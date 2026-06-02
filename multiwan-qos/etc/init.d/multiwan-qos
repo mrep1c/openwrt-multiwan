@@ -1,0 +1,2603 @@
+#!/bin/sh /etc/rc.common
+# shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC3060,SC3003,SC3015,SC3044
+
+START=99
+STOP=99
+
+USE_PROCD=1
+
+VERSION="1.8.0"
+UPD_CHANNEL="release"
+
+EXTRA_COMMANDS="check_version update auto_setup auto_setup_noninteractive validate_custom_rules health_check refresh check_deps install_deps"
+EXTRA_HELP="
+        check_version              Check for updates
+        update                     Update multiwan_qos
+        auto_setup                 Automatically configure multiwan_qos
+        auto_setup_noninteractive  Automatically configure multiwan_qos with no interaction
+        validate_custom_rules      Validate custom rules
+        health_check               Check if MultiWAN QoS is properly configured and running
+        refresh <device>           Refresh qdiscs for a specific device without restarting
+        check_deps                 Check required runtime packages
+        install_deps               Install missing runtime packages with apk/opkg"
+
+REQUIRED_PACKAGES="kmod-sched ip-full nftables kmod-veth tc-full kmod-netem kmod-sched-ctinfo kmod-ifb kmod-sched-cake kmod-sched-red kmod-sched-flower luci-lib-jsonc lua jsonfilter uclient-fetch"
+
+### Utility vars
+_NL_='
+'
+DEFAULT_IFS=" 	${_NL_}"
+IFS="$DEFAULT_IFS"
+
+
+### repo-related vars
+
+# GH repo author (can be overriden for testing)
+: "${MULTIWAN_QOS_REPO_AUTHOR:=mrep1c}"
+
+MAIN_BRANCH_BACKEND=main
+MAIN_BRANCH_FRONTEND=main
+
+# GH API URLs (can be overridden)
+: "${MULTIWAN_QOS_GH_API_URL:="https://api.github.com/repos/${MULTIWAN_QOS_REPO_AUTHOR}"}"
+: "${MULTIWAN_QOS_GH_API_URL_BACKEND:="${MULTIWAN_QOS_GH_API_URL}/openwrt-multiwan-qos"}"
+: "${MULTIWAN_QOS_GH_API_URL_FRONTEND:="${MULTIWAN_QOS_GH_API_URL}/openwrt-multiwan-qos"}"
+
+# GH raw backend URL (can be overridden)
+: "${MULTIWAN_QOS_GH_RAW_URL_BACKEND_MAIN:="https://raw.githubusercontent.com/${MULTIWAN_QOS_REPO_AUTHOR}/openwrt-multiwan-qos/${MAIN_BRANCH_BACKEND}/multiwan-qos"}"
+
+
+### Local paths
+
+MULTIWAN_QOS_D=/etc/multiwan-qos.d
+MULTIWAN_QOS_CFG_FILE=/etc/config/multiwan-qos
+TMP_CFG_DIR=/tmp/multiwan_qos_tmp
+TMP_CFG_FILE=$TMP_CFG_DIR/multiwan-qos
+MULTIWAN_QOS_RESTARTING_FILE=/tmp/multiwan_qos_restarting
+MULTIWAN_QOS_PACKAGE_LOCK=/tmp/multiwan_qos-package-install.lock
+MULTIWAN_QOS_PACKAGE_LOCK_HELD=0
+MULTIWAN_QOS_DEFAULTS_FILE=${MULTIWAN_QOS_D}/multiwan-qos-defaults
+MULTIWAN_QOS_CUSTOM_RULES_FILE=${MULTIWAN_QOS_D}/custom_rules.nft
+MULTIWAN_QOS_INLINE_RULES_FILE=${MULTIWAN_QOS_D}/inline_dscptag.nft
+
+# Local path of JS files
+MULTIWAN_QOS_UPD_DIR=/var/run/multiwan_qos-update
+
+### Components
+MULTIWAN_QOS_COMPONENTS="BACKEND FRONTEND"
+MULTIWAN_QOS_FILES_REG_PATH_BACKEND=${MULTIWAN_QOS_D}/backend_reg.md5
+MULTIWAN_QOS_FILES_REG_PATH_FRONTEND=${MULTIWAN_QOS_D}/frontend_reg.md5
+
+### Backend files
+MULTIWAN_QOS_SERVICE_PATH=/etc/init.d/multiwan-qos
+MULTIWAN_QOS_MAIN_SCRIPT=/etc/multiwan-qos.sh
+MULTIWAN_QOS_HOTPLUG_SCRIPT=/etc/hotplug.d/iface/13-multiwan-qos-hotplug
+MULTIWAN_QOS_HOTPLUG_COMMON=/lib/multiwan-qos/hotplug-common.sh
+
+# stores the version and update channel
+MULTIWAN_QOS_VERSION_FILE_BACKEND=$MULTIWAN_QOS_SERVICE_PATH
+
+MULTIWAN_QOS_FILE_TYPES_BACKEND="GEN EXTRA" # change the value if adding more types
+MULTIWAN_QOS_GEN_FILES_BACKEND="
+    $MULTIWAN_QOS_SERVICE_PATH
+    $MULTIWAN_QOS_MAIN_SCRIPT
+    $MULTIWAN_QOS_DEFAULTS_FILE
+    $MULTIWAN_QOS_HOTPLUG_COMMON
+    /usr/lib/tc/experimental.dist
+    /usr/lib/tc/normal.dist
+    /usr/lib/tc/normmix20-64.dist
+    /usr/lib/tc/pareto.dist
+    /usr/lib/tc/paretonormal.dist"
+MULTIWAN_QOS_EXEC_FILES_BACKEND="
+    $MULTIWAN_QOS_SERVICE_PATH
+    $MULTIWAN_QOS_MAIN_SCRIPT"
+MULTIWAN_QOS_EXTRA_FILES_BACKEND="" # might be useful in the future?
+
+
+### Frontend files
+### !!! When adding or removing frontend (or other) files which need path fixups,
+###       remember to update appropriate fixup files
+
+MULTIWAN_QOS_FRONTEND_DIR_JS=/www/luci-static/resources/view/multiwan-qos
+
+# stores the version and update channel
+MULTIWAN_QOS_VERSION_FILE_FRONTEND="${MULTIWAN_QOS_FRONTEND_DIR_JS}/settings.js"
+
+MULTIWAN_QOS_FILE_TYPES_FRONTEND="GEN EXTRA JS" # change the value if adding more types
+MULTIWAN_QOS_GEN_FILES_FRONTEND="
+    /usr/share/luci/menu.d/luci-app-multiwan-qos.json
+    /usr/share/rpcd/acl.d/luci-app-multiwan-qos.json
+    /usr/libexec/rpcd/luci.multiwan_qos
+    /usr/libexec/rpcd/luci.multiwan_qos_stats"
+MULTIWAN_QOS_EXTRA_FILES_FRONTEND="" # might be useful in the future?
+
+MULTIWAN_QOS_JS_FILENAMES="
+    settings.js
+    hfsc.js
+    cake.js
+    advanced.js
+    rules.js
+    ratelimits.js
+    connections.js
+    custom_rules.js
+    ipsets.js
+    statistics.js"
+# generate js file list with paths
+MULTIWAN_QOS_JS_FILES_FRONTEND=
+for js_file in ${MULTIWAN_QOS_JS_FILENAMES}; do
+    MULTIWAN_QOS_JS_FILES_FRONTEND="${MULTIWAN_QOS_JS_FILES_FRONTEND}${MULTIWAN_QOS_FRONTEND_DIR_JS}/${js_file}${_NL_}"
+done
+
+MULTIWAN_QOS_EXEC_FILES_FRONTEND="
+    /usr/libexec/rpcd/luci.multiwan_qos
+    /usr/libexec/rpcd/luci.multiwan_qos_stats"
+
+
+# Silence shellcheck unused vars warnings
+: "$START" "$STOP" "$USE_PROCD" "$VERSION" "$UPD_CHANNEL" "$EXTRA_COMMANDS" "$EXTRA_HELP" "$REQUIRED_PACKAGES" \
+    "$MAIN_BRANCH_FRONTEND" "$MULTIWAN_QOS_FILES_REG_PATH_BACKEND" "$MULTIWAN_QOS_FILES_REG_PATH_FRONTEND" \
+    "$MULTIWAN_QOS_VERSION_FILE_BACKEND" "$MULTIWAN_QOS_FILE_TYPES_BACKEND" "$MULTIWAN_QOS_GEN_FILES_BACKEND" \
+    "$MULTIWAN_QOS_EXEC_FILES_BACKEND" "$MULTIWAN_QOS_EXTRA_FILES_BACKEND" "$MULTIWAN_QOS_FILE_TYPES_FRONTEND" \
+    "$MULTIWAN_QOS_GEN_FILES_FRONTEND" "$MULTIWAN_QOS_EXTRA_FILES_FRONTEND" "$MULTIWAN_QOS_EXEC_FILES_FRONTEND" \
+    "${global_enabled:=}" "${ROOT_QDISC:=}" "${gameqdisc:=}"
+
+
+### Utility functions
+
+is_package_script_context() {
+    local cmdline
+
+    [ -n "${APK_SCRIPT:-}" ] && return 0
+    [ -r "/proc/$PPID/cmdline" ] || return 1
+    cmdline="$(tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null)"
+    case "$cmdline" in
+        */lib/apk/db/scripts/*|*/usr/lib/opkg/info/*|*post-install*|*post-upgrade*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+calculate_realtime_rate_default() {
+    local rate="$1" dir="$2" realtime min_rate max_rate cap
+
+    [ "$rate" -gt 0 ] 2>/dev/null || rate=1
+
+    realtime=$((rate * 2 / 100 + 300))
+    if [ "$dir" = "wan" ]; then
+        min_rate=768
+        max_rate=2000
+    else
+        min_rate=1024
+        max_rate=3000
+    fi
+
+    [ "$realtime" -lt "$min_rate" ] && realtime=$min_rate
+    [ "$realtime" -gt "$max_rate" ] && realtime=$max_rate
+
+    cap=$((rate * 25 / 100))
+    [ "$cap" -lt 1 ] && cap=1
+    [ "$realtime" -gt "$cap" ] && realtime=$cap
+
+    echo "$realtime"
+}
+
+uci_tmp() {
+    uci -c "$TMP_CFG_DIR" "$@"
+}
+
+commit_tmp_config() {
+    uci_tmp commit multiwan-qos &&
+    cp "$TMP_CFG_FILE" "$MULTIWAN_QOS_CFG_FILE"
+    local rv=$?
+    rm -rf "$TMP_CFG_DIR"
+    [ $rv = 0 ] || error_out "Failed to save the new config."
+    return $rv
+}
+
+# 1 - string
+# 2 - path to file
+write_str_to_file() {
+    printf '%s\n' "$1" > "$2" || { error_out "Failed to write to file '$2'."; return 1; }
+    :
+}
+
+# 0 - (optional) '-p'
+# 1 - path
+try_mkdir() {
+    local IFS="$DEFAULT_IFS" p=
+    [ "$1" = '-p' ] && { p='-p'; shift; }
+    [ -d "$1" ] && return 0
+    mkdir ${p} "$1" || { error_out "Failed to create directory '$1'."; return 1; }
+    :
+}
+
+check_util() { command -v "$1" 1>/dev/null; }
+
+run_with_timeout() {
+    local seconds="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$seconds" "$@"
+    else
+        "$@"
+    fi
+}
+
+mark_multiwan_qos_restarting() {
+    : > "$MULTIWAN_QOS_RESTARTING_FILE"
+}
+
+clear_multiwan_qos_restarting() {
+    rm -f "$MULTIWAN_QOS_RESTARTING_FILE"
+}
+
+cleanup_agent_runtime_files() {
+    rm -rf /tmp/multiwan_qos_agent.lock
+    rm -f /tmp/multiwan_qos_agent_rules.nft /tmp/multiwan_qos_agent_last_seen /tmp/multiwan_qos_agent_rate_limit /tmp/multiwan_qos_agent_state.json
+}
+
+error_out() { log_msg -err "${@}"; }
+
+# prints each argument to a separate line
+print_msg() {
+    local _arg
+    for _arg in "$@"
+    do
+        case "${_arg}" in
+            '') printf '\n' ;; # print out empty lines
+            *) printf '%s\n' "${_arg}"
+        esac
+    done
+    :
+}
+
+# logs each argument separately and prints to a separate line
+# optional arguments: '-err', '-warn' to set logged error level
+log_msg() {
+    local msgs_prefix='' _arg err_l=info msgs_dest
+
+    local IFS="$DEFAULT_IFS"
+    for _arg in "$@"
+    do
+        case "${_arg}" in
+            "-err") err_l=err msgs_prefix="Error: " ;;
+            "-warn") err_l=warn msgs_prefix="Warning: " ;;
+            '') printf '\n' ;; # print out empty lines
+            *)
+                case "$err_l" in
+                    err|warn) msgs_dest="/dev/stderr" ;;
+                    *) msgs_dest="/dev/stdout"
+                esac
+                printf '%s\n' "${msgs_prefix}${_arg}" > "$msgs_dest"
+                logger -t multiwan_qos -p user."$err_l" "${msgs_prefix}${_arg}"
+                msgs_prefix=''
+        esac
+    done
+    :
+}
+
+# check if var names are safe to use with eval
+are_var_names_safe() {
+    local var_name
+    for var_name in "$@"; do
+        case "$var_name" in *[!a-zA-Z_]*) error_out "Invalid var name '$var_name'."; return 1; esac
+    done
+    :
+}
+
+### Update-related functions
+
+# 1 - component: <BACKEND|FRONTEND>
+# return codes:
+# 0 - OK
+# 1 - general error
+# 2 - missing files
+# 3 - missing reg file
+# 4 - non-matching md5sums
+check_files_integrity() {
+    local files_missing='' reg_missing='' reg_file file files file_types component="$1"
+
+    eval "file_types=\"\${MULTIWAN_QOS_FILE_TYPES_${component}}\"
+        reg_file=\"\${MULTIWAN_QOS_FILES_REG_PATH_${component}}\""
+
+    [ -f "$reg_file" ] || reg_missing=1
+
+    files="$(print_file_list "$component" ALL)" && [ -n "$files" ] ||
+        { error_out "Failed to get file list for component '$component'."; return 1; }
+    
+    local IFS="$_NL_"
+    for file in $files; do
+        [ -z "$file" ] || [ -f "$file" ] && continue
+        error_out "Missing file: '$file'."
+        files_missing=1
+    done
+
+    IFS="$DEFAULT_IFS"
+    [ -z "$files_missing" ] || return 2
+    [ -z "$reg_missing" ] || { error_out "$reg_file is not found. Can not check files integrity."; return 3; }
+
+    md5sum -c "$reg_file" &>/dev/null || return 4
+    :
+}
+
+# 1 - component: BACKEND|FRONTEND
+# 2 - types: 'ALL' (doesn't print executable files) or any combination (space-separated) of 'GEN', 'EXTRA', 'JS', 'EXEC'
+print_file_list() {
+    local me=print_file_list file_type files='' \
+        component="$1" file_types="$2"
+
+    [ -n "$1" ] && [ -n "$2" ] || { error_out "$me: missing args."; return 1; }
+
+    case "$component" in
+        BACKEND|FRONTEND) ;;
+        *) error_out "$me: invalid component '$component'."; return 1
+    esac
+
+    if [ "$file_types" = ALL ]; then
+        eval "file_types=\"\${MULTIWAN_QOS_FILE_TYPES_${component}}\""
+    fi
+
+    for file_type in ${file_types}; do
+        case "$file_type" in
+            GEN|EXTRA|JS|EXEC)
+                eval "files=\"${files}\${MULTIWAN_QOS_${file_type}_FILES_${component}}${_NL_}\"" ;;
+            *) error_out "$me: invalid type '$file_type'"; return 1
+        esac
+    done
+
+    # remove extra newlines, leading and trailing whitespaces and tabs
+    printf '%s\n' "$files" | sed "s/^\s*//;s/\s*$//;/^$/d"
+    :
+}
+
+# When updating, old version of the script should call post_update_[X] functions from the new version
+#   post_update_1 should be called via '/bin/sh <multiwan_qos_init_preinst_path> post_update_1' *before* new version is installed
+#   post_update_2 should be called via '/bin/sh "$MULTIWAN_QOS_SERVICE_PATH" post_update_2' *after* new version is installed
+# This allows flexibility when adding new features etc.
+post_update_1() {
+    :
+    # <do something...>
+    return $?
+}
+
+post_update_2() {
+    # <do something...>
+    migrate_config
+    return $?
+}
+
+# Fetches multiwan_qos distribution for specified component
+# 1 - component (BACKEND|FRONTEND)
+# 2 - tarball url
+fetch_multiwan_qos_component() {
+    [ -n "$1" ] && [ -n "$2" ] || { error_out "fetch_multiwan_qos_component: missing arguments."; return 1; }
+
+    local component="$1" fetch_tarball_url="$2"
+    local fetch_rv extract_dir upd_dir="${MULTIWAN_QOS_UPD_DIR}/${component}"
+    local tarball="${upd_dir}/remote_multiwan_qos.tar.gz" ucl_err_file="${upd_dir}/ucl_err"
+
+    case "$component" in
+        BACKEND) repo_name=multiwan_qos ;;
+        FRONTEND) repo_name=luci-app-multiwan-qos ;;
+        *) error_out "$me: invalid component '$component'."; return 1
+    esac
+
+    rm -f "$ucl_err_file" "${tarball}"
+    rm -rf "${upd_dir}/${MULTIWAN_QOS_REPO_AUTHOR}-${repo_name}-"*
+    try_mkdir -p "$upd_dir" || return 1
+
+    uclient-fetch "$fetch_tarball_url" -O "${tarball}" 2> "$ucl_err_file" &&
+    grep -q "Download completed" "$ucl_err_file" &&
+    tar -C "${upd_dir}" -xzf "${tarball}" &&
+    extract_dir="$(find "${upd_dir}/" -type d -name "${MULTIWAN_QOS_REPO_AUTHOR}-${repo_name}-*")" &&
+        [ -n "$extract_dir" ] && [ "$extract_dir" != "/" ]
+    fetch_rv=${?}
+    rm -f "${tarball}"
+
+    [ "$fetch_rv" != 0 ] && [ -s "$ucl_err_file" ] &&
+        log_msg "uclient-fetch output: ${_NL_}$(cat "$ucl_err_file")."
+    rm -f "$ucl_err_file"
+
+    [ "$fetch_rv" = 0 ] && {
+        mv "${extract_dir:-?}"/* "${upd_dir:-?}/" ||
+            { rm -rf "${extract_dir:-?}"; error_out "Failed to move files to dist dir."; return 1; }
+    }
+    rm -rf "${extract_dir:-?}"
+
+    return $fetch_rv
+}
+
+# Get GitHub ref and tarball url for specified component, update channel, branch and version
+# 1 - component (BACKEND|FRONTEND)
+# 2 - update channel: release|snapshot|branch=<github_branch>|commit=<commit_hash>
+# 3 - version (optional): [multiwan_qos_version|commit_hash]
+# Output via variables:
+#   $4 - github ref (version/commit hash), $5 - tarball url, $6 - version type ('version' or 'commit')
+get_gh_ref_data() {
+    set_res_vars() {
+        if [ "$gh_channel" = release ]; then
+            version="${gh_ref#v}"
+        else
+            version="$gh_ref"
+        fi
+        eval "$4"='$version' "$5"='${gh_url_api}/tarball/${gh_ref}' "$6"='$gh_ver_type' \
+            "${component}_prev_ref"='$gh_ref' "${component}_prev_ver_type"='$gh_ver_type' \
+            "${component}_prev_upd_channel"='$gh_channel' "${component}_prev_version"='$version'
+    }
+
+    get_and_process_ref()
+    {
+        local branch \
+            channel="$1" ptrn="$2" branches="$3" main_branch="$4" err_file="$5"
+        case "${channel}" in
+            release)
+                uclient-fetch "${gh_url_api}/releases" -O- 2> "$err_file" | {
+                    jsonfilter -e '@[@.prerelease=false]' |
+                    jsonfilter -a -e "@[@.target_commitish=\"${main_branch}\"].tag_name"
+                    cat 1>/dev/null
+                } ;;
+            snapshot|branch=*|commit=*)
+                for branch in ${branches}
+                do
+                    uclient-fetch "${gh_url_api}/commits?sha=${branch}" -O- 2> "$err_file" | {
+                        jsonfilter -e '@[@.commit]["url"]' |
+                        sed 's/.*\///' # only leave the commit hash
+                        cat 1>/dev/null
+                    }
+                done
+        esac |
+        if [ -n "${ptrn}" ]
+        then
+            grep "${ptrn}"
+        else
+            head -n1 # get latest version or commit
+            cat 1>/dev/null
+        fi
+    }
+
+    local branches='' main_branch grep_ptrn='' \
+        gh_ref='' gh_ver_type='' gh_url_api ref_fetch_tmp_dir="/tmp/multiwan_qos-gh" ref_fetch_rv=0 \
+        prev_ref prev_ver_type prev_upd_channel prev_version \
+        component="$1" gh_channel="$2" version="$3"
+    
+    [ "$gh_channel" = release ] && version="${version#v}"
+
+    local ref_ucl_err_file="${ref_fetch_tmp_dir}/ucl_err"
+
+    are_var_names_safe "$4" "$5" "$6" || return 1
+    eval "$4='' $5='' $6='' gh_url_api=\"\${MULTIWAN_QOS_GH_API_URL_${component}}\""
+
+    eval "prev_ref=\"\${${component}_prev_ref}\"
+        prev_ver_type=\"\${${component}_prev_ver_type}\"
+        prev_upd_channel=\"\${${component}_prev_upd_channel}\"
+        prev_version=\"\${${component}_prev_version}\""
+
+    # if previously stored data exists, use it without API query or cache check
+    if [ -n "$prev_ref" ] && [ -n "$prev_ver_type" ] && \
+        [ "$prev_upd_channel" = "$gh_channel" ] && [ "$version" = "$prev_version" ]; then
+            gh_ref="$prev_ref" gh_ver_type="$prev_ver_type"
+    else
+        # if commit hash is specified and it's 40-char long, use it directly without API query or cache check
+        case "$gh_channel" in
+            snapshot|branch=*|commit=*) [ "${#version}" = 40 ] && gh_ref="$version"
+        esac
+
+        if [ -z "$gh_ref" ]; then
+            # ref cache
+            local cache_file cache_filename="${component}_${version}_${gh_channel}" ref_cache_dir="/tmp/multiwan_qos_cache" cache_ttl
+            case "$gh_channel" in
+                commit=*) cache_ttl=2880 ;; # 48 hours
+                *) cache_ttl=10 # 10 minutes
+            esac
+
+            # clean up old cache
+            find "${ref_cache_dir:-?}" -maxdepth 1 -type f -mmin +"${cache_ttl}" -exec rm -f {} \; 2>/dev/null
+
+            # check if the query is cached
+            cache_file="$(find "${ref_cache_dir:-?}" -maxdepth 1 -type f -name "${cache_filename}" -print 2>/dev/null)"
+            case "$cache_file" in
+                '') ;; # found nothing
+                *[^"$_NL_"]*"${_NL_}"*[^"${_NL_}"]*)
+                    # found multiple files - delete them
+                    local file IFS="$_NL_"
+                    for file in $cache_file; do
+                        [ -n "$file" ] || continue
+                        rm -f "$file"
+                    done
+                    IFS="$DEFAULT_IFS" ;;
+                *)
+                    # found cached query
+                    if [ -z "$IGNORE_CACHE" ] && [ -f "$cache_file" ] && read -r prev_ref prev_ver_type < "$cache_file" &&
+                        [ -n "$prev_ref" ] && [ -n "$prev_ver_type" ]; then
+                            gh_ref="$prev_ref" gh_ver_type="$prev_ver_type"
+                    else
+                        rm -f "${cache_file:-???}"
+                    fi
+            esac
+        fi
+    fi
+
+    if [ -n "$gh_ref" ]; then
+        set_res_vars "$@"
+        return 0
+    fi
+
+    try_mkdir -p "$ref_fetch_tmp_dir" || return 1
+    rm -f "$ref_ucl_err_file"
+
+    eval "main_branch=\"\${MAIN_BRANCH_${component}}\""
+    case "$gh_channel" in
+        release)
+            gh_ver_type=version
+            [ -n "$version" ] && grep_ptrn="^v${version}$" ;;
+        snapshot)
+            gh_ver_type=commit
+            branches="$main_branch"
+            if [ -n "$version" ]; then
+                grep_ptrn="^${version}$"
+            fi ;;
+        branch=*)
+            gh_ver_type=commit
+            branches="${gh_channel#*=}"
+            if [ -n "$version" ]; then
+                grep_ptrn="^${version}$"
+            fi ;;
+        commit=*)
+            gh_ver_type=commit
+            local gh_hash="${gh_channel#*=}"
+
+            if [ "${#gh_hash}" = 40 ]; then
+                # if upd. ch. is 'commit', the upd. ch. string includes commit hash -
+                #    if it's 40-char long, use it directly without API query
+                gh_ref="$gh_hash"
+            else
+                branches="$(
+                    uclient-fetch "${gh_url_api}/branches" -O-  2> "$ref_ucl_err_file" |
+                        { jsonfilter -e '@[@]["name"]'; cat 1>/dev/null; }
+                )"
+                [ -n "$branches" ] || {
+                    error_out "Failed to get $component branches via GH API (url: '${gh_url_api}/branches')."
+                    [ -f "$ref_ucl_err_file" ] &&
+                        log_msg "uclient-fetch log:${_NL_}$(cat "$ref_ucl_err_file")"
+                        rm -f "$ref_ucl_err_file"
+                    return 1
+                }
+                rm -f "$ref_ucl_err_file"
+                grep_ptrn="^${gh_hash}"
+            fi ;;
+        *)
+            error_out "Invalid update channel '$gh_channel'."
+            return 1
+    esac
+
+    # Get ref via GH API
+    [ -z "$gh_ref" ] && gh_ref="$(get_and_process_ref "$gh_channel" "$grep_ptrn" "$branches" "$main_branch" "$ref_ucl_err_file")"
+
+    if [ -z "$gh_ref" ] && [ -f "$ref_ucl_err_file" ] && ! grep -q "Download completed" "$ref_ucl_err_file"; then
+        error_out "Failed to get $component GitHub download URL for $gh_ver_type '$version' (update channel: '$gh_channel')." \
+            "uclient-fetch log:${_NL_}$(cat "$ref_ucl_err_file")"
+        ref_fetch_rv=1
+    fi
+    rm -rf "${ref_fetch_tmp_dir:-?}"
+    [ "$ref_fetch_rv" = 0 ] || return 1
+
+    # validate resulting ref
+    case "$gh_ref" in
+        *[^"$_NL_"]*"${_NL_}"*[^"${_NL_}"]*)
+            error_out "Got multiple $component download URLs for version '$version'." \
+                "If using commit hash, please specify the complete commit hash string."
+            return 1 ;;
+        ''|*[!a-zA-Z0-9._-]*)
+            error_out "Failed to get $component GitHub download URL for $gh_ver_type '$version' (update channel: '$gh_channel')."
+            return 1
+    esac
+
+    # write the query result to cache
+    try_mkdir -p "$ref_cache_dir" &&
+    printf '%s\n' "$gh_ref $gh_ver_type" > "${ref_cache_dir}/${cache_filename}"
+
+    set_res_vars "$@"
+    :
+}
+
+# get update channel and version from local frontend file
+# 1 - var name for version output
+# 2 - var name for upd. channel output
+# 3 - path to file
+get_frontend_spec() {
+    local me=get_frontend_spec rv=0 failed_spec='' spec_res='' spec_line
+        spec_path="$3"
+
+    are_var_names_safe "$1" "$2" || return 1
+    [ -n "$3" ] || { error_out "$me: missing args."; return 1; }
+
+    # assumes string enclosed in FS and no prior FS present in the line
+    spec_res="$(
+        awk -v v_ptrn_1="^[ 	]*const UI_VERSION[ 	]*=" -v v_ptrn_2="^[-a-zA-Z0-9_.]+$" \
+            -v u_ptrn_1="^[ 	]*const UI_UPD_CHANNEL[ 	]*=" -v u_ptrn_2="^[-a-zA-Z0-9_.=]+$" \
+            -F "'" '
+                BEGIN{rv=1}
+                {
+                    if (v_match_res != "" && u_match_res != "") {rv = v_match_res + u_match_res; exit}
+                }
+                $0~v_ptrn_1 {
+                    v_match_res=2
+                    if ( $2~v_ptrn_2 ) {print "version:" $2; v_match_res=0}
+                    next
+                }
+                $0~u_ptrn_1 {
+                    u_match_res=3
+                    if ( $2~u_ptrn_2 ) {print "upd_channel:" $2; u_match_res=0}
+                    next
+                }
+                END{exit rv}
+            ' "$spec_path"
+        )" || {
+            rv=$?
+            case $rv in
+                2) failed_spec=version ;;
+                3) failed_spec="update channel" ;;
+                *) failed_spec="version and update channel" ;;
+            esac
+            error_out "$me: Failed to get frontend $failed_spec from file '$spec_path'."
+        }
+
+        local IFS="$_NL_"
+        for spec_line in $spec_res; do
+            case "$spec_line" in
+                '') continue ;;
+                version:*) eval "$1"='${spec_line#*:}' ;;
+                upd_channel:*) eval "$2"='${spec_line#*:}' ;;
+                *) error_out "$me: got unexpected string when parsing file '$spec_path'."; return 1
+            esac
+        done
+        return $rv
+}
+
+# Get version and update channel from local file or from repo
+# 1 - var name for version output
+# 2 - var name for update channel output
+# 3 - component (BACKEND|FRONTEND)
+# 4 - origin (local|remote)
+# Error codes: 1 - failed to get version, 2 - got invalid version
+get_component_spec() {
+    local gv_version='' gv_upd_channel='' me=get_component_spec \
+        gv_component="$3" gv_origin="$4"
+
+    are_var_names_safe "$1" "$2" || return 1
+
+    # get update channel
+    case "$gv_component" in
+        BACKEND) gv_upd_channel="$UPD_CHANNEL" ;;
+        FRONTEND) get_frontend_spec gv_version gv_upd_channel "$MULTIWAN_QOS_VERSION_FILE_FRONTEND" || return 1 ;;
+        *) error_out "$me: invalid component '$gv_component'."; return 1
+    esac
+
+    # get version
+    case "$gv_origin" in
+        local) [ "$gv_component" = BACKEND ] && gv_version="$VERSION" ;;
+        remote) get_gh_ref_data "$gv_component" "$gv_upd_channel" "" gv_version _ _ || return 1 ;;
+        *) error_out "$me: invalid origin '$gv_origin'."; return 1
+    esac
+
+    : "$gv_version" # Silence shellcheck warning
+
+    eval "$1"='$gv_version'
+    eval "$2"='$gv_upd_channel'
+
+    :
+}
+
+# Check and print versions for local and remote backend and frontend
+# sets global variables: $BACKEND_upd_avail, $FRONTEND_upd_avail
+# (optional) '-n' to not print update tip
+# (optional) '-i' to ignore cache
+# (optional) '-c <BACKEND|FRONTEND>''
+# Return codes:
+# 0 - no update
+# 1 - error
+# 254 - update available
+check_version() {
+    print_msg "Version check is disabled in this custom build to prevent overwriting local changes."
+    return 0
+}
+
+# Optional args:
+# -s <path> : simulate update (intended for testing: service multiwan_qos update -s <path_to_new_ver> -v <version>)
+# -c <frontend|backend> : only update specified component
+# -v [<version>|package[=<version>]|release|snapshot|branch=<branch>|commit=<commit_hash>] : version string
+# -U <update_channel> : force this update channel (overrides the upd. channel derived from '-v' option)
+# -W <version> : force this version (overrides the version derived from '-v' option)
+# -f : force update
+# -i : ignore previous cache results
+update() {
+    print_msg "Update is disabled in this custom build to prevent overwriting local changes."
+    return 0
+} # End update function stub
+
+# 1 - path to upper distribution dir (containing a dir for each component)
+# 2 - component(s): <BACKEND|FRONTEND|"BACKEND FRONTEND">
+install_multiwan_qos_files() {
+    inst_failed() {
+        [ -n "$1" ] && error_out "$1"
+        error_out "Failed to install new $component files."
+    }
+
+    local file preinst_path curr_files new_file_list new_file_list exec_files='' \
+        dist_dir ver_file_path frontend_updated='' \
+        upper_dist_dir="$1" components="$2" version upd_channel
+
+    for component in $components; do
+        log_msg "" "Installing new $component files..."
+
+        eval "version=\"\${ver_${component}}\" upd_channel=\"\${upd_channel_${component}}\""
+        [ -n "$version" ] && [ -n "$upd_channel" ] ||
+            { inst_failed "Internal error: failed to get version and update channel for component '$component'."; return 1; }
+
+        dist_dir="${upper_dist_dir}/${component}"
+
+        # read new file list
+        new_file_list="$(cat "${dist_dir}/new_file_list")" && [ -n "$new_file_list" ] &&
+        exec_files="$(cat "${dist_dir}/exec_files")" ||
+            {
+                rm -f "${dist_dir}/new_file_list" "${dist_dir}/exec_files"
+                inst_failed "Failed to read new file list."
+                return 1
+            }
+        rm -f "${dist_dir}/exec_files"
+
+        # get current file list
+        curr_files="$(print_file_list "$component" ALL)" || { inst_failed; return 1; }
+
+        eval "ver_file_path=\"\${MULTIWAN_QOS_VERSION_FILE_${component}}\""
+
+        # version and update channel string replacement vars
+        local ver_ptrn_prefix ver_repl_str upd_ch_repl_str
+        case "$component" in
+            BACKEND)
+                ver_ptrn_prefix=
+                ver_repl_str="VERSION=\"$version\""
+                upd_ch_repl_str="UPD_CHANNEL=\"$upd_channel\"" ;;
+            FRONTEND)
+                ver_ptrn_prefix="const UI_"
+                ver_repl_str="VERSION = '$version';"
+                upd_ch_repl_str="UPD_CHANNEL = '$upd_channel';" ;;
+        esac
+
+        # set version and update channel in component's main file
+        local preinst_ver_file_path="${dist_dir}${ver_file_path}"
+
+        sed -i "
+            /^\s*${ver_ptrn_prefix}VERSION\s*=/{s/.*/${ver_ptrn_prefix}${ver_repl_str}/;}
+            /^\s*${ver_ptrn_prefix}UPD_CHANNEL\s*=/{s/.*/${ver_ptrn_prefix}${upd_ch_repl_str}/;}" \
+                "$preinst_ver_file_path" &&
+                    # verify that substitution worked
+                    grep -q "^${ver_ptrn_prefix}${ver_repl_str}" "$preinst_ver_file_path" &&
+                    grep -q "^${ver_ptrn_prefix}${upd_ch_repl_str}" "$preinst_ver_file_path" ||
+                        { inst_failed "Failed to set version in file '$preinst_ver_file_path'."; return 1; }
+
+        # Check for changed files
+        local curr_reg_file changed_files='' unchanged_files='' man_changed_files='' \
+            prefixed_curr_reg_file="${dist_dir}/prefixed_reg_${component}.md5"
+        eval "curr_reg_file=\"\${MULTIWAN_QOS_FILES_REG_PATH_${component}}\""
+
+        if [ -s "$curr_reg_file" ]; then
+            # prefix file paths in the reg file for md5sum comparison
+            sed -E "/^$/d;s~([^ 	]+$)~${dist_dir}\\1~" "$curr_reg_file" > "$prefixed_curr_reg_file"
+            unchanged_files="$(md5sum -c "$prefixed_curr_reg_file" 2>/dev/null |
+                sed -n "/:\s*OK\s*$/{s/\s*:\s*OK\s*$//;s~^\s*${dist_dir}~~;p;}")"
+            rm -f "$prefixed_curr_reg_file"
+
+            # remove unchanged files from $new_file_list to reliably get a list of files to copy
+            changed_files="$(
+                printf '%s\n' "$unchanged_files" | awk '
+                    NR==FNR {unch[$0];next}
+                    ($0=="" || $0 in unch) {next}
+                    {print}
+                ' - "${dist_dir}/new_file_list"
+            )"
+
+            # Detect manually modified files
+            man_changed_files="$(
+                md5sum -c "$curr_reg_file" 2>/dev/null |
+                sed -n "/:\s*FAILED\s*$/{s/\s*:\s*FAILED\s*$//;p;}" |
+                awk '
+                    NR == FNR {new[$0]; next}
+                    $0 in new {print}
+                ' "${dist_dir}/new_file_list" -
+            )"
+
+            # Add manually modified files to changed files
+            if [ -n "$man_changed_files" ]; then
+                changed_files="$(printf '%s\n' "${changed_files}${_NL_}${man_changed_files}" | sort -u | sed '/^$/d')"
+            fi
+        else
+            changed_files="$new_file_list"
+        fi
+
+        local IFS="$_NL_"
+        for file in $unchanged_files; do
+            [ -n "$file" ] || continue
+            log_msg "File '$file' did not change - not updating."
+        done
+
+        local mod_files_bk_dir="/tmp/multiwan_qos_old_modified_files"
+        for file in $man_changed_files; do
+            [ -n "$file" ] && [ -f "$file" ] || continue
+            log_msg -warn "File '$file' was manually modified - overwriting."
+            if try_mkdir -p "$mod_files_bk_dir" && cp "$file" "${mod_files_bk_dir}/${file##*/}"; then
+                log_msg "Saved a backup copy of manually modified file to ${mod_files_bk_dir}/${file##*/}"
+            else
+                log_msg -warn "Can not create a backup copy of manually modified file '$file' - overwriting anyway."
+            fi
+        done
+
+        # Copy changed files
+        for file in $changed_files
+        do
+            preinst_path="${dist_dir}${file}"
+
+            log_msg "Copying file '${file}'."
+            try_mkdir -p "${file%/*}" && cp "$preinst_path" "$file" ||
+                { inst_failed "Failed to copy file '$preinst_path' to '$file'."; return 1; }
+            [ "$component" = FRONTEND ] && frontend_updated=1
+        done
+
+        # delete obsolete files
+        for file in ${curr_files}
+        do
+            [ -f "$file" ] || continue
+
+            # check for $file in $new_file_list, allowing newline as list delimiter
+            case "$new_file_list" in
+                "$file"|"${file}${_NL_}"*|*"${_NL_}${file}"|*"${_NL_}${file}${_NL_}"*)
+                    continue ;;
+                *)
+                    log_msg "Deleting obsolete file '$file'."
+                    rm -f "$file"
+            esac
+        done
+
+        # make files executable
+        set -- $exec_files # relying on IFS=\n
+        chmod +x "$@" || { inst_failed "Failed to make files executable."; return 1; }
+
+        # save the md5sum registry file if needed
+        if [ -n "$changed_files" ] || [ ! -s "$curr_reg_file" ]; then
+            # make md5sum registry of new files
+            # shellcheck disable=SC2046
+            set -- $(printf '%s\n' "$new_file_list" | sed "/^$/d;s~^\s*~${dist_dir}~") # relying on IFS=\n
+            md5sums="$(md5sum "$@")" && [ -n "$md5sums" ] &&
+            try_mkdir -p "${curr_reg_file%/*}" &&
+            printf '%s\n' "$md5sums" | sed "s~\s${dist_dir}~ ~" > "$curr_reg_file" ||
+                { inst_failed "Failed to register new files."; return 1; }
+        fi
+        IFS="$DEFAULT_IFS"
+    done
+
+    # Restart rpcd only if any frontend files were updated
+    [ -n "$frontend_updated" ] && /etc/init.d/rpcd restart
+    :
+}
+
+### Config-related functions
+
+preserve_config_files() {
+    local path save_req='' \
+        paths="$MULTIWAN_QOS_MAIN_SCRIPT $MULTIWAN_QOS_SERVICE_PATH $MULTIWAN_QOS_HOTPLUG_SCRIPT $MULTIWAN_QOS_D" \
+        tmp_file="/tmp/multiwan_qos_sysupgr" \
+        sysupgr_file="/etc/sysupgrade.conf"
+
+    rm -f "$tmp_file"
+
+    printf '\n'
+
+    if [ "$PRESERVE_CONFIG_FILES" = 1 ]; then
+        for path in $paths; do
+            grep -qxF "$path" "$sysupgr_file" && continue
+            echo "$path" >> "$tmp_file" || return 1
+            save_req=1
+        done
+        if [ -n "$save_req" ]; then
+            cat "$tmp_file" >> "$sysupgr_file" &&
+            print_msg "Config files have been added to $sysupgr_file for preservation."
+        else
+            print_msg "$sysupgr_file already lists multiwan_qos config files."
+        fi
+    else
+        print_msg "Preservation of config files is disabled."
+
+        # Remove the config files from sysupgrade.conf if they exist
+        [ -f "$sysupgr_file" ] || return 0
+        cp "$sysupgr_file" "$tmp_file" || return 1
+        for path in $paths; do
+            grep -qxF "$path" "$tmp_file" || continue
+            sed -i "\|^$path$|d" "$tmp_file" || return 1
+            save_req=1
+        done
+
+        if [ -n "$save_req" ]; then
+            mv "$tmp_file" "$sysupgr_file" &&
+            print_msg "Config files have been removed from $sysupgr_file."
+        else
+            print_msg "$sysupgr_file does not list multiwan_qos config files."
+        fi
+    fi
+
+    rm -f "$tmp_file"
+    :
+}
+
+# return codes:
+# 0 - OK
+# 1 - error
+# 154 - error in default config
+# 155 - missing sections and/or options in user config
+parse_config() {
+    local file miss_sec_f="/tmp/multiwan_qos-missing-sections" miss_opt_f="/tmp/multiwan_qos-missing-options"
+    for file in "$MULTIWAN_QOS_CFG_FILE" "$MULTIWAN_QOS_DEFAULTS_FILE"; do
+        [ -f "$file" ] || {
+            error_out "$file not found."
+            return 1
+        }
+    done
+
+    awk -v miss_sec_f="$miss_sec_f" -v miss_opt_f="$miss_opt_f" \
+        -v bad_quotes="(\"|'.*'.*')" -v p1="'[^']*$" -v p2=".*'" ' \
+    function get_val(s){
+        if (sub(p1,"",s) && sub(p2,"",s)) return s; else return "ERROR"
+    }
+
+    BEGIN{
+        rv=0
+        # Primary settings must be printed first
+        def_prim_arr["settings:UPRATE"]
+        def_prim_arr["settings:DOWNRATE"]
+        # Make interface checking lenient as defaults might not have it yet
+    }
+
+    # serialize user config into user_sections_arr, user_opts_arr
+    NR == FNR {
+        if ($0 ~ bad_quotes) next # ignore lines with double-quotes or more than 2 single-quotes
+
+        if ( $0 ~ /^[ 	]*config[ 	]/ ) {
+            section = get_val($0)
+            if (section == "ERROR" || section !~ /^[a-zA-Z0-9_]+$/) next # ignore invalid section declarations
+            user_sections_arr[section]
+            next
+        }
+
+        if ( $0 ~ /^[ 	]*option[ 	]/ ) {
+            if ( ! section || $2 !~ /^[a-zA-Z0-9_]+$/ ) next # ignore options w/ invalid keys or outside section
+            val = get_val($0)
+            if ( val == "ERROR" || ! val ) next # ignore options w/ invalid or empty values
+            user_opts_arr[section ":" $2] = val
+        }
+        next
+    }
+
+    # serialize default config into def_prim_arr, def_secondary_arr
+    # and check against it for missing sections or options in user config
+    FNR == 1 { section = ""; section_ind = 0 }
+    $0 ~ /^[ 	]*($|#)/ {next} # ignore comments and empty lines
+
+    /^[ 	]*config[ 	]/ {
+        if ($0 ~ bad_quotes) {rv=154;exit}
+        section = get_val($0)
+        if (section == "ERROR" || section !~ /^[a-zA-Z0-9_]+$/) {rv=154; exit}
+        
+        # Interface sections are dynamic, do not check against defaults
+        if (section == "interface") next
+
+        if (section in user_sections_arr) {section_ind++;next}
+        # user config is missing section
+        missing_sections = missing_sections section "=" section_ind "\n"
+        print section >> miss_sec_f
+        section_ind++
+        next
+    }
+
+    /^[ 	]*option[ 	]/ {
+        if ($0 ~ bad_quotes) {rv=154;exit}
+        if ( ! section || $2 !~ /^[a-zA-Z0-9_]+$/ ) {rv=154; exit}
+        val = get_val($0)
+        if (val == "ERROR") {rv=154; exit}
+        
+        # Skip checking options for interface sections
+        if (section == "interface") next
+
+        ser_opt = section ":" $2
+        if (ser_opt in def_prim_arr) def_prim_arr[ser_opt] = val
+            else def_secondary_arr[ser_opt] = val
+        if (! val) next     # do not check user opts vs def opts without value
+        if (ser_opt in user_opts_arr) next
+        # user config is missing option
+        missing_opts =  missing_opts ser_opt "=" val "\n"
+        print ser_opt >> miss_opt_f
+    }
+
+    END{
+        if (rv == 1 || rv == 154) exit rv
+        if (missing_sections) {
+            rv = 155
+            print "missing_sections=\"" missing_sections "\""
+        }
+        if (missing_opts) {
+            rv = 155
+            print "missing_opts=\"" missing_opts "\""
+        }
+
+        # Check primary options, but skip if they are related to settings (which we effectively removed/migrated)
+        # Actually for now, let us keep strict check for other sections
+        for (ser_opt in def_prim_arr) {
+             # if (! def_prim_arr[ser_opt]) exit 154
+        } 
+        
+        printf "%s", "ser_def_opts=\""
+        for (ser_opt in def_prim_arr) {print ser_opt "=" def_prim_arr[ser_opt]}
+        for (ser_opt in def_secondary_arr) print ser_opt "=" def_secondary_arr[ser_opt]
+        print "\""
+        exit rv
+    }' "$MULTIWAN_QOS_CFG_FILE" "$MULTIWAN_QOS_DEFAULTS_FILE"
+    rv=$?
+
+    [ $rv != 155 ] && { rm -f "$miss_sec_f" "$miss_opt_f"; return $rv; }
+
+    for file in "$miss_sec_f" "$miss_opt_f"; do
+        [ -f "$file" ] || continue
+        log_msg -warn "" "Missing config ${file##*-}:" "$(cat "$file")"
+        rm -f "$file"
+    done
+    return 155
+}
+
+load_and_fix_config() {
+    export MULTIWAN_QOS_CONFIG_LOADED=
+    try_load_and_fix_config "$@" && { MULTIWAN_QOS_CONFIG_LOADED=1; return 0; }
+    # 155 = config loaded but some options/sections missing
+    [ $? != 155 ] && {
+        error_out "Failed to load config."
+        uci revert multiwan-qos 2>/dev/null
+    }
+    return 1
+}
+
+# return codes:
+# 0 - check or fix OK
+# 1 - error
+try_load_and_fix_config() {
+    parse_ser_opt() {
+        case "$4" in
+            '') return 0 ;;
+            *:*=*) ;;
+            *) error_out "parse_ser_opt: unexpected input '$4'."; return 1
+        esac
+        local gso_section="${4%%:*}" gso_val="${4#*=}" gso_opt_name="${4#*:}"
+        gso_opt_name="${gso_opt_name%"=$gso_val"}"
+        eval "$1=\"$gso_section\" $2=\"$gso_opt_name\" $3=\"$gso_val\""
+    }
+
+    local nofix=
+    [ "$1" = '-nofix' ] && nofix=1
+
+    if [ ! -f "$MULTIWAN_QOS_CFG_FILE" ]; then
+        [ -n "$nofix" ] && return 1
+        log_msg -warn "Config file not found, restoring from multiwan-qos-defaults."
+        # multiwan-qos-defaults is checked for and restored if required by start() using the update() routine
+        [ -f "$MULTIWAN_QOS_DEFAULTS_FILE" ] || { error_out "$MULTIWAN_QOS_DEFAULTS_FILE not found."; return 1; }
+        uci import multiwan-qos < "$MULTIWAN_QOS_DEFAULTS_FILE" || {
+            error_out "Failed to restore config."
+            return 1
+        }
+        log_msg "Config file restored."
+    fi
+
+    local IFS="$DEFAULT_IFS" section section_name ser_opt opt_name def_val \
+        parse_rv parse_res missing_sections='' missing_opts='' ser_def_opts=''
+
+    # Validate config and generate $parse_res for config repair
+    parse_res="$(parse_config)"
+    parse_rv=$?
+
+    case $parse_rv in
+        0|155) ;;
+        1) error_out "Failed to parse config."; return 1 ;;
+        154) error_out "Failed to process $MULTIWAN_QOS_DEFAULTS_FILE."; return 1 ;;
+        *) error_out "Unexpected return code $parse_rv when parsing config."; return 1 ;;
+    esac
+
+    eval "$parse_res" || { error_out "Failed to parse config."; return 1; }
+
+    if [ "$parse_rv" = 155 ] && [ -z "$nofix" ]; then
+        log_msg "" "Adding missing sections and options from the default config."
+
+        IFS="$_NL_"
+        for section in $missing_sections; do
+            [ -n "$section" ] || continue
+            section_name="${section%%=*}"
+            index="${section#*=}"
+            log_msg "Adding config section '$section_name'."
+            uci set "multiwan_qos.${section_name}=${section_name}" &&
+            uci reorder "multiwan_qos.${section_name}=${index}" || return 1
+        done
+        for ser_opt in $missing_opts; do
+            [ -n "$ser_opt" ] || continue
+            parse_ser_opt section opt_name def_val "$ser_opt" || return 1
+            [ -n "$section" ] && [ -n "$opt_name" ] && [ -n "$def_val" ] || continue
+            log_msg "Adding option '$opt_name' to section '$section' with default value '$def_val'."
+            uci set "multiwan_qos.${section}.${opt_name}=${def_val}" ||
+                { error_out "Failed to add config option."; return 1; }
+        done
+        IFS="$DEFAULT_IFS"
+        uci commit multiwan-qos || return 1
+        parse_rv=0
+    fi
+
+    if [ -z "$nofix" ]; then
+        local agent_commit_req=''
+        uci -q get multiwan-qos.agent >/dev/null 2>&1 || {
+            log_msg "Adding missing config section 'agent'."
+            uci set multiwan-qos.agent=agent || return 1
+            agent_commit_req=1
+        }
+        uci -q get multiwan-qos.agent.enabled >/dev/null 2>&1 || {
+            uci set multiwan-qos.agent.enabled='0' || return 1
+            agent_commit_req=1
+        }
+        uci -q get multiwan-qos.agent.api_key >/dev/null 2>&1 || {
+            uci set multiwan-qos.agent.api_key='' || return 1
+            agent_commit_req=1
+        }
+        uci -q get multiwan-qos.agent.timeout >/dev/null 2>&1 || {
+            uci set multiwan-qos.agent.timeout='300' || return 1
+            agent_commit_req=1
+        }
+        [ -z "$agent_commit_req" ] || uci commit multiwan-qos || return 1
+    fi
+
+    config_load 'multiwan-qos' || return 1
+
+    IFS="$_NL_"
+    for ser_opt in $ser_def_opts; do
+        IFS="$DEFAULT_IFS"
+        parse_ser_opt section opt_name def_val "$ser_opt" || return 1
+        var_name="$opt_name"
+
+        # Var name and def val overrides
+        case "${section}:${opt_name}" in
+            global:enabled) var_name=global_enabled ;;
+            advanced:ACKRATE) def_val=$((UPRATE * 5 / 100)) ;;
+            hfsc:GAMEUP) def_val=$(calculate_realtime_rate_default "$UPRATE" "wan") ;;
+            hfsc:GAMEDOWN) def_val=$(calculate_realtime_rate_default "$DOWNRATE" "lan") ;;
+            hfsc:netem_direction) var_name=NETEM_DIRECTION ;;
+        esac
+
+        NO_EXPORT='' config_get "$var_name" "$section" "$opt_name" "$def_val"
+    done
+    IFS="$DEFAULT_IFS"
+
+    # Ensure valid values for download/upload rates per interface
+    # This part is now handled within the interface setup iteration or individual interface validation
+    # For global validation, we might just skip or iterate if needed.
+    # Since we are moving to per-interface setup, global variable export here is less critical
+    # but we should still ensure valid defaults if possible.
+
+    # Load PC Agent config (optional section — defaults to disabled)
+    AGENT_ENABLED=0
+    config_get AGENT_ENABLED agent enabled 0
+    export AGENT_ENABLED
+
+    return $parse_rv
+}
+
+migrate_config() {
+    try_migrate_config
+    local rv=$?
+    [ $rv = 0 ] || {
+        error_out "Failed to migrate config."
+        uci_tmp revert multiwan-qos 2>/dev/null
+    }
+    rm -rf "$TMP_CFG_DIR"
+    return $rv
+}
+
+try_migrate_config() {
+    report_migration() {
+        local msg="Link layer settings migrated from settings for qdisc '$1' to advanced section: preset=$2"
+        [ -n "$3" ] && msg="$msg, overhead=$3"
+        log_msg "$msg"
+    }
+
+    delete_premigration_settings() {
+        local qdisc old_settings
+        for qdisc in cake hfsc; do
+            eval "old_settings=\"\${${qdisc}_old_settings}\""
+            for setting in $old_settings; do
+                uci_tmp -q delete "multiwan_qos.$qdisc.$setting"
+            done
+        done
+    }
+
+    . /lib/functions.sh
+
+    local commit_req=''
+
+    [ -f "$MULTIWAN_QOS_CFG_FILE" ] &&
+    try_mkdir -p "$TMP_CFG_DIR" &&
+    cp "$MULTIWAN_QOS_CFG_FILE" "$TMP_CFG_FILE" || return 1
+
+    # Check for and correct the custom_rules section
+    awk "
+        BEGIN{cor=3; inc=3}
+        /^[  ]*config[  ]+multiwan_qos[  ]+'custom_rules'[  ]*$/{inc=4}
+        /^[  ]*config[  ]+custom_rules[  ]+'custom_rules'[  ]*$/{cor=4}
+        END{exit cor inc}
+    "  "$TMP_CFG_FILE"
+
+    case "$?" in
+        33)
+            # No custom_rules section found
+            ;;
+        43)
+            # Only correct section found
+            ;;
+        34)
+            # Only incorrect section found - correct it
+            commit_req=1
+            print_msg "Incorrect custom_rules section found. Correcting..."
+            sed -i "s/config multiwan_qos 'custom_rules'/config custom_rules 'custom_rules'/" "$TMP_CFG_FILE"
+            print_msg "custom_rules section corrected."
+            ;;
+        44)
+            # Both correct and incorrect sections found - remove duplicate
+            commit_req=1
+            print_msg "Both incorrect and correct custom_rules sections found. Removing the incorrect one..."
+            uci_tmp -q delete multiwan_qos.@multiwan_qos[0] || return 1
+            print_msg "Incorrect custom_rules section removed."
+            ;;
+        *)
+            error_out "Unexpected return code '$?' when checking the 'custom_rules' section."
+            return 1
+            ;;
+    esac
+
+    # Migrate link layer settings to advanced section based on active QDisc
+
+    local root_qdisc qdisc settings setting val adv_preset \
+        has_old_settings=0 \
+        cake_old_settings="COMMON_LINK_PRESETS OVERHEAD MPU LINK_COMPENSATION ETHER_VLAN_KEYWORD" \
+        hfsc_old_settings="LINKTYPE OH"
+    : "$cake_old_settings" "$hfsc_old_settings"
+
+    UCI_CONFIG_DIR="$TMP_CFG_DIR" config_load 'multiwan-qos' || return 1
+    config_get root_qdisc settings ROOT_QDISC
+    config_get adv_preset advanced COMMON_LINK_PRESETS
+
+    # Check for old settings, migrate settings for CAKE or set OLD_${setting} vars for HFSC
+    for qdisc in cake hfsc; do
+        eval "settings=\"\${${qdisc}_old_settings}\""
+        for setting in $settings; do
+            config_get val "$qdisc" "$setting"
+            [ -n "$val" ] || continue
+
+            has_old_settings=1
+
+            if [ "$qdisc" = "$root_qdisc" ]; then 
+                eval "OLD_${setting}=\"${val}\""
+            fi
+        done
+    done
+    
+    # Migrate legacy settings section to interface section
+    uci_tmp get multiwan-qos.settings >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        print_msg "Migrating legacy settings section to interface 'wan'..."
+        commit_req=1
+        
+        # Create new interface section
+        uci_tmp set multiwan-qos.wan=interface
+        uci_tmp set multiwan-qos.wan.name='wan'
+        
+        # Move options
+        local old_WAN old_DOWNRATE old_UPRATE old_ROOT_QDISC
+        uci_tmp get multiwan-qos.settings.WAN >/dev/null 2>&1 && old_WAN=$(uci_tmp get multiwan-qos.settings.WAN)
+        uci_tmp get multiwan-qos.settings.DOWNRATE >/dev/null 2>&1 && old_DOWNRATE=$(uci_tmp get multiwan-qos.settings.DOWNRATE)
+        uci_tmp get multiwan-qos.settings.UPRATE >/dev/null 2>&1 && old_UPRATE=$(uci_tmp get multiwan-qos.settings.UPRATE)
+        uci_tmp get multiwan-qos.settings.ROOT_QDISC >/dev/null 2>&1 && old_ROOT_QDISC=$(uci_tmp get multiwan-qos.settings.ROOT_QDISC)
+        
+        [ -n "$old_WAN" ] && uci_tmp set multiwan-qos.wan.device="$old_WAN"
+        [ -n "$old_DOWNRATE" ] && uci_tmp set multiwan-qos.wan.download="$old_DOWNRATE"
+        [ -n "$old_UPRATE" ] && uci_tmp set multiwan-qos.wan.upload="$old_UPRATE"
+        [ -n "$old_ROOT_QDISC" ] && uci_tmp set multiwan-qos.wan.qdisc="$old_ROOT_QDISC"
+        
+        # Delete old settings section
+        uci_tmp delete multiwan-qos.settings
+        
+        # Also migrate qdisc specific settings if necessary (already being handled partially above)
+    fi
+
+    # Skip migration if not needed
+    if [ -n "$adv_preset" ]; then
+        if [ "$has_old_settings" = 0 ]; then
+            [ -n "$commit_req" ] || return 0
+            commit_tmp_config
+            return $?
+        fi
+        delete_premigration_settings
+        commit_tmp_config
+        return $?
+    fi
+
+    # Clean up old settings
+    delete_premigration_settings
+
+    # Finalize CAKE migration
+    [ "$root_qdisc" = cake ] && {
+        if [ -n "$OLD_COMMON_LINK_PRESETS" ]; then
+            commit_tmp_config || return 1
+            report_migration cake "$OLD_COMMON_LINK_PRESETS" "$OLD_OVERHEAD"
+        else
+            uci_tmp set multiwan-qos.advanced.COMMON_LINK_PRESETS=ethernet &&
+            commit_tmp_config || return 1
+            log_msg "Added missing link layer preset: ethernet."
+        fi
+        return 0
+    }
+
+    # Migrate settings for non-cake root qdiscs
+
+    # Use default "ethernet" if LINKTYPE not set
+    case "${OLD_LINKTYPE:-ethernet}" in
+        atm)
+            COMMON_LINK_PRESETS=atm
+            # ATM used the $OH variable - only set if different from default
+            [ -n "$OLD_OH" ] && [ "$OLD_OH" != "44" ] && {
+                OH="$OLD_OH"
+                uci_tmp set multiwan-qos.advanced.OVERHEAD="$OLD_OH" || return 1
+            }
+            ;;
+        docsis)
+            COMMON_LINK_PRESETS=docsis
+            ;;
+        *)
+            COMMON_LINK_PRESETS=ethernet
+            ;;
+    esac
+
+    uci_tmp set multiwan-qos.advanced.COMMON_LINK_PRESETS="$COMMON_LINK_PRESETS" &&
+    commit_tmp_config || return 1
+    report_migration "$root_qdisc" "$COMMON_LINK_PRESETS" "$OH"
+    :
+}
+
+### Servce functions
+
+# Check if multiwan_qos is active
+# Return codes:
+# 0 - active
+# 1 - inactive
+# 250 - error
+is_multiwan_qos_active() {
+    [ -n "$1" ] || { error_out "is_multiwan_qos_active: specify WAN device"; return 250; }
+    tc qdisc show dev "$1" 2>/dev/null | grep -qE "hfsc|cake|htb" && \
+        nft -t list table inet dscptag >/dev/null 2>&1
+}
+
+# Validate a single nftables file
+# Args: $1=file_path, $2=file_type, $3=tmp_file
+# Returns: 0 on success, 1 on failure
+validate_nft_file() {
+    local file_path="$1" file_type="$2" tmp_file="$3"
+    
+    echo "Validating $file_type ($file_path):" >> "$tmp_file"
+    
+    if [ ! -s "$file_path" ]; then
+        echo "  - File is empty or does not exist. Skipping." >> "$tmp_file"
+        return 0
+    fi
+    
+    case "$file_type" in
+        "full table rules")
+            if nft --check --file "$file_path" >> "$tmp_file" 2>&1; then
+                echo "  - Syntax check PASSED." >> "$tmp_file"
+                return 0
+            else
+                echo "  - Syntax check FAILED." >> "$tmp_file"
+                return 1
+            fi
+            ;;
+        "inline rules")
+            validate_inline_rules "$file_path" "$tmp_file"
+            ;;
+        *)
+            echo "  - ERROR: Unknown file type '$file_type'." >> "$tmp_file"
+            return 1
+            ;;
+    esac
+}
+
+# Validate inline rules with context wrapping
+# Args: $1=file_path, $2=tmp_file
+validate_inline_rules() {
+    local file_path="$1" tmp_file="$2"
+    local check_file="/tmp/multiwan_qos_inline_init_check.nft"
+    
+    echo "  - Checking for forbidden keywords (table, chain, hook, priority)..." >> "$tmp_file"
+    
+    if grep -Eq '^[[:space:]]*(table|chain|type|hook|priority)[[:space:]]+' "$file_path"; then
+        echo "  - Keyword check FAILED. Forbidden keyword found." >> "$tmp_file"
+        return 1
+    fi
+    
+    printf '%s\n%s\n' "  - Keyword check PASSED." \
+        "  - Checking NFT syntax (within context)..." >> "$tmp_file"
+    
+    # Create temporary file with context
+    {
+        printf '%s\n\t%s\n' "table inet __multiwan_qos_validation_ctx {" \
+            "chain __dscptag_init_ctx {"
+        cat "$file_path"
+        printf '\n\t%s\n%s\n' "}" "}"
+    } > "$check_file"
+    
+    if nft --check --file "$check_file" 2>>"$tmp_file"; then
+        echo "  - Syntax check PASSED." >> "$tmp_file"
+        rm -f "$check_file"
+        return 0
+    else
+        echo "  - Syntax check FAILED." >> "$tmp_file"
+        rm -f "$check_file"
+        return 1
+    fi
+}
+
+validate_custom_rules() {
+    local tmp_file="/tmp/multiwan_qos_custom_rules_validation.txt"
+    local fail=0
+    
+    # Clear previous validation results
+    true > "$tmp_file"
+    
+    # FIX: Validate FIRST, then only flush if validation passes (Bug #3)
+    # This prevents breaking active rules if validation fails
+    
+    # Validate both rule types BEFORE touching the table
+    if ! validate_nft_file "$MULTIWAN_QOS_CUSTOM_RULES_FILE" "full table rules" "$tmp_file"; then
+        fail=$((fail + 1))
+    fi
+    
+    if ! validate_nft_file "$MULTIWAN_QOS_INLINE_RULES_FILE" "inline rules" "$tmp_file"; then
+        fail=$((fail + 1))
+    fi
+    
+    # Only flush table if validation passed
+    if [ "$fail" -eq 0 ]; then
+        if nft list table inet multiwan_qos_custom >/dev/null 2>&1; then
+            echo "Flushing existing multiwan_qos_custom table after successful validation..." >> "$tmp_file"
+            nft flush table inet multiwan_qos_custom
+        fi
+        printf '\n%s\n' "Overall validation: PASSED" >> "$tmp_file"
+        return 0
+    else
+        printf '\n%s\n' "Overall validation: FAILED" >> "$tmp_file"
+        return 1
+    fi
+}
+
+# Detect package manager. Prefer apk on OpenWrt 25.12+, keep opkg as legacy fallback.
+detect_package_manager() {
+    local has_apk=0 has_opkg=0
+    
+    check_util apk && has_apk=1
+    check_util opkg && has_opkg=1
+    
+    if [ "$has_apk" -eq 1 ]; then
+        echo "apk"
+    elif [ "$has_opkg" -eq 1 ]; then
+        echo "opkg"
+    else 
+        echo "unknown"
+    fi
+}
+
+# Check for valid package manager
+check_pkg_manager() {
+    case "$1" in
+        apk|opkg)
+            return 0
+            ;;
+        conflict)
+            error_out "Multiple package managers detected (apk and opkg). Package management disabled."
+            return 1
+            ;;
+        *)
+            error_out "No supported package manager found."
+            return 1
+            ;;
+    esac
+}
+
+# Check if a package is installed
+check_package() {
+    local pkg="$1"
+    
+    case "$pkg_manager" in
+        "apk")
+            apk info -e "$pkg" >/dev/null 2>&1
+            return $?
+            ;;
+        "opkg")
+            opkg list-installed | grep -q "^$pkg "
+            return $?
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+acquire_package_lock() {
+    local oldpid wait_count
+
+    if mkdir "$MULTIWAN_QOS_PACKAGE_LOCK" 2>/dev/null; then
+        echo "$$" > "$MULTIWAN_QOS_PACKAGE_LOCK/pid"
+        MULTIWAN_QOS_PACKAGE_LOCK_HELD=1
+        return 0
+    fi
+
+    oldpid="$(cat "$MULTIWAN_QOS_PACKAGE_LOCK/pid" 2>/dev/null)"
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+        log_msg "Waiting for another package install to finish (pid $oldpid)"
+        wait_count=0
+        while [ "$wait_count" -lt 60 ]; do
+            sleep 1
+            if mkdir "$MULTIWAN_QOS_PACKAGE_LOCK" 2>/dev/null; then
+                echo "$$" > "$MULTIWAN_QOS_PACKAGE_LOCK/pid"
+                MULTIWAN_QOS_PACKAGE_LOCK_HELD=1
+                return 0
+            fi
+            wait_count=$((wait_count + 1))
+        done
+        error_out "Timed out waiting for package install lock."
+        return 1
+    fi
+
+    rm -f "$MULTIWAN_QOS_PACKAGE_LOCK/pid" 2>/dev/null
+    rmdir "$MULTIWAN_QOS_PACKAGE_LOCK" 2>/dev/null
+    mkdir "$MULTIWAN_QOS_PACKAGE_LOCK" 2>/dev/null || {
+        error_out "Could not acquire package install lock."
+        return 1
+    }
+    echo "$$" > "$MULTIWAN_QOS_PACKAGE_LOCK/pid"
+    MULTIWAN_QOS_PACKAGE_LOCK_HELD=1
+    return 0
+}
+
+release_package_lock() {
+    [ "$MULTIWAN_QOS_PACKAGE_LOCK_HELD" = "1" ] || return 0
+    rm -f "$MULTIWAN_QOS_PACKAGE_LOCK/pid" 2>/dev/null
+    rmdir "$MULTIWAN_QOS_PACKAGE_LOCK" 2>/dev/null
+    MULTIWAN_QOS_PACKAGE_LOCK_HELD=0
+}
+
+install_packages() {
+    local missing_packages="" pkg
+
+    check_pkg_manager "$pkg_manager" || return 1
+
+    for pkg in $REQUIRED_PACKAGES; do
+        if ! check_package "$pkg"; then
+            missing_packages="$missing_packages $pkg"
+        fi
+    done
+
+    [ -z "$missing_packages" ] && return 0
+
+    acquire_package_lock || return 1
+
+    # Re-check after acquiring the lock in case another service fixed them.
+    missing_packages=""
+    for pkg in $REQUIRED_PACKAGES; do
+        if ! check_package "$pkg"; then
+            missing_packages="$missing_packages $pkg"
+        fi
+    done
+
+    if [ -n "$missing_packages" ]; then
+        print_msg "Installing missing required packages:$missing_packages"
+        case "$pkg_manager" in
+            "apk")
+                apk update || {
+                    release_package_lock
+                    error_out "Failed to update apk package list."
+                    return 1
+                }
+                apk add $missing_packages || {
+                    release_package_lock
+                    error_out "Failed to install packages:$missing_packages"
+                    return 1
+                }
+                ;;
+            "opkg")
+                opkg update || {
+                    release_package_lock
+                    error_out "Failed to update opkg package list."
+                    return 1
+                }
+                opkg install $missing_packages || {
+                    release_package_lock
+                    error_out "Failed to install packages:$missing_packages"
+                    return 1
+                }
+                ;;
+        esac
+    fi
+
+    release_package_lock
+
+    check_package_status
+}
+
+check_package_status() {
+    local missing_packages=""
+    
+    for pkg in $REQUIRED_PACKAGES; do
+        if ! check_package "$pkg"; then
+            missing_packages="$missing_packages $pkg"
+        fi
+    done
+    
+    if [ -n "$missing_packages" ]; then
+        error_out "Missing packages:$missing_packages"
+        return 1
+    fi
+    return 0
+}
+
+check_deps() {
+    check_pkg_manager "$pkg_manager" || return 1
+    check_package_status
+}
+
+install_deps() {
+    install_packages
+}
+
+create_hotplug_script() {
+    log_msg "" "Creating the hotplug script."
+    # The actual hotplug logic lives in $MULTIWAN_QOS_HOTPLUG_COMMON (single source
+    # of truth). The script we generate here is a thin wrapper that sources it.
+    cat > "$MULTIWAN_QOS_HOTPLUG_SCRIPT" << 'EOF'
+#!/bin/sh
+# MultiWAN QoS hotplug handler — sources shared logic from a single file
+# to avoid drift between the packaged and init.d-generated copies.
+. /lib/multiwan-qos/hotplug-common.sh
+EOF
+}
+
+manage_custom_rules_file() {
+    local action="$1"
+    
+    case "$action" in
+        create)
+            # Ensure the directory exists
+            try_mkdir -p "${MULTIWAN_QOS_D}"
+            
+            # Create the files if they don't exist
+            [ ! -f "$MULTIWAN_QOS_CUSTOM_RULES_FILE" ] && touch "$MULTIWAN_QOS_CUSTOM_RULES_FILE"
+            [ ! -f "$MULTIWAN_QOS_INLINE_RULES_FILE" ] && touch "$MULTIWAN_QOS_INLINE_RULES_FILE"
+
+            ;;
+        delete)
+            # Not used at the moment...
+            rm -f "$MULTIWAN_QOS_CUSTOM_RULES_FILE"
+            rm -f "$MULTIWAN_QOS_INLINE_RULES_FILE"
+            ;;
+    esac
+}
+
+start_service_impl() {
+    # handle first run after installation or update from older versions
+    if [ "$VERSION" = dev ]; then
+        log_msg "" "Completing the upgrade of the update mechanism..."
+        update -f || return 1
+        # shellcheck disable=SC1090
+        . "${MULTIWAN_QOS_SERVICE_PATH}" # source updated init script 
+    fi
+
+    # Check files and re-fetch them if any are missing
+    for component in $MULTIWAN_QOS_COMPONENTS; do
+        check_files_integrity "$component"
+        rv=$?
+        case $rv in
+            0) ;; # integrity OK
+            3) log_msg -warn "Integrity registry for $component is missing; skipping md5 verification for this custom build." ;;
+            1) return 1 ;;
+            2) # missing files
+                local fix_upd_channel='' fix_version='' force_version=''
+                case "$component" in
+                    BACKEND) fix_version="$VERSION" fix_upd_channel="$UPD_CHANNEL" ;;
+                    FRONTEND) get_component_spec fix_version fix_upd_channel FRONTEND local 2>/dev/null
+                esac
+                case "$fix_version" in
+                    dev|''|"1.1.0"|"v1.1.0") ;;
+                    *) force_version="-W $fix_version"
+                esac
+                : "${fix_upd_channel:=release}"
+                if ! update -U "$fix_upd_channel" $force_version -c "$component"; then
+                    log_msg -warn "Failed to fix multiwan_qos installation automatically."
+                    [ $rv = 2 ] && {
+                        log_msg "Either connect to the Internet and run '/etc/init.d/multiwan-qos start' to have missing files automatically fetched," \
+                        "or manually download and save them in designated paths."
+                        return 1
+                    }
+                    # Do not fail on missing reg files
+                fi ;;
+            4) ;; # non-matching md5sums
+        esac
+    done
+    check_deps || {
+        error_out "Missing required packages. Install MultiWAN QoS through the OpenWrt feed, or run '/etc/init.d/multiwan-qos install_deps' to attempt repair."
+        return 1
+    }
+    create_hotplug_script
+
+    load_and_fix_config || return 1
+
+    # Enable the global option
+    uci set multiwan-qos.global.enabled='1'
+    uci commit multiwan-qos
+    export global_enabled=1
+
+    # Create custom rules file if it doesn't exist
+    manage_custom_rules_file create
+    if validate_custom_rules; then
+        nft destroy table inet multiwan_qos_custom
+        nft -f "$MULTIWAN_QOS_CUSTOM_RULES_FILE" || { error_out "Failed to load custom nftables rules."; return 1; }
+    else
+        error_out "Custom rules validation failed. Not applying custom nftables rules."
+    fi
+
+    preserve_config_files # Add config files to sysupgrade.conf
+
+    run_with_timeout 90 /bin/sh "$MULTIWAN_QOS_MAIN_SCRIPT" || { error_out "Failed to start multiwan_qos."; return 1; }
+
+    run_with_timeout 30 /etc/init.d/firewall reload &&
+    enable || return 1
+
+    log_msg "Service started"
+}
+
+start_service() {
+    local rv
+
+    if is_package_script_context; then
+        log_msg "Skipping service start during package installation."
+        return 0
+    fi
+
+    mark_multiwan_qos_restarting
+    cleanup_agent_runtime_files
+    start_service_impl
+    rv=$?
+    clear_multiwan_qos_restarting
+    return $rv
+}
+
+stop_service_impl() {
+    . /lib/functions/network.sh
+
+    cleanup_interface() {
+        local config="$1"
+        local device
+
+        config_get device "$config" device
+        
+        # If device is not specified, try to resolve from section name as fallback
+        if [ -z "$device" ]; then
+             network_get_device device "$config"
+        fi
+        
+        [ -z "$device" ] && return
+
+        # Delete qdiscs
+        tc qdisc del dev "$device" root > /dev/null 2>&1
+        tc qdisc del dev ifb-"$device" root > /dev/null 2>&1
+        tc qdisc del dev "$device" ingress > /dev/null 2>&1
+
+        # Remove IFB interface
+        ip link del ifb-"$device" 2>/dev/null
+    }
+
+    print_msg "Stopping service multiwan_qos..."
+
+    # Only disable if not in shutdown and not in restart
+    if [ "$DISABLE_ON_STOP" != "0" ] && [ -z "$FROM_SHUTDOWN" ]; then
+        disable
+        uci set multiwan-qos.global.enabled='0'
+        uci commit multiwan-qos
+    fi
+
+    # Remove custom rules table
+    nft destroy table inet multiwan_qos_custom 2>/dev/null
+
+    cleanup_agent_runtime_files
+
+    # Remove legacy CAKE watchdog from earlier custom builds.
+    if [ -f /var/run/multiwan_qos-cake-watchdog.pid ]; then
+        kill "$(cat /var/run/multiwan_qos-cake-watchdog.pid)" 2>/dev/null
+        rm -f /var/run/multiwan_qos-cake-watchdog.pid
+    fi
+    killall multiwan_qos-cake-watchdog.sh 2>/dev/null
+    rm -f /etc/multiwan_qos-cake-watchdog.sh
+    rm -rf /var/run/multiwan_qos-cake-watchdog.lock /var/run/multiwan_qos-cake-watchdog.state
+
+    # Kill agent watchdog
+    if [ -f /var/run/multiwan-qos-agent-watchdog.pid ]; then
+        kill "$(cat /var/run/multiwan-qos-agent-watchdog.pid)" 2>/dev/null
+        rm -f /var/run/multiwan-qos-agent-watchdog.pid
+    fi
+    killall multiwan-qos-agent-watchdog.lua 2>/dev/null
+
+    ## Delete files
+    rm -f "$MULTIWAN_QOS_HOTPLUG_SCRIPT"
+    rm -f /usr/share/nftables.d/ruleset-post/dscptag.nft
+
+    # Clean up all configured interfaces
+    config_load 'multiwan-qos'
+    config_foreach cleanup_interface interface
+
+    # Clean up multicast policing on LAN
+    nft destroy table inet multiwan_qos_mcast 2>/dev/null
+
+    nft destroy table inet dscptag 2>/dev/null
+    nft destroy table netdev multiwan_qos_ingress 2>/dev/null
+
+    if [ "$DISABLE_ON_STOP" != "0" ]; then
+        print_msg "Reloading firewall service..."
+        run_with_timeout 30 /etc/init.d/firewall reload || log_msg -warn "Firewall reload timed out or failed during MultiWAN QoS stop."
+    fi
+    log_msg "Service stopped"
+}
+
+stop_service() {
+    local rv
+    mark_multiwan_qos_restarting
+    cleanup_agent_runtime_files
+    stop_service_impl
+    rv=$?
+    clear_multiwan_qos_restarting
+    return $rv
+}
+
+shutdown() {
+    # Set variable for shutdown
+    FROM_SHUTDOWN=1
+    # Call stop_service
+    stop_service
+}
+
+status_service() {
+    load_and_fix_config -nofix
+
+    print_msg "==== multiwan_qos Status ===="
+    
+    # Check if autostart is enabled
+    if enabled; then
+        print_msg "multiwan_qos autostart is enabled."
+    else
+        print_msg "multiwan_qos autostart is not enabled."
+    fi
+
+    # Check if the service is enabled in UCI config
+    local config_enabled=true not_managing=
+    if [ "$global_enabled" != 1 ]; then
+        config_enabled=false
+        not_managing=", but multiwan_qos is not managing it"
+    fi
+    print_msg "multiwan_qos global:enabled is $config_enabled."
+
+    local active_qdisc='' active_device=''
+    capture_active_interface() {
+        local config="$1" enabled device qdisc
+
+        [ -n "$active_qdisc" ] && return 0
+        config_get_bool enabled "$config" enabled 1
+        [ "$enabled" -eq 1 ] || return 0
+        config_get device "$config" device
+        [ -n "$device" ] || return 0
+        config_get qdisc "$config" qdisc 'hfsc'
+        active_qdisc="$qdisc"
+        active_device="$device"
+    }
+    config_load 'multiwan-qos'
+    config_foreach capture_active_interface interface
+    [ -n "$active_qdisc" ] || active_qdisc="${ROOT_QDISC:-hfsc}"
+
+    local dir dev qdisc qdiscs qdisc_print
+    local reported_interfaces=0
+
+    report_shaping_dev() {
+        dir="$1"
+        dev="$2"
+        qdiscs="$(tc qdisc show dev "$dev" 2>/dev/null | sed -n 's/^qdisc\s\s*\([^ \t]*\).* root .*/\1/p')"
+        qdiscs="${qdiscs//$'\n'/ }"
+        active_qdisc=''
+        qdisc_print=''
+        for qdisc in cake hfsc htb; do
+            case "${qdiscs}" in "${qdisc}"|"${qdisc} "*|*" ${qdisc}"|*" ${qdisc} "*)
+                active_qdisc="$qdisc"
+            esac
+        done
+
+        case "$active_qdisc" in
+            cake) qdisc_print=CAKE ;;
+            hfsc) qdisc_print=HFSC ;;
+            htb) qdisc_print=HTB ;;
+        esac
+
+        if [ -n "$active_qdisc" ]; then
+            print_msg "Traffic shaping ($qdisc_print) is active on the $dir interface ($dev)$not_managing."
+        else
+            print_msg "No traffic shaping is active on the $dir interface ($dev)."
+        fi
+    }
+
+    report_interface_shaping() {
+        local config="$1"
+        local enabled device ifb_dev
+
+        config_get_bool enabled "$config" enabled 1
+        [ "$enabled" -eq 1 ] || return
+
+        config_get device "$config" device
+        [ -n "$device" ] || return
+
+        reported_interfaces=$((reported_interfaces + 1))
+        ifb_dev="ifb-$device"
+
+        report_shaping_dev egress "$device"
+        report_shaping_dev ingress "$ifb_dev"
+        check_ifb_health "$device"
+    }
+
+    check_ifb_health() {
+        local device="$1" ifb_dev="ifb-$device"
+
+        ip link show "$ifb_dev" >/dev/null 2>&1 || {
+            print_msg "  WARNING: IFB device $ifb_dev does not exist"
+            return 1
+        }
+
+        local stats qdisc_type drops backlog
+        stats=$(tc -s qdisc show dev "$ifb_dev" 2>/dev/null)
+        [ -z "$stats" ] && {
+            print_msg "  WARNING: No qdisc stats for $ifb_dev"
+            return 1
+        }
+
+        # Extract root qdisc type
+        qdisc_type=$(echo "$stats" | awk '/^qdisc / && /root/ {print $2; exit}')
+
+        # Cumulative counters — report as observed, not as active problems
+        drops=$(echo "$stats" | awk '/dropped/ {
+            for(i=1;i<=NF;i++) if($i=="dropped") {
+                v=$(i+1); gsub(/[^0-9]/, "", v); print v; exit
+            }
+        }')
+        drops="${drops:-0}"
+
+        # Currently-live backlog — flag if non-zero (indicates active queuing pressure)
+        backlog=$(echo "$stats" | awk '/backlog/ {
+            for(i=1;i<=NF;i++) if($i=="backlog") {print $(i+1); exit}
+        }')
+
+        print_msg "  IFB ($ifb_dev): qdisc=$qdisc_type drops=$drops (cumulative)"
+        case "$backlog" in
+            ""|"0"|"0b") ;;
+            *) print_msg "  WARNING: $ifb_dev has active backlog: $backlog" ;;
+        esac
+
+        return 0
+    }
+
+    config_load 'multiwan-qos'
+    config_foreach report_interface_shaping interface
+
+    # Legacy fallback for configurations that only use settings.WAN.
+    # Only fall back when NO interface sections are configured at all.
+    if [ "$reported_interfaces" -eq 0 ]; then
+        local has_interface_sections=0
+        count_interfaces() { has_interface_sections=1; }
+        config_foreach count_interfaces interface
+        if [ "$has_interface_sections" -eq 0 ] && [ -n "$WAN" ]; then
+            local IFB="ifb-$WAN"
+            for dir in egress ingress; do
+                case "$dir" in
+                    egress) dev="$WAN" ;;
+                    ingress) dev="$IFB" ;;
+                esac
+                report_shaping_dev "$dir" "$dev"
+            done
+        fi
+    fi
+
+    # Show summary of current settings
+    print_msg "" "==== Current Settings ====" \
+        "Upload rate: $UPRATE kbps" \
+        "Download rate: $DOWNRATE kbps" \
+        "Game traffic reserve: calculated per interface"
+    case "$active_qdisc" in
+        cake) print_msg "Queue discipline: CAKE (single-lane shaper)" ;;
+        hfsc) print_msg "Queue discipline: HFSC (realtime/default/low/bulk lanes)" ;;
+        hybrid) print_msg "Queue discipline: Hybrid (realtime/default/bulk lanes)" ;;
+        htb) print_msg "Queue discipline: HTB (realtime/default/bulk lanes)" ;;
+        *) print_msg "Queue discipline: $active_qdisc" ;;
+    esac
+
+    # Display MultiWAN QoS version information
+    print_msg "" "==== Version Information ===="
+    check_version
+
+    # Display system information
+    print_msg "" "==== System Information ===="
+    ubus call system board
+
+    # Display health check information
+    print_msg "" "==== Health Check ===="
+    health_check
+
+    # Check for flow offloading settings (incompatible with multiwan_qos)
+    print_msg "" "==== Flow Offloading Check ===="
+    local flow_offloading_enabled=0
+    local flow_offloading_hw_enabled=0
+    
+    # Check software flow offloading in firewall defaults
+    if [ "$(uci -q get firewall.@defaults[0].flow_offloading)" = "1" ]; then
+        flow_offloading_enabled=1
+        print_msg "WARNING: Software flow offloading is enabled."
+    fi
+    
+    # Check hardware flow offloading in firewall defaults
+    if [ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = "1" ]; then
+        flow_offloading_hw_enabled=1
+        print_msg "WARNING: Hardware flow offloading is enabled."
+    fi
+    
+    if [ "$flow_offloading_enabled" -eq 1 ] || [ "$flow_offloading_hw_enabled" -eq 1 ]; then
+        print_msg "CRITICAL: Flow offloading is incompatible with multiwan_qos and may cause issues!"
+        print_msg "To disable flow offloading, run:"
+        if [ "$flow_offloading_enabled" -eq 1 ]; then
+            print_msg "  uci set firewall.@defaults[0].flow_offloading='0'"
+        fi
+        if [ "$flow_offloading_hw_enabled" -eq 1 ]; then
+            print_msg "  uci set firewall.@defaults[0].flow_offloading_hw='0'"
+        fi
+        print_msg "  uci commit firewall"
+        print_msg "  /etc/init.d/firewall restart"
+    else
+        print_msg "Flow offloading is disabled (compatible with multiwan_qos)."
+    fi
+
+    # Display WAN interface information
+    print_msg "" "==== WAN Interface Information ===="
+    ifstatus wan | grep -e device
+
+    # Display MultiWAN QoS configuration
+    print_msg "" "==== MultiWAN QoS Configuration ===="
+    cat "$MULTIWAN_QOS_CFG_FILE"
+
+    print_msg "==== Package Status ===="
+
+    if check_pkg_manager "$pkg_manager" && check_package_status; then
+        print_msg "All required packages are installed."
+    else
+        print_msg "Some required packages are missing. MultiWAN QoS may not function correctly."
+    fi
+
+    print_msg "" "==== Detailed Technical Information ====" \
+        "Traffic Control (tc) Queues:"
+    tc -s qdisc
+
+    print_msg "" "==== Nftables Ruleset (dscptag) ===="
+    nft list ruleset | grep 'chain dscptag' -A 100
+
+
+    print_msg "" "==== Custom Rules Table Status ===="
+    if nft list table inet multiwan_qos_custom &>/dev/null; then
+        print_msg "Custom rules table (multiwan_qos_custom) is active." \
+            "Current custom rules:"
+        nft list table inet multiwan_qos_custom
+    else
+        print_msg "Custom rules table (multiwan_qos_custom) is not active or doesn't exist."
+    fi
+
+    print_msg "" "==== Inline Rules Status ===="
+    if [ -s "$MULTIWAN_QOS_INLINE_RULES_FILE" ]; then
+        print_msg "Inline rules are configured:"
+        cat "$MULTIWAN_QOS_INLINE_RULES_FILE"
+        printf '\n'
+    else
+        print_msg "No inline rules configured."
+    fi
+}
+
+refresh_interface() {
+    local target_device="$1"
+    [ -z "$target_device" ] && { error_out "Usage: /etc/init.d/multiwan-qos refresh <device>"; return 1; }
+
+    load_and_fix_config || return 1
+    /bin/sh "$MULTIWAN_QOS_MAIN_SCRIPT" refresh-device "$target_device"
+}
+
+refresh() {
+    refresh_interface "$1"
+}
+
+restart() {
+    local rv
+    mark_multiwan_qos_restarting
+    cleanup_agent_runtime_files
+    DISABLE_ON_STOP=0 stop_service_impl
+    rv=$?
+    if [ "$rv" -eq 0 ]; then
+        sleep 1 # Ensure all processes have been properly terminated
+        start_service_impl
+        rv=$?
+    fi
+    clear_multiwan_qos_restarting
+    return $rv
+}
+
+reload_service() {
+    restart
+}
+
+# 1 - speedtest command
+# 2 - Upload|Download
+# I/O via STDIN/STDOUT
+parse_speedtest_output() {
+    local speedtest_cmd="$1" direction="$2"
+    case "$speedtest_cmd" in
+        speedtest-go*)
+            grep "${direction}:" | grep -oE '[0-9]+\.[0-9]+' | head -n1
+            ;;
+        "speedtest --simple"*)
+            # match to (Upload:|Download:).*, print field 2. if no match, return 1
+            awk "BEGIN{rv=1} \$0~/$direction:/ {print \$2; rv=0; exit} END{exit rv}"
+            ;;
+        *)
+            error_out "Unexpected speedtest command '$speedtest_cmd'."
+            false
+            ;;
+    esac || {
+        error_out "Failed to get the $direction speed."
+        echo "0"
+        return 1
+    }
+    :
+}
+
+auto_setup() {
+    try_auto_setup "$@" && return 0
+    error_out "auto-setup failed."
+    uci revert multiwan-qos 2>/dev/null
+    return 1
+}
+
+# for non-interactive setup, call with '-n [gaming_ip_address]'
+try_auto_setup() {
+    # shellcheck disable=SC2329
+    is_ip_configured() {
+        local ip ip_type section_id="$1" gaming_ip="$2"
+        for ip_type in src_ip dest_ip; do
+            config_get ip "$section_id" "$ip_type"
+            [ "$ip" = "$gaming_ip" ] && { ip_configured=1; break; }
+        done
+    }
+
+    local L3_DEVICE WAN_INTERFACE FINAL_INTERFACE SPEEDTEST_CMD FREE_SPACE SPEED_RESULT DOWNLOAD_SPEED UPLOAD_SPEED
+    local gaming_ip='' noninteractive='' speed_choice response speedtest_req direction
+
+    if [ "$1" = "-n" ]; then
+        gaming_ip="$2"
+        noninteractive=1
+    else
+        noninteractive=
+    fi
+    [ -z "$noninteractive" ] && print_msg "Starting multiwan_qos auto-setup..."
+
+    # Detect WAN interface
+    WAN_INTERFACE=$(ifstatus wan | grep -e '"device"' | cut -d'"' -f4)
+    L3_DEVICE=$(ifstatus wan | grep -e '"l3_device"' | cut -d'"' -f4)
+
+    if [ -z "$WAN_INTERFACE" ] && [ -z "$L3_DEVICE" ]; then
+        error_out "Unable to detect WAN interface. Please set it manually in the configuration."
+        return 1
+    fi
+
+    FINAL_INTERFACE=${L3_DEVICE:-$WAN_INTERFACE}
+    print_msg "Detected WAN interface: $FINAL_INTERFACE"
+
+    # Stop multiwan_qos if it's running
+    if is_multiwan_qos_active "$FINAL_INTERFACE"; then
+        print_msg "Stopping multiwan_qos for accurate speed test results..."
+        stop_service
+        sleep 5  # Give some time for the network to stabilize
+    fi
+
+    if [ -n "$noninteractive" ]; then
+        speedtest_req=1
+    else
+        while :; do
+            print_msg "Do you want to run a speed test or enter speeds manually? [test/manual]"
+            read -r speed_choice
+            case "$speed_choice" in
+                *[A-Z]*) speed_choice="$(printf %s "$speed_choice" | tr 'A-Z' 'a-z')"
+            esac
+
+            case "$speed_choice" in
+                test|manual) break
+            esac
+            print_msg "Invalid input '$speed_choice'. Please enter 'test' or 'manual'."
+        done
+
+        if [ "$speed_choice" = "manual" ]; then
+            for direction in download upload; do
+                while :; do
+                    print_msg "Please enter your $direction speed in Mbit/s:"
+                    read -r response
+                    case "$response" in
+                        ''|*[!0-9.]*|*.*.*)
+                            # do not allow empty string or irrelevant characters or 2x '.'
+                            print_msg "Invalid input '$response'. Please try again."
+                            continue
+                            ;;
+                        *[0-9]*)
+                            break
+                            ;;
+                        *)
+                            # do not allow input without digits
+                            print_msg "Invalid input '$response'. Please try again."
+                            continue
+                            ;;
+                    esac
+                done
+                case "$direction" in
+                    download) DOWNLOAD_SPEED="$response" ;;
+                    upload) UPLOAD_SPEED="$response" ;;
+                esac
+            done
+            speedtest_req=
+        else
+            print_msg "This will run a speed test to configure multiwan_qos. Do you want to continue? [y/N]"
+            read -r response
+            case "$response" in
+                [Yy]) ;;
+                *)
+                    print_msg "Auto-setup cancelled."
+                    return 0
+                    ;;
+            esac
+            speedtest_req=1
+        fi
+    fi
+
+    if [ -n "$speedtest_req" ]; then
+        # Check for speedtest-go first
+        if check_util speedtest-go; then
+            print_msg "speedtest-go is already installed. Using it for the speed test."
+            SPEEDTEST_CMD="speedtest-go"
+        else
+            print_msg "speedtest-go is not found. Checking for python3-speedtest-cli..."
+            if check_util speedtest; then
+                print_msg "python3-speedtest-cli is already installed. Using it for the speed test."
+                SPEEDTEST_CMD="speedtest --simple"
+            else
+                print_msg "Neither speedtest-go nor python3-speedtest-cli is installed. Attempting to install speedtest-go..."
+                check_pkg_manager "$pkg_manager" || return 1
+                
+                # Check for sufficient space (adjust the required space as needed)
+                FREE_SPACE=$(df /overlay | awk 'NR==2 {print $4}')
+                if [ "$FREE_SPACE" -lt 15360 ]; then  # Assuming 15MB for speedtest-go
+                    print_msg "Not enough space for speedtest-go. Attempting to install python3-speedtest-cli instead..."
+                else
+                    case "$pkg_manager" in
+                        "apk")
+                            apk update && apk add speedtest-go
+                            ;;
+                        "opkg")
+                            opkg update && opkg install speedtest-go
+                            ;;
+                    esac
+                    if [ $? -eq 0 ]; then
+                        SPEEDTEST_CMD="speedtest-go"
+                    else
+                        error_out "Failed to install speedtest-go. Attempting to install python3-speedtest-cli instead..."
+                    fi
+                fi
+
+                # If speedtest-go installation failed or there wasn't enough space, try python3-speedtest-cli
+                if [ -z "$SPEEDTEST_CMD" ]; then
+                    if [ "$FREE_SPACE" -lt 1024 ]; then  # 1MB for python3-speedtest-cli
+                        error_out "Error: Not enough free space to install any speedtest tool." \
+                            "Auto-setup cannot continue. Please free up some space and try again."
+                        return 1
+                    fi
+                    case "$pkg_manager" in
+                        "apk")
+                            apk update && apk add python3-speedtest-cli
+                            ;;
+                        "opkg")
+                            opkg update && opkg install python3-speedtest-cli python3-speedtest-cli-src
+                            ;;
+                    esac
+                    if [ $? -eq 0 ]; then
+                        SPEEDTEST_CMD="speedtest --simple"
+                    else
+                        error_out "Failed to install python3-speedtest-cli. Auto-setup cannot continue."
+                        return 1
+                    fi
+                fi
+            fi
+        fi
+
+        print_msg "Running speed test... This may take a few minutes."
+        SPEED_RESULT=$($SPEEDTEST_CMD)
+
+        DOWNLOAD_SPEED=$(printf %s "$SPEED_RESULT" | parse_speedtest_output "$SPEEDTEST_CMD" Download) &&
+        UPLOAD_SPEED=$(printf %s "$SPEED_RESULT" | parse_speedtest_output "$SPEEDTEST_CMD" Upload) ||
+            return 1
+
+        print_msg "Speed test results:" \
+            "Download speed: $DOWNLOAD_SPEED Mbit/s" \
+            "Upload speed: $UPLOAD_SPEED Mbit/s"
+    fi
+
+    # Convert speeds to kbps and apply 90% rule
+    DOWNRATE=$(awk -v speed="$DOWNLOAD_SPEED" 'BEGIN {print int(speed * 1000 * 0.9)}')
+    UPRATE=$(awk -v speed="$UPLOAD_SPEED" 'BEGIN {print int(speed * 1000 * 0.9)}')
+
+    print_msg "QoS configuration:" \
+        "DOWNRATE: $DOWNRATE kbps (90% of measured download speed)" \
+        "UPRATE: $UPRATE kbps (90% of measured upload speed)"
+
+    [ -f "$MULTIWAN_QOS_CFG_FILE" ] || {
+        error_out "config file '$MULTIWAN_QOS_CFG_FILE' not found."
+        return 1
+    }
+
+    config_load 'multiwan-qos'
+
+    local wan_section
+    config_get wan_section settings wan 2>/dev/null
+    if [ -z "$wan_section" ]; then
+        wan_section="wan"
+    fi
+
+    uci set multiwan-qos.${wan_section}=interface
+    uci set multiwan-qos.${wan_section}.name="${wan_section}"
+    uci set multiwan-qos.${wan_section}.device="$FINAL_INTERFACE"
+    uci set multiwan-qos.${wan_section}.download="$DOWNRATE"
+    uci set multiwan-qos.${wan_section}.upload="$UPRATE" || return 1
+
+    # Section for gaming device IP
+    if [ -z "$noninteractive" ]; then
+        print_msg "Would you like to add a gaming device IP for prioritization? [y/N]"
+        read -r response
+        case "$response" in
+            [Yy])
+                print_msg "Please enter the IP address of your gaming device:"
+                read -r gaming_ip
+                ;;
+        esac
+    fi
+
+    if [ -n "$gaming_ip" ]; then
+        # Validate IP address format
+        case "$gaming_ip" in
+            [0-9][0-9][0-9].[0-9][0-9][0-9].[0-9][0-9][0-9].[0-9][0-9][0-9])
+                # Check if rules for this IP already exist
+                local ip_configured=
+                config_foreach is_ip_configured rule "$gaming_ip"
+                # $ip_configured is set in is_ip_configured()
+                if [ -n "$ip_configured" ]; then
+                    print_msg "Rules for IP $gaming_ip already exist. Skipping addition of new rules."
+                    gaming_ip=
+                fi
+                ;;
+            *)
+                print_msg "Invalid IP address format. No gaming device rules added."
+                gaming_ip=
+                ;;
+        esac
+    fi
+
+    if [ -n "$gaming_ip" ]; then
+        local direction ip_dir port_dir
+        for direction in Inbound Outbound; do
+            case "$direction" in
+                Inbound) ip_dir=dest port_dir=src ;;
+                Outbound) ip_dir=src port_dir=dest ;;
+            esac
+            uci add multiwan-qos rule 1>/dev/null &&
+            uci set "multiwan_qos.@rule[-1].name=Game_Console_${direction}" &&
+            uci set "multiwan_qos.@rule[-1].proto=udp" &&
+            uci set "multiwan_qos.@rule[-1].${ip_dir}_ip=${gaming_ip}" &&
+            uci add_list "multiwan_qos.@rule[-1].${port_dir}_port=!=80" &&
+            uci add_list "multiwan_qos.@rule[-1].${port_dir}_port=!=443" &&
+            uci set "multiwan_qos.@rule[-1].class=cs5" &&
+            uci set "multiwan_qos.@rule[-1].counter=1" ||
+                return 1
+        done
+        print_msg "Gaming device rules added for IP: $gaming_ip"
+    else
+        print_msg "No gaming device IP added."
+    fi
+
+    uci commit multiwan-qos || return 1
+
+    print_msg "Configuration updated. New settings:"
+    grep -E "option (WAN|DOWNRATE|UPRATE)" "$MULTIWAN_QOS_CFG_FILE"
+
+
+    print_msg "Auto-setup complete. multiwan_qos has been configured with detected settings." \
+        "To apply these changes, please restart multiwan_qos by running: $MULTIWAN_QOS_SERVICE_PATH restart"
+    :
+}
+
+auto_setup_noninteractive() {
+    local output_file="/tmp/multiwan_qos_auto_setup_output.txt" auto_setup_rv
+    {
+        echo "Starting multiwan_qos non-interactive auto-setup..."
+        auto_setup -n "$1" 2>&1
+    } > "$output_file"
+    auto_setup_rv=$?
+    echo "$output_file"
+    return $auto_setup_rv
+}
+
+health_check() {
+    # Check if MultiWAN QoS is properly configured and running
+    local status="" errors=0 service_enabled=0 config_status=''
+
+    # Check the config
+    if load_and_fix_config -nofix 1>/dev/null; then
+        config_status=ok
+    else
+        config_status=failed # *** NOTE THE CHANGE FROM 'missing' TO 'failed' ***
+        errors=$((errors + 1))
+    fi
+
+    # Check global:enabled and if the service is enabled
+    enabled && service_enabled=1
+
+    case "${service_enabled}${global_enabled}" in
+        11) status="${status}service:enabled;" ;;
+        00) status="${status}service:disabled;"; errors=$((errors + 1)) ;;
+        *) status="${status}service:invalid_state;"; errors=$((errors + 1)) ;;
+    esac
+
+    # Check nftables configuration
+    if nft list table inet dscptag >/dev/null 2>&1; then
+        status="${status}nft:ok;"
+    else
+        status="${status}nft:failed;"
+        errors=$((errors + 1))
+    fi
+
+    # Check tc configuration on configured interfaces
+    local tc_ok=0
+    check_interface_tc() {
+        local config="$1"
+        local device
+        config_get device "$config" device
+        [ -z "$device" ] && return
+        if tc qdisc show dev "$device" 2>/dev/null | grep -E -q "hfsc|cake|htb"; then
+            tc_ok=1
+        fi
+    }
+    config_load 'multiwan-qos'
+    config_foreach check_interface_tc interface
+    
+    # Fallback to legacy $WAN check
+    if [ "$tc_ok" -eq 0 ] && [ -n "$WAN" ]; then
+        tc qdisc show dev "$WAN" 2>/dev/null | grep -E -q "hfsc|cake|htb" && tc_ok=1
+    fi
+    
+    if [ "$tc_ok" -eq 1 ]; then
+        status="${status}tc:ok;"
+    else
+        status="${status}tc:failed;"
+        errors=$((errors + 1))
+    fi
+
+    status="${status}config:${config_status};"
+
+    # Check required packages
+    local missing_packages=""
+    for pkg in $REQUIRED_PACKAGES; do
+        if ! check_package "$pkg"; then
+            missing_packages="${missing_packages}${pkg} "
+        fi
+    done
+
+    if [ -z "$missing_packages" ]; then
+        status="${status}packages:ok;"
+    else
+        status="${status}packages:missing:${missing_packages};"
+        errors=$((errors + 1))
+    fi
+
+    local agent_enabled=0
+    config_get_bool agent_enabled agent enabled 0
+    if [ "$agent_enabled" -eq 0 ]; then
+        status="${status}agent:disabled;"
+        status="${status}pc:disabled;"
+    elif nft list chain inet dscptag multiwan_qos_agent >/dev/null 2>&1; then
+        status="${status}agent:ready;"
+        local agent_timeout=300 agent_last_seen='' agent_age=''
+        config_get agent_timeout agent timeout 300
+        if [ -f /tmp/multiwan_qos_agent_last_seen ]; then
+            agent_last_seen="$(cat /tmp/multiwan_qos_agent_last_seen 2>/dev/null)"
+            case "$agent_last_seen" in
+                ''|*[!0-9]*) agent_last_seen='' ;;
+            esac
+        fi
+        if [ -n "$agent_last_seen" ]; then
+            agent_age=$(($(date +%s) - agent_last_seen))
+            if [ "$agent_age" -le "$agent_timeout" ] 2>/dev/null; then
+                status="${status}pc:connected;"
+            else
+                status="${status}pc:stale;"
+            fi
+        else
+            status="${status}pc:idle;"
+        fi
+    elif nft list table inet dscptag >/dev/null 2>&1; then
+        status="${status}agent:failed;"
+        status="${status}pc:disabled;"
+        errors=$((errors + 1))
+    else
+        status="${status}agent:waiting;"
+        status="${status}pc:idle;"
+    fi
+
+    # Check files existence and md5sums
+    for component in ${MULTIWAN_QOS_COMPONENTS}; do
+        local reg_file=''
+        eval "reg_file=\"\${MULTIWAN_QOS_FILES_REG_PATH_${component}}\""
+        if [ ! -f "$reg_file" ]; then
+            status="${status}${component}_integrity:skipped;"
+            continue
+        fi
+        if check_files_integrity "$component"; then
+            status="${status}${component}_integrity:ok;"
+        else
+            status="${status}${component}_integrity:failed;"
+            errors=$((errors + 1))
+        fi
+    done
+
+    # Output status
+    echo "status=$status;errors=$errors"
+    
+    # Return code depending on errors
+    [ "$errors" -eq 0 ] || return 1
+    return 0
+}
+
+pkg_manager="$(detect_package_manager)" # global variable
+
+
+### Process command-line args
+
+# if called directrly via /bin/sh with one of the keywords, set $action to the keyword
+case "$1" in
+    update|print_file_list|post_update_1|post_update_2) action="$1"; shift
+esac
+
+case "$action" in
+    update|print_file_list|post_update_1|post_update_2) "$action" "$@"; exit $? ;;
+esac

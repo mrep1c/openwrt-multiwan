@@ -1,0 +1,252 @@
+#!/bin/sh
+
+. /lib/functions.sh
+. /lib/functions/network.sh
+. /usr/share/libubox/jshn.sh
+. /lib/multiwan-nft/common.sh
+
+# nftables commands
+NFT="nft"
+NFT_TABLE="multiwan_nft"
+NFT_FAMILY="inet"
+
+report_connected_v4() {
+	if $NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v4 &>/dev/null; then
+		$NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v4 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?'
+	fi
+}
+
+report_connected_v6() {
+	[ "$NO_IPV6" -ne 0 ] && return
+	if $NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v6 &>/dev/null; then
+		$NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v6 | grep -oE '[0-9a-fA-F:]+(/[0-9]+)?'
+	fi
+}
+
+report_policies() {
+	local policy="$1"
+	local percent total_weight weight iface
+
+	# Parse policy chain from nft output
+	local chain_output=$($NFT list chain $NFT_FAMILY $NFT_TABLE "$policy" 2>/dev/null)
+	
+	# Extract comments from nft output (BusyBox-compatible, no grep -P)
+	# nft comment format: comment "iface weight total_weight"
+	total_weight=$(echo "$chain_output" | sed -n 's/.*comment "\([^"]*\)".*/\1/p' | head -1 | awk '{print $3}')
+
+	if [ -n "${total_weight##*[!0-9]*}" ]; then
+		for iface in $(echo "$chain_output" | sed -n 's/.*comment "\([^"]*\)".*/\1/p' | grep -v "^out " | awk '{print $1}'); do
+			weight=$(echo "$chain_output" | sed -n 's/.*comment "\([^"]*\)".*/\1/p' | awk '$1 == "'$iface'" {print $2}')
+			
+			# Avoid division by zero
+			if [ -n "$total_weight" ] && [ "$total_weight" -gt 0 ]; then
+				percent=$((weight*100/total_weight))
+			else
+				percent=0
+			fi
+			
+			json_add_object
+			json_add_string interface "$iface"
+			json_add_int percent "$percent"
+			json_close_object
+		done
+	else
+		# Only one interface or special policy (blackhole/default/unreachable)
+		local comment=$(echo "$chain_output" | sed -n 's/.*comment "\([^"]*\)".*/\1/p' | head -1)
+		
+		# If comment is simple (e.g. "default"), do nothing?
+		# Original code seems to loop for interfaces.
+		# If it's a single interface policy, the comment format is "interface weight weight"
+		if [ -n "$comment" ]; then
+			iface=$(echo "$comment" | awk '{print $1}')
+			# Check if iface is a valid interface name or special keyword
+			if [ "$iface" != "blackhole" ] && [ "$iface" != "default" ] && [ "$iface" != "unreachable" ]; then
+				json_add_object
+				json_add_string interface "$iface"
+				json_add_int percent "100"
+				json_close_object
+			fi
+		fi
+	fi
+}
+
+report_policies_v4() {
+	local policy
+	# List all chains starting with multiwan_nft_policy_
+	for policy in $($NFT list chains $NFT_FAMILY $NFT_TABLE 2>/dev/null | grep -oE 'chain multiwan_nft_policy_[^ ]+' | sed 's/chain //'); do
+		json_add_array "${policy##*multiwan_nft_policy_}"
+		report_policies "$policy"
+		json_close_array
+	done
+}
+
+report_policies_v6() {
+	# IPv6 policies are same as v4 in inet table
+	report_policies_v4
+}
+
+get_age() {
+	local time_p time_u
+	iface="$1"
+	time_p="$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/TIME")"
+	[ -z "${time_p}" ] || {
+		time_n="$(get_uptime)"
+		echo $((time_n-time_p))
+	}
+}
+
+get_offline_time() {
+	local time_n time_d iface
+	iface="$1"
+	time_d="$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/OFFLINE")"
+	[ -z "${time_d}" ] || [ "${time_d}" = "0" ] || {
+		time_n="$(get_uptime)"
+		echo $((time_n-time_d))
+	}
+}
+
+get_multiwan_nft_status() {
+	local iface="${1}"
+	local iface_select="${2}"
+	local running="0"
+	local age=0
+	local online=0
+	local offline=0
+	local enabled time_p time_n time_u time_d status track_status up uptime
+
+	if [ "${iface}" != "${iface_select}" ] && [ "${iface_select}" != "" ]; then
+		return
+	fi
+
+	track_status="$(multiwan_nft_get_track_status "$1")"
+	[ "$track_status" = "active" ] && running="1"
+	age=$(get_age "$iface")
+	online=$(get_online_time "$iface")
+	offline=$(get_offline_time "$iface")
+
+	config_get enabled "$iface" enabled 0
+
+	if [ -d "${MULTIWAN_NFT_STATUS_DIR}" ]; then
+		network_get_uptime uptime "$iface"
+		network_is_up "$iface" && up="1"
+		if [ -f "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/STATUS" ]; then
+			status="$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/STATUS")"
+		else
+			status="notracking"
+		fi
+	else
+		uptime=0
+		up=0
+		status="unknown"
+	fi
+
+	json_add_object "${iface}"
+	json_add_int age "$age"
+	json_add_int online "${online}"
+	json_add_int offline "${offline}"
+	json_add_int uptime "${uptime}"
+	json_add_int "score" "$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/SCORE")"
+	json_add_int "lost" "$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/LOST")"
+	json_add_int "turn" "$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/TURN")"
+	json_add_string "status" "${status}"
+	json_add_boolean "enabled" "${enabled}"
+	json_add_boolean "running" "${running}"
+	json_add_boolean "up" "${up}"
+	json_add_array "track_ip"
+	for file in $MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/TRACK_*; do
+		[ -z "${file#*/TRACK_OUTPUT}" ] && continue
+		[ -z "${file#*/TRACK_\*}" ] && continue
+		track="${file#*/TRACK_}"
+		json_add_object
+		json_add_string ip "${track}"
+		json_add_string status "$(cat "${file}")"
+		json_add_int latency "$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/LATENCY_${track}")"
+		json_add_int packetloss "$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/LOSS_${track}")"
+		json_close_object
+	done
+	json_close_array
+	json_close_object
+}
+
+main () {
+
+	case "$1" in
+		list)
+			json_init
+			json_add_object "status"
+			json_add_string "section" "x"
+			json_add_string "interface" "x"
+			json_add_string "policies" "x"
+			json_close_object
+			json_dump
+			;;
+		call)
+			case "$2" in
+			status)
+				local section iface
+				read input;
+				json_load "$input"
+				json_get_var section section
+				json_get_var iface interface
+
+				config_load 'multiwan-nft'
+				json_init
+				case "$section" in
+					interfaces)
+						json_add_object interfaces
+						config_foreach get_multiwan_nft_status interface "${iface}"
+						json_close_object
+						;;
+					connected)
+						json_add_object connected
+						json_add_array ipv4
+						report_connected_v4
+						json_close_array
+						json_add_array ipv6
+						report_connected_v6
+						json_close_array
+						json_close_object
+						;;
+					policies)
+						json_add_object policies
+						json_add_object ipv4
+						report_policies_v4
+						json_close_object
+						json_add_object ipv6
+						report_policies_v6
+						json_close_object
+						json_close_object
+						;;
+					*)
+						# interfaces
+						json_add_object interfaces
+						config_foreach get_multiwan_nft_status interface
+						json_close_object
+						# connected
+						json_add_object connected
+						json_add_array ipv4
+						report_connected_v4
+						json_close_array
+						json_add_array ipv6
+						report_connected_v6
+						json_close_array
+						json_close_object
+						# policies
+						json_add_object policies
+						json_add_object ipv4
+						report_policies_v4
+						json_close_object
+						json_add_object ipv6
+						report_policies_v6
+						json_close_object
+						json_close_object
+						;;
+				esac
+				json_dump
+				;;
+			esac
+			;;
+	esac
+}
+
+main "$@"

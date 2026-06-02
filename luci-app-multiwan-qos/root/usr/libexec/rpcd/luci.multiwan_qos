@@ -1,0 +1,499 @@
+#!/usr/bin/env lua
+
+local jsonc = require "luci.jsonc"
+local AGENT_STATE_FILE = "/tmp/multiwan_qos_agent_state.json"
+
+-- Check if an IP address is private - not needed at the moment
+local function is_private_ip(ip)
+    if not ip or ip == "" then
+        return false
+    end
+
+    if ip:match(":") then  -- IPv6
+        -- Check for ULA (fc00::/7), link-local (fe80::/10), or loopback (::1)
+        return ip:match("^f[cd]") or ip:match("^fe80:") or ip == "::1"
+    else  -- IPv4
+        local octets = {ip:match("(%d+)%.(%d+)%.(%d+)%.(%d+)")}
+        if not octets[1] then return false end
+        local first, second = tonumber(octets[1]), tonumber(octets[2])
+        -- Check for private IPv4 ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+        return (first == 10) or
+               (first == 172 and second >= 16 and second <= 31) or
+               (first == 192 and second == 168)
+    end
+end
+
+-- Parse a single connection line from nf_conntrack
+local function parse_connection(line)
+    local conn = {}
+    conn.layer3, conn.layer4, conn.protocol, conn.timeout = line:match("(%w+)%s+(%d+)%s+(%w+)%s+(%d+)")
+    if not (conn.layer3 and conn.layer4 and conn.protocol and conn.timeout) then
+        return nil
+    end
+
+    if conn.protocol == "icmp" or conn.protocol == "icmpv6" then
+        -- Handle ICMP and ICMPv6 protocols
+        conn.src, conn.dst, conn.type, conn.code, conn.id = 
+            line:match("src=(%S+)%s+dst=(%S+)%s+type=(%d+)%s+code=(%d+)%s+id=(%d+)")
+        conn.in_packets, conn.in_bytes = line:match("packets=(%d+)%s+bytes=(%d+)")
+        conn.out_packets, conn.out_bytes = conn.in_packets, conn.in_bytes
+        conn.sport, conn.dport = "-", "-"  -- ICMP doesn't use ports
+    else
+        -- Handle other protocols (e.g., TCP, UDP)
+        local src1, dst1, sport1, dport1, packets1, bytes1,
+              src2, dst2, sport2, dport2, packets2, bytes2 = 
+            line:match("src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+)%s+packets=(%d+)%s+bytes=(%d+).*src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+)%s+packets=(%d+)%s+bytes=(%d+)")
+        
+        -- Always use the first direction as the original
+        conn.src, conn.dst, conn.sport, conn.dport = src1, dst1, sport1, dport1
+        conn.out_packets, conn.in_packets = tonumber(packets1), tonumber(packets2)
+        conn.out_bytes, conn.in_bytes = tonumber(bytes1), tonumber(bytes2)
+    end
+
+    if not (conn.src and conn.dst) then
+        return nil
+    end
+
+    -- Extract additional connection information
+    conn.dscp = math.floor(tonumber(line:match("mark=(%d+)") or "0"))
+    conn.use = tonumber(line:match("use=(%d+)") or "0")
+    conn.timeout = tonumber(conn.timeout) or 0
+
+    -- Determine connection state
+    if line:match("%[ASSURED%]") then
+        conn.state = "ASSURED"
+    elseif line:match("%[UNREPLIED%]") then
+        conn.state = "UNREPLIED"
+    else
+        conn.state = "UNKNOWN"
+    end
+
+    return conn
+end
+
+-- Retrieve all current connections from nf_conntrack
+local function get_connections()
+    local conn_list = {}
+    
+    -- Read MAX_CONNECTIONS from config
+    local max_connections = 0
+    local config = io.popen("uci get multiwan-qos.advanced.MAX_CONNECTIONS 2>/dev/null")
+    if config then
+        local value = config:read("*line")
+        config:close()
+        if value and value ~= "" then
+            max_connections = tonumber(value) or 0
+        end
+    end
+    
+    local f = io.open("/proc/net/nf_conntrack", "r")
+    if not f then
+        return {}, max_connections
+    end
+
+    local count = 0
+    
+    -- Read connections from nf_conntrack (with early exit if limited)
+    for line in f:lines() do
+        -- Early exit if we have a limit and reached it
+        if max_connections > 0 and count >= max_connections then
+            break
+        end
+        
+        local conn = parse_connection(line)
+        if conn then
+            conn.total_bytes = (conn.in_bytes or 0) + (conn.out_bytes or 0)
+            table.insert(conn_list, conn)
+            count = count + 1
+        end
+    end
+    f:close()
+
+    -- Sort only the connections we actually loaded
+    table.sort(conn_list, function(a, b)
+        return a.total_bytes > b.total_bytes
+    end)
+
+    -- Determine max_entries based on system load (only if no manual limit)
+    local max_entries = #conn_list
+    if max_connections == 0 then
+        local load_avg = io.open("/proc/loadavg"):read("*a")
+        local load1 = tonumber(load_avg:match("^(%d+%.%d+)")) or 0
+        
+        -- Apply load-based limits only if no manual limit
+        if load1 > 2.0 then
+            max_entries = math.min(100, #conn_list)
+        elseif load1 > 1.5 then
+            max_entries = math.min(500, #conn_list)
+        elseif load1 > 0.8 then
+            max_entries = math.min(1000, #conn_list)
+        end
+    end
+
+    -- Final connections table
+    local connections = {}
+    for i = 1, max_entries do
+        local conn = conn_list[i]
+        if not conn then break end
+        local key = string.format("%s:%s:%s:%s:%s:%s",
+            conn.layer3, conn.protocol, conn.src, conn.sport, conn.dst, conn.dport)
+        connections[key] = conn
+    end
+
+    return connections, max_connections
+end
+
+local function trim(value)
+    return (value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function command_ok(cmd)
+    local a, _, c = os.execute(cmd .. " >/dev/null 2>&1")
+    return a == true or a == 0 or c == 0
+end
+
+local function read_command(cmd)
+    local f = io.popen(cmd .. " 2>/dev/null")
+    if not f then
+        return "", false
+    end
+
+    local output = f:read("*a") or ""
+    local a, _, c = f:close()
+    return output, (a == true or a == 0 or c == 0)
+end
+
+local function read_uci(path, default)
+    local output, ok = read_command("uci -q get " .. path)
+    if not ok then
+        return default
+    end
+
+    output = trim(output)
+    if output == "" then
+        return default
+    end
+
+    return output
+end
+
+local function is_agent_enabled()
+    return read_uci("multiwan-qos.agent.enabled", "0") == "1"
+end
+
+local function get_agent_timeout()
+    return tonumber(read_uci("multiwan-qos.agent.timeout", "300")) or 300
+end
+
+local function agent_chain_exists()
+    return command_ok("nft list chain inet dscptag multiwan_qos_agent")
+end
+
+local function dscptag_table_exists()
+    return command_ok("nft list table inet dscptag")
+end
+
+local function get_agent_pc_state(enabled, chain_exists, has_rules)
+    if not enabled then
+        return "disabled", nil, "disabled"
+    end
+
+    if not chain_exists then
+        if dscptag_table_exists() then
+            return "failed", nil, "missing_chain"
+        end
+        return "waiting", nil, "missing_table"
+    end
+
+    if has_rules then
+        return "connected", nil, "active_rules"
+    end
+
+    local f = io.open("/tmp/multiwan_qos_agent_last_seen", "r")
+    if not f then
+        return "ready", nil, "no_last_seen"
+    end
+
+    local last_seen = tonumber(f:read("*l"))
+    f:close()
+
+    if not last_seen then
+        return "ready", nil, "invalid_last_seen"
+    end
+
+    local age = os.time() - last_seen
+    if age <= get_agent_timeout() then
+        return "connected", age, "fresh_heartbeat"
+    end
+
+    return "stale", age, "stale_heartbeat"
+end
+
+local function read_agent_state()
+    local f = io.open(AGENT_STATE_FILE, "r")
+    if not f then
+        return nil
+    end
+
+    local body = f:read("*a") or ""
+    f:close()
+    if body == "" then
+        return nil
+    end
+
+    return jsonc.parse(body)
+end
+
+local function parse_nft_rule_fields(line)
+    local packets, bytes = line:match("counter%s+packets%s+(%d+)%s+bytes%s+(%d+)")
+    local has_dscp_setter = line:lower():match("ip%s+dscp%s+set%s+[%w%d]+") ~= nil
+    local has_ct_mark_setter = line:lower():match("ct%s+mark%s+set") ~= nil
+    local proto = line:lower():match("%s(udp)%s+sport") or line:lower():match("%s(udp)%s+dport") or ""
+
+    return {
+        is_agent_owned = has_dscp_setter and not has_ct_mark_setter and true or false,
+        dscp = line:match("ip%s+dscp%s+set%s+([%w%d]+)") or "",
+        ct_mark = "",
+        ct_dscp = nil,
+        proto = proto,
+        src_ip = line:match("ip%s+saddr%s+(%S+)") or "",
+        dst_ip = line:match("ip%s+daddr%s+(%S+)") or "",
+        src_port = tonumber(line:lower():match("udp%s+sport%s+(%d+)") or "0") or 0,
+        dst_port = tonumber(line:lower():match("udp%s+dport%s+(%d+)") or "0") or 0,
+        packets = tonumber(packets) or 0,
+        bytes = tonumber(bytes) or 0,
+        handle = tonumber(line:match("#%s+handle%s+(%d+)") or "0") or 0,
+        raw = trim(line)
+    }
+end
+
+local function nft_line_is_rule(trimmed)
+    local lower = trimmed:lower()
+    return trimmed ~= "" and
+        not trimmed:match("^#") and
+        not trimmed:match("^table%s+") and
+        not trimmed:match("^chain%s+") and
+        trimmed ~= "{" and
+        trimmed ~= "}" and
+        not trimmed:match("^type%s+") and
+        not trimmed:match("^policy%s+") and
+        not trimmed:match("^%^+%s*~*$") and
+        not trimmed:match("^~+%s*$") and
+        not lower:match("^error:") and
+        not lower:match("^syntax%s+error") and
+        not lower:match("^internal:") and
+        not lower:match("^netlink:")
+end
+
+local function nft_output_has_error(output)
+    output = output or ""
+    local lower = output:lower()
+    return lower:match("^%s*error:") ~= nil or
+        lower:match("\n%s*error:") ~= nil or
+        lower:match("^%s*syntax%s+error") ~= nil or
+        lower:match("\n%s*syntax%s+error") ~= nil or
+        lower:match("%^%s*~") ~= nil
+end
+
+local function parse_agent_rule(line)
+    local comment = line:match('comment.*"agent_([^"]+)"')
+    if not comment then
+        return nil
+    end
+
+    local game, direction = comment:match("^(.*)_(UP)$")
+    if not game then
+        game, direction = comment:match("^(.*)_(DN)$")
+    end
+
+    if not game or not direction then
+        return nil
+    end
+
+    local rule = parse_nft_rule_fields(line)
+    if not rule.is_agent_owned then
+        return nil
+    end
+    rule.game = game
+    rule.direction = direction
+    return rule
+end
+
+local function merge_state_rule_with_nft(rule, nft_rule)
+    local merged = {}
+    for k, v in pairs(rule or {}) do
+        merged[k] = v
+    end
+    if nft_rule then
+        merged.dscp = nft_rule.dscp ~= "" and nft_rule.dscp or merged.dscp
+        merged.ct_mark = ""
+        merged.ct_dscp = nil
+        merged.packets = nft_rule.packets or 0
+        merged.bytes = nft_rule.bytes or 0
+        merged.handle = nft_rule.handle or 0
+        merged.raw = nft_rule.raw or ""
+    else
+        merged.ct_mark = ""
+        merged.ct_dscp = nil
+        merged.packets = merged.packets or 0
+        merged.bytes = merged.bytes or 0
+        merged.raw = merged.raw or ""
+    end
+    return merged
+end
+
+local function raw_rule_for_display(raw_rule, pc_ip)
+    local merged = {}
+    for k, v in pairs(raw_rule or {}) do
+        merged[k] = v
+    end
+
+    merged.game = merged.game or "Unknown"
+    merged.direction = merged.direction or ""
+    if pc_ip and pc_ip ~= "" then
+        if merged.src_ip == pc_ip then
+            merged.direction = "UP"
+        elseif merged.dst_ip == pc_ip then
+            merged.direction = "DN"
+        end
+    end
+
+    return merged
+end
+
+local function get_agent_rules()
+    local output, ok = read_command("nft -a list chain inet dscptag multiwan_qos_agent")
+    local rules = {}
+    local raw_rules = {}
+    local raw_rule_count = 0
+    local agent_rule_count = 0
+    local non_agent_rule_count = 0
+    local raw_agent_rule_count = 0
+
+    if not ok or nft_output_has_error(output) then
+        return rules, raw_rules, raw_rule_count, agent_rule_count, non_agent_rule_count, raw_agent_rule_count, output, false
+    end
+
+    for line in output:gmatch("[^\r\n]+") do
+        local trimmed = trim(line)
+        if nft_line_is_rule(trimmed) then
+            raw_rule_count = raw_rule_count + 1
+            local raw_rule = parse_nft_rule_fields(line)
+            if raw_rule.is_agent_owned then
+                agent_rule_count = agent_rule_count + 1
+                raw_rules[#raw_rules + 1] = raw_rule
+            else
+                non_agent_rule_count = non_agent_rule_count + 1
+            end
+        end
+
+        if line:match('comment.*"agent_') then
+            raw_agent_rule_count = raw_agent_rule_count + 1
+        end
+
+        local rule = parse_agent_rule(line)
+        if rule then
+            rules[#rules + 1] = rule
+        end
+    end
+
+    return rules, raw_rules, raw_rule_count, agent_rule_count, non_agent_rule_count, raw_agent_rule_count, output, true
+end
+
+-- Define RPC methods
+local methods = {
+    getAgentStatus = {
+        call = function()
+            local enabled = is_agent_enabled()
+            local chain_exists = agent_chain_exists()
+            local rules, raw_rules, raw_rule_count, agent_rule_count, non_agent_rule_count, raw_agent_rule_count, raw_output, nft_ok = {}, {}, 0, 0, 0, 0, "", false
+            local agent_state = read_agent_state()
+            local rule_source = "none"
+
+            if chain_exists then
+                rules, raw_rules, raw_rule_count, agent_rule_count, non_agent_rule_count, raw_agent_rule_count, raw_output, nft_ok = get_agent_rules()
+            end
+
+            if #rules > 0 then
+                rule_source = "nft_comments"
+            elseif agent_rule_count > 0 then
+                local expected_state_count = tonumber(agent_state and agent_state.rule_count or 0) or 0
+                if agent_state and agent_state.rules and expected_state_count == agent_rule_count then
+                    local recovered = {}
+                    for i, rule in ipairs(agent_state.rules) do
+                        recovered[#recovered + 1] = merge_state_rule_with_nft(rule, raw_rules[i])
+                    end
+                    rules = recovered
+                    rule_source = "state"
+                else
+                    local recovered = {}
+                    local pc_ip = agent_state and agent_state.pc_ip or nil
+                    for _, raw_rule in ipairs(raw_rules) do
+                        recovered[#recovered + 1] = raw_rule_for_display(raw_rule, pc_ip)
+                    end
+                    rules = recovered
+                    rule_source = agent_state and "nft_raw_state_mismatch" or "nft_raw"
+                end
+            end
+
+            local has_rules = agent_rule_count > 0 or (#rules > 0) or (raw_agent_rule_count > 0)
+            local pc_state, last_seen_age, last_seen_state = get_agent_pc_state(enabled, chain_exists, has_rules)
+            local parse_warning = nil
+
+            if chain_exists and not nft_ok then
+                parse_warning = "Failed to list multiwan_qos_agent rules"
+            elseif raw_agent_rule_count > 0 and #rules == 0 then
+                parse_warning = "Agent rules were found in multiwan_qos_agent, but LuCI could not parse them"
+            elseif non_agent_rule_count > 0 and #rules == 0 then
+                parse_warning = "multiwan_qos_agent contains non-agent rules; ignored for PC Agent active rules"
+            end
+
+            return {result = jsonc.stringify({
+                enabled = enabled,
+                chain_exists = chain_exists,
+                pc_state = pc_state,
+                last_seen_age = last_seen_age,
+                last_seen_state = last_seen_state,
+                rules = rules,
+                rule_count = #rules,
+                rule_source = rule_source,
+                raw_rule_count = raw_rule_count,
+                agent_rule_count = agent_rule_count,
+                non_agent_rule_count = non_agent_rule_count,
+                raw_agent_rule_count = raw_agent_rule_count,
+                state_rule_count = agent_state and tonumber(agent_state.rule_count or 0) or 0,
+                state_updated_at = agent_state and agent_state.updated_at or nil,
+                verification_status = agent_state and agent_state.verification_status or nil,
+                nft_ok = nft_ok,
+                parse_warning = parse_warning,
+                nft_output = raw_output
+            })}
+        end
+    },
+    getConntrackDSCP = {
+        call = function()
+            local connections, max_connections = get_connections()
+            return {result = jsonc.stringify({connections = connections, max_connections = max_connections})}
+        end
+    }
+}
+
+-- Handle RPC calls
+if arg[1] == "list" then
+    local rv = {}
+    for _, v in pairs(methods) do
+        rv[_] = v.args or {}
+    end
+    print((jsonc.stringify(rv):gsub(":%[%]", ":{}")))
+elseif arg[1] == "call" then
+    local args = jsonc.parse(io.stdin:read("*a"))
+    local method = methods[arg[2]]
+    if method then
+        local result = method.call(args)
+        print(result.result)
+        os.exit(result.code or 0)
+    else
+        print(jsonc.stringify({error = "Method not found"}))
+        os.exit(1)
+    end
+end

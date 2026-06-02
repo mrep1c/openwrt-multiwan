@@ -1,0 +1,103 @@
+{
+	"admin/status/multiwan-nft": {
+		"title": "MultiWAN Manager",
+		"order": "600",
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-multiwan-nft" ]
+		}
+	},
+	"admin/status/multiwan-nft/overview": {
+		"title": "Overview",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "multiwan-nft/status/overview"
+		}
+	},
+	"admin/status/multiwan-nft/detail": {
+		"title": "Status",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "multiwan-nft/status/detail"
+		}
+	},
+	"admin/status/multiwan-nft/diagnostics": {
+		"title": "Diagnostics",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "multiwan-nft/status/diagnostics"
+		}
+	},
+	"admin/status/multiwan-nft/troubleshooting": {
+		"title": "Troubleshooting",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "multiwan-nft/status/troubleshooting"
+		}
+	},
+
+	"admin/network/multiwan-nft": {
+		"title": "MultiWAN Manager",
+		"order": "600",
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-multiwan-nft" ]
+		}
+	},
+	"admin/network/multiwan-nft/globals": {
+		"title": "Globals",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "multiwan-nft/network/globals"
+		}
+	},
+	"admin/network/multiwan-nft/interface": {
+		"title": "Interface",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "multiwan-nft/network/interface"
+		}
+	},
+	"admin/network/multiwan-nft/member": {
+		"title": "Member",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "multiwan-nft/network/member"
+		}
+	},
+	"admin/network/multiwan-nft/policy": {
+		"title": "Policy",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "multiwan-nft/network/policy"
+		}
+	},
+	"admin/network/multiwan-nft/rule": {
+		"title": "Rule",
+		"order": 50,
+		"action": {
+			"type": "view",
+			"path": "multiwan-nft/network/rule"
+		}
+	},
+	"admin/network/multiwan-nft/notify": {
+		"title": "Notify",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "multiwan-nft/network/notify"
+		}
+	}
+}

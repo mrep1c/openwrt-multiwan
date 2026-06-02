@@ -1,0 +1,101 @@
+{
+    "admin/network/multiwan-qos": {
+        "title": "MultiWAN QoS",
+        "order": 70,
+        "action": {
+            "type": "firstchild"
+        },
+        "depends": {
+            "acl": [ "luci-app-multiwan-qos" ],
+            "uci": { "multiwan-qos": true }
+        }
+    },
+    "admin/network/multiwan-qos/settings": {
+        "title": "Settings",
+        "order": 10,
+        "action": {
+            "type": "view",
+            "path": "multiwan-qos/settings"
+        }
+    },
+    "admin/network/multiwan-qos/hfsc": {
+        "title": "HFSC",
+        "order": 20,
+        "action": {
+            "type": "view",
+            "path": "multiwan-qos/hfsc"
+        }
+    },
+    "admin/network/multiwan-qos/cake": {
+        "title": "CAKE",
+        "order": 30,
+        "action": {
+            "type": "view",
+            "path": "multiwan-qos/cake"
+        }
+    },
+    "admin/network/multiwan-qos/advanced": {
+        "title": "Advanced",
+        "order": 40,
+        "action": {
+            "type": "view",
+            "path": "multiwan-qos/advanced"
+        }
+    },
+    "admin/network/multiwan-qos/rules": {
+        "title": "Rules",
+        "order": 50,
+        "action": {
+            "type": "view",
+            "path": "multiwan-qos/rules"
+        }
+    },
+    "admin/network/multiwan-qos/ipsets": {
+        "title": "IP Sets",
+        "order": 45,
+        "action": {
+            "type": "view",
+            "path": "multiwan-qos/ipsets"
+        }
+    },
+    "admin/network/multiwan-qos/ratelimits": {
+        "title": "Rate Limits",
+        "order": 55,
+        "action": {
+            "type": "view",
+            "path": "multiwan-qos/ratelimits"
+        }
+    },
+    "admin/network/multiwan-qos/custom_rules": {
+        "title": "Custom Rules",
+        "order": 60,
+        "action": {
+            "type": "view",
+            "path": "multiwan-qos/custom_rules"
+        }
+    },
+    "admin/network/multiwan-qos/connections": {
+        "title": "Connections",
+        "order": 70,
+        "action": {
+            "type": "view",
+            "path": "multiwan-qos/connections"
+        }
+    },
+    "admin/network/multiwan-qos/statistics": {
+        "title": "Statistics",
+        "order": 80,
+        "action": {
+            "type": "view",
+            "path": "multiwan-qos/statistics"
+        }
+    },
+    "admin/network/multiwan-qos/agent": {
+        "title": "Agent",
+        "order": 75,
+        "action": {
+            "type": "view",
+            "path": "multiwan-qos/agent"
+        }
+    }
+}

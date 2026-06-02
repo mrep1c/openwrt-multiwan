@@ -1,0 +1,3 @@
+#!/bin/sh
+# Compatibility wrapper for PC agents using the previous endpoint.
+exec /www/cgi-bin/multiwan-qos-agent

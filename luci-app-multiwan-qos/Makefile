@@ -1,0 +1,42 @@
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=luci-app-multiwan-qos
+PKG_VERSION:=1.0.0
+PKG_RELEASE:=1
+PKG_PO_VERSION:=1.0.0-r1
+
+PKG_MAINTAINER:=Markus Hütter <mh@hudra.net>
+PKG_LICENSE:=GPL-3.0-or-later
+
+LUCI_TITLE:=LuCI support for MultiWAN QoS
+LUCI_DEPENDS:=+multiwan-qos +luci-lib-jsonc +lua +jq
+LUCI_PKGARCH:=all
+PKG_PROVIDES:=luci-app-qosmate
+PKG_CONFLICTS:=luci-app-qosmate
+PKG_REPLACES:=luci-app-qosmate
+
+PO_LANG:=de
+
+include $(TOPDIR)/feeds/luci/luci.mk
+
+define Build/Compile
+endef
+
+define Package/$(PKG_NAME)/install
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/multiwan-qos
+	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
+	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
+	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
+
+	$(INSTALL_DATA) ./htdocs/luci-static/resources/multiwan-qos/*.js $(1)/www/luci-static/resources/view/multiwan-qos/
+
+	$(INSTALL_DATA) ./root/usr/share/luci/menu.d/luci-app-multiwan-qos.json $(1)/usr/share/luci/menu.d/
+	$(INSTALL_DATA) ./root/usr/share/rpcd/acl.d/luci-app-multiwan-qos.json $(1)/usr/share/rpcd/acl.d/
+
+	$(INSTALL_BIN) ./root/usr/libexec/rpcd/luci.multiwan_qos $(1)/usr/libexec/rpcd/
+	$(INSTALL_BIN) ./root/usr/libexec/rpcd/luci.multiwan_qos_stats $(1)/usr/libexec/rpcd/
+endef
+
+# call BuildPackage - OpenWrt buildroot signature
+
+$(eval $(call BuildPackage,$(PKG_NAME)))

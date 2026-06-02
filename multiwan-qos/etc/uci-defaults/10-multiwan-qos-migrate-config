@@ -1,0 +1,30 @@
+#!/bin/sh
+
+old_cfg="/etc/config/qosmate"
+new_cfg="/etc/config/multiwan-qos"
+old_dir="/etc/qosmate.d"
+new_dir="/etc/multiwan-qos.d"
+backup_suffix=".pre-multiwan-rename"
+
+migrate_file() {
+	local old_path="$1"
+	local new_path="$2"
+
+	[ -f "$old_path" ] || return 0
+
+	cp -p "$old_path" "${old_path}${backup_suffix}" 2>/dev/null
+	[ -f "$new_path" ] && cp -p "$new_path" "${new_path}${backup_suffix}" 2>/dev/null
+	mv "$old_path" "$new_path"
+}
+
+migrate_file "$old_cfg" "$new_cfg"
+
+if [ -d "$old_dir" ]; then
+	cp -R "$old_dir" "${old_dir}${backup_suffix}" 2>/dev/null
+	[ -d "$new_dir" ] && cp -R "$new_dir" "${new_dir}${backup_suffix}" 2>/dev/null
+	mkdir -p "$new_dir"
+	cp -R "$old_dir"/. "$new_dir"/ 2>/dev/null
+	rm -rf "$old_dir"
+fi
+
+exit 0
