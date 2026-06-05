@@ -1,0 +1,202 @@
+name: Build OpenWrt APK feed
+run-name: OpenWrt ${{ github.event.inputs.release_tag || 'apk-25.12-noarch' }}
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      openwrt_release:
+        description: OpenWrt release version
+        required: true
+        default: "25.12.4"
+      target:
+        description: OpenWrt target
+        required: true
+        default: rockchip
+      subtarget:
+        description: OpenWrt subtarget
+        required: true
+        default: armv8
+      sdk_url:
+        description: OpenWrt SDK tarball URL
+        required: true
+        default: https://downloads.openwrt.org/releases/25.12.4/targets/rockchip/armv8/openwrt-sdk-25.12.4-rockchip-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+      release_tag:
+        description: GitHub release tag for APK feed assets
+        required: true
+        default: apk-25.12-noarch
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: openwrt-multiwan-apk-${{ github.event.inputs.release_tag || 'apk-25.12-noarch' }}
+      cancel-in-progress: true
+    env:
+      OPENWRT_RELEASE: ${{ github.event.inputs.openwrt_release || '25.12.4' }}
+      OPENWRT_RELEASE_LABEL: "25.12"
+      TARGET: ${{ github.event.inputs.target || 'rockchip' }}
+      SUBTARGET: ${{ github.event.inputs.subtarget || 'armv8' }}
+      SDK_URL: ${{ github.event.inputs.sdk_url || 'https://downloads.openwrt.org/releases/25.12.4/targets/rockchip/armv8/openwrt-sdk-25.12.4-rockchip-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst' }}
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || 'apk-25.12-noarch' }}
+
+    steps:
+      - name: Checkout package feed
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            ccache \
+            file \
+            gawk \
+            gettext \
+            git \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            openssl \
+            python3 \
+            python3-setuptools \
+            rsync \
+            unzip \
+            wget \
+            zlib1g-dev \
+            zstd
+
+      - name: Download OpenWrt SDK
+        run: |
+          mkdir -p "$RUNNER_TEMP/openwrt-sdk"
+          wget -O "$RUNNER_TEMP/openwrt-sdk.tar.zst" "$SDK_URL"
+          tar -I zstd -xf "$RUNNER_TEMP/openwrt-sdk.tar.zst" \
+            -C "$RUNNER_TEMP/openwrt-sdk" \
+            --strip-components=1
+
+      - name: Configure stable APK signing key
+        env:
+          OPENWRT_APK_PRIVATE_KEY: ${{ secrets.OPENWRT_APK_PRIVATE_KEY }}
+        run: |
+          cd "$RUNNER_TEMP/openwrt-sdk"
+          if [ -z "$OPENWRT_APK_PRIVATE_KEY" ]; then
+            echo "OPENWRT_APK_PRIVATE_KEY secret is not set" >&2
+            exit 1
+          fi
+          printf '%s\n' "$OPENWRT_APK_PRIVATE_KEY" > private-key.pem
+          chmod 600 private-key.pem
+          openssl ec -in private-key.pem -pubout -out public-key.pem
+          cmp -s public-key.pem "$GITHUB_WORKSPACE/keys/mrep1c-openwrt-multiwan-apk.pem"
+
+      - name: Configure SDK feed
+        run: |
+          cd "$RUNNER_TEMP/openwrt-sdk"
+          echo "src-link multiwan $GITHUB_WORKSPACE" >> feeds.conf.default
+
+          for attempt in 1 2 3; do
+            if ./scripts/feeds update -a && [ -f feeds/luci/luci.mk ]; then
+              break
+            fi
+
+            echo "OpenWrt feed update failed or LuCI feed is incomplete (attempt $attempt of 3)" >&2
+            rm -rf feeds/luci feeds/luci.index
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep $((attempt * 30))
+          done
+
+          test -f feeds/luci/luci.mk
+          ./scripts/feeds install -p multiwan multiwan-nft
+          ./scripts/feeds install -p multiwan luci-app-multiwan-nft
+          ./scripts/feeds install -p multiwan multiwan-qos
+          ./scripts/feeds install -p multiwan luci-app-multiwan-qos
+          make defconfig
+
+      - name: Build packages
+        run: |
+          cd "$RUNNER_TEMP/openwrt-sdk"
+          make -j"$(nproc)" package/feeds/multiwan/multiwan-nft/compile V=s
+          make -j"$(nproc)" package/feeds/multiwan/luci-app-multiwan-nft/compile V=s
+          make -j"$(nproc)" package/feeds/multiwan/multiwan-qos/compile V=s
+          make -j"$(nproc)" package/feeds/multiwan/luci-app-multiwan-qos/compile V=s
+          make package/index V=s
+
+      - name: Collect APK feed assets
+        run: |
+          cd "$RUNNER_TEMP/openwrt-sdk"
+          feed_dir="$(find bin/packages -mindepth 2 -maxdepth 2 -type d -name multiwan | head -n 1)"
+          if [ -z "$feed_dir" ]; then
+            echo "Could not find generated bin/packages/*/multiwan directory" >&2
+            find bin/packages -maxdepth 3 -type d >&2
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "$feed_dir"/*.apk "$GITHUB_WORKSPACE/dist/"
+          cp "$feed_dir"/packages.adb "$GITHUB_WORKSPACE/dist/"
+
+          key_file=""
+          if [ -f public-key.pem ]; then
+            key_file="public-key.pem"
+          elif [ -f key-build.pub ]; then
+            key_file="key-build.pub"
+          else
+            key_file="$(find . -maxdepth 3 -type f \( -name "public-key.pem" -o -name "*.pem" -o -name "*.pub" \) | head -n 1 || true)"
+          fi
+
+          if [ -z "$key_file" ] || [ ! -s "$key_file" ]; then
+            echo "Could not find APK feed public signing key" >&2
+            find . -maxdepth 3 -type f -name "*key*" >&2
+            exit 1
+          fi
+
+          cp "$key_file" "$GITHUB_WORKSPACE/dist/mrep1c-openwrt-multiwan-apk.pem"
+
+          apk_count="$(find "$GITHUB_WORKSPACE/dist" -maxdepth 1 -type f -name "*.apk" | wc -l)"
+          test "$apk_count" -ge 4
+          test -s "$GITHUB_WORKSPACE/dist/packages.adb"
+          test -s "$GITHUB_WORKSPACE/dist/mrep1c-openwrt-multiwan-apk.pem"
+
+          {
+            echo "OpenWrt $OPENWRT_RELEASE_LABEL architecture-independent APK feed"
+            echo
+            echo "Install the feed public key first:"
+            echo "uclient-fetch -O /etc/apk/keys/mrep1c-openwrt-multiwan-apk.pem https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/mrep1c-openwrt-multiwan-apk.pem"
+            echo
+            echo "Router APK feed URL:"
+            echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/packages.adb"
+            echo
+            echo "Packages:"
+            find "$GITHUB_WORKSPACE/dist" -maxdepth 1 -type f -name "*.apk" -printf "- %f\n" | sort
+          } > "$GITHUB_WORKSPACE/dist/RELEASE_NOTES.txt"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-apk-feed-${{ env.OPENWRT_RELEASE }}-${{ env.TARGET }}-${{ env.SUBTARGET }}
+          path: dist/*
+
+      - name: Publish GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release view "$TAG" --json assets --jq '.assets[].name' |
+              while IFS= read -r asset; do
+                [ -n "$asset" ] || continue
+                gh release delete-asset "$TAG" "$asset" -y || true
+              done
+            gh release upload "$TAG" dist/*.apk dist/mrep1c-openwrt-multiwan-apk.pem --clobber
+            gh release upload "$TAG" dist/packages.adb --clobber
+          else
+            gh release create "$TAG" \
+              --title "OpenWrt $OPENWRT_RELEASE_LABEL architecture-independent APK feed" \
+              --notes-file dist/RELEASE_NOTES.txt
+            gh release upload "$TAG" dist/*.apk dist/mrep1c-openwrt-multiwan-apk.pem --clobber
+            gh release upload "$TAG" dist/packages.adb --clobber
+          fi

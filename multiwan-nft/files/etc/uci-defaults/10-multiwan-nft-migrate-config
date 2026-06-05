@@ -1,0 +1,23 @@
+#!/bin/sh
+
+old_cfg="/etc/config/mwan3"
+new_cfg="/etc/config/multiwan-nft"
+old_user="/etc/mwan3.user"
+new_user="/etc/multiwan-nft.user"
+backup_suffix=".pre-multiwan-rename"
+
+migrate_file() {
+	local old_path="$1"
+	local new_path="$2"
+
+	[ -f "$old_path" ] || return 0
+
+	cp -p "$old_path" "${old_path}${backup_suffix}" 2>/dev/null
+	[ -f "$new_path" ] && cp -p "$new_path" "${new_path}${backup_suffix}" 2>/dev/null
+	mv "$old_path" "$new_path"
+}
+
+migrate_file "$old_cfg" "$new_cfg"
+migrate_file "$old_user" "$new_user"
+
+exit 0

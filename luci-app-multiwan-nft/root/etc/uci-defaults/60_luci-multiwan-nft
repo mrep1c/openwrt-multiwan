@@ -1,0 +1,15 @@
+#!/bin/sh
+
+command -v uci >/dev/null 2>&1 || exit 0
+
+if ! uci -q get multiwan-nft.globals >/dev/null 2>&1; then
+	section="$(uci -q add multiwan-nft globals 2>/dev/null || true)"
+	[ -n "$section" ] || exit 0
+	uci -q rename "multiwan-nft.${section}=globals" >/dev/null 2>&1 || true
+fi
+
+uci -q get multiwan-nft.globals.local_source >/dev/null 2>&1 || \
+	uci -q set multiwan-nft.globals.local_source="none" >/dev/null 2>&1 || true
+uci -q commit multiwan-nft >/dev/null 2>&1 || true
+
+exit 0

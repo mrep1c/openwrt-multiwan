@@ -1,0 +1,58 @@
+#!/bin/sh
+
+old_cfg="/etc/config/qosmate"
+new_cfg="/etc/config/multiwan-qos"
+old_dir="/etc/qosmate.d"
+new_dir="/etc/multiwan-qos.d"
+backup_suffix=".pre-multiwan-rename"
+
+migrate_file() {
+	local old_path="$1"
+	local new_path="$2"
+
+	[ -f "$old_path" ] || return 0
+
+	cp -p "$old_path" "${old_path}${backup_suffix}" 2>/dev/null
+	[ -f "$new_path" ] && cp -p "$new_path" "${new_path}${backup_suffix}" 2>/dev/null
+	mv "$old_path" "$new_path"
+}
+
+cleanup_legacy_qosmate() {
+	local legacy_init="/etc/init.d/qosmate"
+	local removed=0
+
+	if [ -x "$legacy_init" ]; then
+		"$legacy_init" stop 2>/dev/null || true
+		"$legacy_init" disable 2>/dev/null || true
+	fi
+
+	for path in \
+		/etc/init.d/qosmate \
+		/etc/rc.d/S*qosmate \
+		/etc/rc.d/K*qosmate \
+		/etc/hotplug.d/iface/*qosmate* \
+		/usr/share/luci/menu.d/luci-app-qosmate.json \
+		/usr/share/rpcd/acl.d/luci-app-qosmate.json \
+		/usr/libexec/rpcd/luci.qosmate \
+		/usr/libexec/rpcd/luci.qosmate_stats \
+		/www/luci-static/resources/view/qosmate; do
+		[ -e "$path" ] || continue
+		rm -rf "$path" 2>/dev/null && removed=1
+	done
+
+	[ "$removed" -eq 1 ] && logger -t multiwan-qos "Removed legacy MultiWAN QoS service/LuCI files"
+}
+
+migrate_file "$old_cfg" "$new_cfg"
+
+if [ -d "$old_dir" ]; then
+	cp -R "$old_dir" "${old_dir}${backup_suffix}" 2>/dev/null
+	[ -d "$new_dir" ] && cp -R "$new_dir" "${new_dir}${backup_suffix}" 2>/dev/null
+	mkdir -p "$new_dir"
+	cp -R "$old_dir"/. "$new_dir"/ 2>/dev/null
+	rm -rf "$old_dir"
+fi
+
+cleanup_legacy_qosmate
+
+exit 0

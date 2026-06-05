@@ -1,0 +1,1115 @@
+#!/usr/bin/lua
+-- MultiWAN QoS Agent CGI Endpoint
+-- Receives game connection data from the Windows PC agent and dynamically
+-- manages nftables rules in the multiwan_qos_agent chain.
+--
+-- Security:
+--   - API key validated against UCI config
+--   - Input strictly validated (IPs, ports, protocols only)
+--   - Only manipulates the isolated multiwan_qos_agent chain
+--   - Cannot modify UCI config, restart services, or run arbitrary commands
+--   - Rate-limited by timestamp check
+
+local jsonc = require "luci.jsonc"
+
+-- Constants
+local TIMESTAMP_FILE = "/tmp/multiwan_qos_agent_last_seen"
+local RATE_LIMIT_FILE = "/tmp/multiwan_qos_agent_rate_limit"
+local STATE_FILE = "/tmp/multiwan_qos_agent_state.json"
+local RESTARTING_FILE = "/tmp/multiwan_qos_restarting"
+local NFT_TABLE = "inet dscptag"
+local NFT_CHAIN = "multiwan_qos_agent"
+local LOCK_DIR = "/tmp/multiwan_qos_agent.lock"
+local MIN_REQUEST_INTERVAL_SEC = 1  -- minimum seconds between requests
+local DEFAULT_DSCP = 46
+local AGENT_ENDPOINT_VERSION = 4
+local DSCP_CLASS_BY_VALUE = {
+    [46] = "ef",
+    [40] = "cs5",
+    [48] = "cs6",
+    [56] = "cs7",
+    [32] = "cs4",
+    [34] = "af41",
+    [36] = "af42",
+    [8] = "cs1",
+    [0] = "cs0",
+}
+
+-- Helpers
+
+local function shell_quote(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+local function command_ok(cmd)
+    local wrapped = "if command -v timeout >/dev/null 2>&1; then timeout 8s sh -c " ..
+        shell_quote(cmd) .. "; else sh -c " .. shell_quote(cmd) .. "; fi"
+    local a, _, c = os.execute(wrapped)
+    return a == true or a == 0 or c == 0
+end
+
+local function trim(value)
+    return (value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function read_command(cmd)
+    local wrapped = "if command -v timeout >/dev/null 2>&1; then timeout 8s sh -c " ..
+        shell_quote(cmd) .. "; else sh -c " .. shell_quote(cmd) .. "; fi"
+    local f = io.popen(wrapped .. " 2>/dev/null")
+    if not f then
+        return "", false
+    end
+
+    local output = f:read("*a") or ""
+    local a, _, c = f:close()
+    return output, (a == true or a == 0 or c == 0)
+end
+
+local function acquire_lock()
+    if command_ok("mkdir " .. LOCK_DIR .. " 2>/dev/null") then
+        local f = io.open(LOCK_DIR .. "/ts", "w")
+        if f then
+            f:write(tostring(os.time()) .. "\n")
+            f:close()
+        end
+        return true
+    end
+
+    local f = io.open(LOCK_DIR .. "/ts", "r")
+    local ts = f and tonumber(f:read("*l")) or nil
+    if f then f:close() end
+
+    if ts and (os.time() - ts) > 30 then
+        os.execute("rm -rf " .. LOCK_DIR .. " 2>/dev/null")
+        if command_ok("mkdir " .. LOCK_DIR .. " 2>/dev/null") then
+            local wf = io.open(LOCK_DIR .. "/ts", "w")
+            if wf then
+                wf:write(tostring(os.time()) .. "\n")
+                wf:close()
+            end
+            return true
+        end
+    end
+
+    return false
+end
+
+local function release_lock()
+    os.execute("rm -rf " .. LOCK_DIR .. " 2>/dev/null")
+end
+
+local function file_exists(path)
+    local f = io.open(path, "r")
+    if f then
+        f:close()
+        return true
+    end
+    return false
+end
+
+local function send_response(status, message, extra)
+    local payload = { status = status, message = message }
+    if type(extra) == "table" then
+        for k, v in pairs(extra) do
+            payload[k] = v
+        end
+    end
+
+    print("Status: " .. status)
+    print("Content-Type: application/json")
+    print("")
+    print(jsonc.stringify(payload))
+end
+
+local function constant_time_compare(a, b)
+    if not a or not b or #a ~= #b then return false end
+    local result = 0
+    for i = 1, #a do
+        result = result + (a:byte(i) ~= b:byte(i) and 1 or 0)
+    end
+    return result == 0
+end
+
+local function get_api_key()
+    local f = io.popen("uci -q get multiwan-qos.agent.api_key 2>/dev/null")
+    if not f then return nil end
+    local key = f:read("*l")
+    f:close()
+    if key and key ~= "" then return key end
+    return nil
+end
+
+local function is_agent_enabled()
+    local f = io.popen("uci -q get multiwan-qos.agent.enabled 2>/dev/null")
+    if not f then return false end
+    local val = f:read("*l")
+    f:close()
+    return val == "1"
+end
+
+local function get_timeout()
+    local f = io.popen("uci -q get multiwan-qos.agent.timeout 2>/dev/null")
+    if not f then return 300 end
+    local val = f:read("*l")
+    f:close()
+    return tonumber(val) or 300
+end
+
+-- Rate limiter: reject requests faster than MIN_REQUEST_INTERVAL_SEC
+local function check_rate_limit()
+    local now = os.time()
+
+    local ts_f = io.open(RATE_LIMIT_FILE, "r")
+    if ts_f then
+        local last_sec = tonumber(ts_f:read("*l"))
+        ts_f:close()
+        -- Since os.time() is in seconds, minimum interval is 1 second
+        if last_sec and (now - last_sec) < MIN_REQUEST_INTERVAL_SEC then
+            return false
+        end
+    end
+
+    -- Update timestamp
+    local ts_w = io.open(RATE_LIMIT_FILE, "w")
+    if ts_w then
+        ts_w:write(tostring(now) .. "\n")
+        ts_w:close()
+    end
+    return true
+end
+
+local function touch_last_seen()
+    local ts_w = io.open(TIMESTAMP_FILE, "w")
+    if ts_w then
+        ts_w:write(tostring(os.time()) .. "\n")
+        ts_w:close()
+    end
+end
+
+local function clear_last_seen()
+    os.remove(TIMESTAMP_FILE)
+end
+
+local function clear_agent_state()
+    os.remove(STATE_FILE)
+end
+
+local function write_agent_state(state)
+    local f = io.open(STATE_FILE, "w")
+    if not f then
+        return false
+    end
+    f:write(jsonc.stringify(state or {}))
+    f:write("\n")
+    f:close()
+    return true
+end
+
+local function read_agent_state()
+    local f = io.open(STATE_FILE, "r")
+    if not f then
+        return nil
+    end
+
+    local body = f:read("*a") or ""
+    f:close()
+    if body == "" then
+        return nil
+    end
+
+    local ok, parsed = pcall(jsonc.parse, body)
+    if ok and type(parsed) == "table" then
+        return parsed
+    end
+    return nil
+end
+
+-- Strict input validation
+
+local function validate_ip(ip)
+    if not ip or type(ip) ~= "string" then return false end
+    -- IPv4 only for now
+    local a, b, c, d = ip:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    if not a then return false end
+    a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+    return a >= 0 and a <= 255 and b >= 0 and b <= 255 and
+           c >= 0 and c <= 255 and d >= 0 and d <= 255
+end
+
+local function validate_port(port)
+    if type(port) ~= "number" then return false end
+    return port >= 1 and port <= 65535 and math.floor(port) == port
+end
+
+local function validate_proto(proto)
+    return proto == "udp"
+end
+
+local function dscp_class_from_value(value)
+    value = tonumber(value)
+    if value == nil then value = DEFAULT_DSCP end
+    if math.floor(value) ~= value then return nil end
+    return DSCP_CLASS_BY_VALUE[value], value
+end
+
+local function nft_token_matches_number(token, value)
+    if not token or value == nil then
+        return false
+    end
+
+    token = token:lower():gsub("[,;]$", "")
+    if token == tostring(value) then
+        return true
+    end
+
+    local hex = token:match("^0x(%x+)$")
+    return hex ~= nil and tonumber(hex, 16) == value
+end
+
+local function nft_line_is_rule(trimmed)
+    local lower = trimmed:lower()
+    return trimmed ~= "" and
+        not trimmed:match("^#") and
+        not trimmed:match("^table%s+") and
+        not trimmed:match("^chain%s+") and
+        trimmed ~= "{" and
+        trimmed ~= "}" and
+        not trimmed:match("^type%s+") and
+        not trimmed:match("^policy%s+") and
+        not trimmed:match("^%^+%s*~*$") and
+        not trimmed:match("^~+%s*$") and
+        not lower:match("^error:") and
+        not lower:match("^syntax%s+error") and
+        not lower:match("^internal:") and
+        not lower:match("^netlink:")
+end
+
+local function nft_output_has_error(output)
+    output = output or ""
+    local lower = output:lower()
+    return lower:match("^%s*error:") ~= nil or
+        lower:match("\n%s*error:") ~= nil or
+        lower:match("^%s*syntax%s+error") ~= nil or
+        lower:match("\n%s*syntax%s+error") ~= nil or
+        lower:match("%^%s*~") ~= nil
+end
+
+local function validate_game_name(name)
+    if not name or type(name) ~= "string" then return false end
+    -- Allow alphanumeric, spaces, hyphens, underscores, colons, dots (max 64 chars)
+    if #name > 64 or #name < 1 then return false end
+    return name:match("^[%w%s%-_:%.]+$") ~= nil
+end
+
+local function conntrack_paths()
+    return { "/proc/net/nf_conntrack", "/proc/net/ip_conntrack" }
+end
+
+local function maybe_conntrack_candidate(src, dst, sport, dport, pc_ip, remote_ip, score)
+    sport = tonumber(sport)
+    dport = tonumber(dport)
+    if not validate_port(sport) or not validate_port(dport) then
+        return nil
+    end
+
+    if src == pc_ip and dst == remote_ip then
+        return {
+            local_port = sport,
+            remote_port = dport,
+            score = score or 0
+        }
+    end
+
+    if dst == pc_ip and src == remote_ip then
+        return {
+            local_port = dport,
+            remote_port = sport,
+            score = score or 0
+        }
+    end
+
+    return nil
+end
+
+local function conntrack_candidate_score(candidate, reported_remote_port, reported_local_port)
+    local exact = 0
+    if validate_port(reported_remote_port) and candidate.remote_port == reported_remote_port then
+        exact = exact + 2
+    end
+    if validate_port(reported_local_port) and candidate.local_port == reported_local_port then
+        exact = exact + 1
+    end
+    local base_score = candidate.score or 0
+    if base_score > 100000000000 then base_score = 100000000000 end
+    return (exact * 1000000000000) + base_score
+end
+
+local function consider_conntrack_candidate(candidate, reported_remote_port, reported_local_port, best, best_score)
+    if candidate then
+        local candidate_score = conntrack_candidate_score(candidate, reported_remote_port, reported_local_port)
+        if candidate_score > best_score then
+            return candidate, candidate_score
+        end
+    end
+    return best, best_score
+end
+
+local function find_router_conntrack_flow(pc_ip, remote_ip, reported_remote_port, reported_local_port)
+    local best = nil
+    local best_score = -1
+
+    for _, path in ipairs(conntrack_paths()) do
+        local f = io.open(path, "r")
+        if f then
+            for line in f:lines() do
+                if line:match("%sudp%s") and line:find(pc_ip, 1, true) and line:find(remote_ip, 1, true) then
+                    local src1, dst1, sport1, dport1, packets1, bytes1,
+                        src2, dst2, sport2, dport2, packets2, bytes2 =
+                        line:match("src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+)%s+packets=(%d+)%s+bytes=(%d+).*src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+)%s+packets=(%d+)%s+bytes=(%d+)")
+
+                    local score = 0
+                    if not (src1 and src2) then
+                        src1, dst1, sport1, dport1,
+                            src2, dst2, sport2, dport2 =
+                            line:match("src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+).*src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+)")
+                    end
+
+                    if src1 and src2 then
+                        score = (tonumber(bytes1) or 0) + (tonumber(bytes2) or 0) +
+                            (tonumber(packets1) or 0) + (tonumber(packets2) or 0)
+                        best, best_score = consider_conntrack_candidate(
+                            maybe_conntrack_candidate(src1, dst1, sport1, dport1, pc_ip, remote_ip, score),
+                            reported_remote_port, reported_local_port, best, best_score)
+                        best, best_score = consider_conntrack_candidate(
+                            maybe_conntrack_candidate(src2, dst2, sport2, dport2, pc_ip, remote_ip, score),
+                            reported_remote_port, reported_local_port, best, best_score)
+                    end
+                end
+            end
+            f:close()
+            if best then
+                return best
+            end
+        end
+    end
+
+    return nil
+end
+
+-- Validate the pc_ip is a private LAN address
+local function is_private_ip(ip)
+    local a, b = ip:match("^(%d+)%.(%d+)%.")
+    a, b = tonumber(a), tonumber(b)
+    if not a then return false end
+    return (a == 10) or
+           (a == 172 and b >= 16 and b <= 31) or
+           (a == 192 and b == 168)
+end
+
+-- Build and apply nftables rules
+
+local function flush_agent_chain()
+    return command_ok("nft flush chain " .. NFT_TABLE .. " " .. NFT_CHAIN .. " 2>/dev/null")
+end
+
+local function add_nft_rule(rule_str)
+    local cmd = "nft add rule " .. NFT_TABLE .. " " .. NFT_CHAIN .. " " .. rule_str
+    return command_ok(cmd)
+end
+
+local function agent_chain_exists()
+    return command_ok("nft list chain " .. NFT_TABLE .. " " .. NFT_CHAIN .. " >/dev/null 2>&1")
+end
+
+local function cleanup_stale_rules()
+    local f = io.open(TIMESTAMP_FILE, "r")
+    if not f then return end
+
+    local ts = tonumber(f:read("*l"))
+    f:close()
+
+    if ts and (os.time() - ts) > get_timeout() then
+        if agent_chain_exists() then
+            flush_agent_chain()
+        end
+        os.remove(TIMESTAMP_FILE)
+        clear_agent_state()
+    end
+end
+
+local function agent_rule_actions(dscp_class, safe_game, direction)
+    return string.format(
+        'ip dscp set %s counter comment "agent_%s_%s"',
+        dscp_class, safe_game, direction
+    )
+end
+
+local function make_rule_meta(game, direction, proto, remote_ip, remote_port, local_port, dscp_class)
+    return {
+        game = game,
+        direction = direction,
+        proto = proto,
+        remote_ip = remote_ip,
+        remote_port = remote_port,
+        local_port = local_port,
+        dscp = dscp_class,
+        packets = 0,
+        bytes = 0
+    }
+end
+
+local function mark_rule_meta_source(rule, match_source)
+    rule.match_source = match_source
+    return rule
+end
+
+local function normalized_rule_field(rule, field)
+    local value = rule and rule[field] or nil
+    if value == nil then
+        return ""
+    end
+    if field == "remote_port" or field == "local_port" then
+        return tostring(tonumber(value) or 0)
+    end
+    return tostring(value)
+end
+
+local function rules_meta_equal(existing_rules, desired_rules)
+    if type(existing_rules) ~= "table" or type(desired_rules) ~= "table" then
+        return false
+    end
+    if #existing_rules ~= #desired_rules then
+        return false
+    end
+
+    local fields = {
+        "game", "direction", "proto", "remote_ip", "remote_port",
+        "local_port", "dscp", "match_source"
+    }
+    local existing_signatures = {}
+    local desired_signatures = {}
+
+    for i = 1, #desired_rules do
+        local existing_parts = {}
+        local desired_parts = {}
+        for _, field in ipairs(fields) do
+            existing_parts[#existing_parts + 1] = normalized_rule_field(existing_rules[i], field)
+            desired_parts[#desired_parts + 1] = normalized_rule_field(desired_rules[i], field)
+        end
+        existing_signatures[#existing_signatures + 1] = table.concat(existing_parts, "\31")
+        desired_signatures[#desired_signatures + 1] = table.concat(desired_parts, "\31")
+    end
+
+    table.sort(existing_signatures)
+    table.sort(desired_signatures)
+
+    for i = 1, #desired_signatures do
+        if existing_signatures[i] ~= desired_signatures[i] then
+            return false
+        end
+    end
+
+    return true
+end
+
+local function state_matches_desired_rules(state, rules_added, rules_meta, dscp_value)
+    if type(state) ~= "table" or type(state.rules) ~= "table" then
+        return false
+    end
+    if (tonumber(state.rule_count or 0) or 0) ~= rules_added then
+        return false
+    end
+    if (tonumber(state.dscp or -1) or -1) ~= dscp_value then
+        return false
+    end
+    return rules_meta_equal(state.rules, rules_meta)
+end
+
+local function inspect_agent_rules(dscp_class, dscp_value)
+    local output, ok = read_command("nft -a list chain " .. NFT_TABLE .. " " .. NFT_CHAIN)
+    local result = {
+        ok = ok and not nft_output_has_error(output),
+        status = "listed",
+        raw_rule_count = 0,
+        agent_rule_count = 0,
+        non_agent_rule_count = 0,
+        agent_comment_count = 0,
+        dscp_rule_count = 0,
+        ct_mark_rule_count = 0,
+        nft_output = output
+    }
+
+    if not result.ok then
+        result.status = "nft_list_failed"
+        return result
+    end
+
+    for line in output:gmatch("[^\r\n]+") do
+        local trimmed = trim(line)
+        local lower = trimmed:lower()
+        local is_rule_line = nft_line_is_rule(trimmed)
+
+        if is_rule_line then
+            result.raw_rule_count = result.raw_rule_count + 1
+        end
+
+        if line:match('comment.*"agent_') then
+            result.agent_comment_count = result.agent_comment_count + 1
+        end
+
+        local dscp_token = lower:match("ip%s+dscp%s+set%s+([%w_]+)")
+        local has_dscp_setter = dscp_token ~= nil
+        if dscp_class then
+            has_dscp_setter = dscp_token == dscp_class or
+                nft_token_matches_number(dscp_token, dscp_value)
+        end
+        local has_ct_mark_setter = lower:match("ct%s+mark%s+set") ~= nil
+
+        if is_rule_line then
+            if has_dscp_setter and not has_ct_mark_setter then
+                result.agent_rule_count = result.agent_rule_count + 1
+                result.dscp_rule_count = result.dscp_rule_count + 1
+            elseif has_ct_mark_setter then
+                result.non_agent_rule_count = result.non_agent_rule_count + 1
+                result.ct_mark_rule_count = result.ct_mark_rule_count + 1
+            else
+                result.non_agent_rule_count = result.non_agent_rule_count + 1
+            end
+        end
+    end
+
+    return result
+end
+
+local function verify_agent_rules(expected_count, dscp_class, dscp_value)
+    local output, ok = read_command("nft -a list chain " .. NFT_TABLE .. " " .. NFT_CHAIN)
+    local raw_rule_count = 0
+    local agent_rule_count = 0
+    local non_agent_rule_count = 0
+    local agent_comment_count = 0
+    local dscp_rule_count = 0
+    local ct_mark_rule_count = 0
+
+    if not ok or nft_output_has_error(output) then
+        return {
+            ok = false,
+            status = "nft_list_failed",
+            message = "Failed to list multiwan_qos_agent after update",
+            raw_rule_count = raw_rule_count,
+            agent_rule_count = agent_rule_count,
+            non_agent_rule_count = non_agent_rule_count,
+            agent_comment_count = agent_comment_count,
+            dscp_rule_count = dscp_rule_count,
+            ct_mark_rule_count = ct_mark_rule_count,
+            nft_output = output
+        }
+    end
+
+    for line in output:gmatch("[^\r\n]+") do
+        local trimmed = trim(line)
+        local lower = trimmed:lower()
+        local is_rule_line = nft_line_is_rule(trimmed)
+
+        if is_rule_line then
+            raw_rule_count = raw_rule_count + 1
+        end
+
+        if line:match('comment.*"agent_') then
+            agent_comment_count = agent_comment_count + 1
+        end
+
+        local dscp_token = lower:match("ip%s+dscp%s+set%s+([%w_]+)")
+        local has_dscp_setter = dscp_token == dscp_class or
+            nft_token_matches_number(dscp_token, dscp_value)
+        local has_ct_mark_setter = lower:match("ct%s+mark%s+set") ~= nil
+
+        if is_rule_line then
+            if has_dscp_setter and not has_ct_mark_setter then
+                agent_rule_count = agent_rule_count + 1
+                dscp_rule_count = dscp_rule_count + 1
+            elseif has_ct_mark_setter then
+                non_agent_rule_count = non_agent_rule_count + 1
+                ct_mark_rule_count = ct_mark_rule_count + 1
+            else
+                non_agent_rule_count = non_agent_rule_count + 1
+            end
+        end
+    end
+
+    local verified = true
+    local status = "verified"
+    local message = "Agent rules verified"
+
+    if expected_count > 0 then
+        if ct_mark_rule_count > 0 then
+            verified = false
+            status = "unexpected_ct_mark"
+            message = "Agent chain contains conntrack mark setters; expected DSCP-only rules"
+        elseif non_agent_rule_count > 0 then
+            verified = false
+            status = "unexpected_non_agent_rules"
+            message = "multiwan_qos_agent contains non-agent rules after update"
+        elseif agent_rule_count ~= expected_count then
+            verified = false
+            status = "agent_count_mismatch"
+            message = "Agent-owned rule count did not match expected rule count"
+        elseif dscp_rule_count ~= expected_count then
+            verified = false
+            status = "dscp_count_mismatch"
+            message = "Agent rule DSCP setters did not match expected rule count"
+        elseif agent_comment_count ~= expected_count then
+            status = "verified_without_comments"
+            message = "Agent rules verified; nft comments unavailable or incomplete"
+        end
+    elseif agent_rule_count ~= 0 or non_agent_rule_count ~= 0 then
+        verified = false
+        status = "unexpected_rules"
+        message = "multiwan_qos_agent still contains rules after zero-rule update"
+    end
+
+    return {
+        ok = verified,
+        status = status,
+        message = message,
+        raw_rule_count = raw_rule_count,
+        agent_rule_count = agent_rule_count,
+        non_agent_rule_count = non_agent_rule_count,
+        agent_comment_count = agent_comment_count,
+        verified_rule_count = verified and expected_count or 0,
+        dscp_rule_count = dscp_rule_count,
+        ct_mark_rule_count = ct_mark_rule_count,
+        nft_output = output
+    }
+end
+
+local function current_agent_status()
+    local state = read_agent_state()
+    local state_rule_count = tonumber(state and state.rule_count or 0) or 0
+    local status = {
+        chain_exists = agent_chain_exists(),
+        rule_count = 0,
+        raw_rule_count = 0,
+        agent_rule_count = 0,
+        non_agent_rule_count = 0,
+        agent_comment_count = 0,
+        dscp_rule_count = 0,
+        state_rule_count = state_rule_count,
+        verification_status = state and state.verification_status or "none",
+        stale_state_cleared = false
+    }
+
+    if not status.chain_exists then
+        if state_rule_count > 0 then
+            status.previous_state_rule_count = state_rule_count
+            status.state_rule_count = 0
+            status.stale_state_cleared = true
+            clear_agent_state()
+        end
+        status.verification_status = "missing_chain"
+        return status
+    end
+
+    local inspected = inspect_agent_rules(
+        state and state.dscp_class or nil,
+        state and tonumber(state.dscp) or nil
+    )
+    status.nft_ok = inspected.ok
+    status.raw_rule_count = inspected.raw_rule_count or 0
+    status.agent_rule_count = inspected.agent_rule_count or 0
+    status.non_agent_rule_count = inspected.non_agent_rule_count or 0
+    status.agent_comment_count = inspected.agent_comment_count or 0
+    status.dscp_rule_count = inspected.dscp_rule_count or 0
+    status.rule_count = status.agent_rule_count
+
+    if not inspected.ok then
+        status.verification_status = inspected.status or "nft_list_failed"
+        return status
+    end
+
+    if status.raw_rule_count == 0 and state_rule_count > 0 then
+        status.previous_state_rule_count = state_rule_count
+        status.state_rule_count = 0
+        status.stale_state_cleared = true
+        status.verification_status = "empty_chain"
+        clear_agent_state()
+    elseif status.agent_rule_count > 0 then
+        status.verification_status = state and state.verification_status or "listed"
+    else
+        status.verification_status = "verified"
+    end
+
+    return status
+end
+
+local function apply_connection_rules(pc_ip, connections, dscp_class, dscp_value)
+    local rules_added = 0
+    local buffer = {}
+    local rules_meta = {}
+    local ignored_connections = 0
+    local conntrack_resolved = 0
+    local conntrack_unmatched = 0
+    local existing_state = read_agent_state()
+
+    if not agent_chain_exists() then
+        return nil, "Agent nft chain not found; restart MultiWAN QoS after enabling the agent", nil, rules_meta, ignored_connections, conntrack_resolved, conntrack_unmatched
+    end
+
+    buffer[#buffer + 1] = "flush chain " .. NFT_TABLE .. " " .. NFT_CHAIN
+
+    for _, conn in ipairs(connections) do
+        local game = conn.game or "unknown"
+        local safe_game = game:gsub("[^%w_]", ""):sub(1, 20)
+        if safe_game == "" then safe_game = "unknown" end
+        local proto = conn.proto
+
+        if conn.remote_ip and conn.remote_port then
+            local remote_port = tonumber(conn.remote_port)
+            if validate_ip(conn.remote_ip) and validate_port(remote_port) then
+                local local_port = tonumber(conn.local_port)
+                local resolved = find_router_conntrack_flow(pc_ip, conn.remote_ip, remote_port, local_port)
+                if resolved then
+                    remote_port = resolved.remote_port
+                    local_port = resolved.local_port
+                    conntrack_resolved = conntrack_resolved + 1
+
+                    buffer[#buffer + 1] = string.format(
+                        'add rule %s %s ip saddr %s ip daddr %s %s sport %d %s dport %d %s',
+                        NFT_TABLE, NFT_CHAIN, pc_ip, conn.remote_ip, proto, local_port, proto, remote_port,
+                        agent_rule_actions(dscp_class, safe_game, "UP")
+                    )
+                    rules_meta[#rules_meta + 1] = mark_rule_meta_source(
+                        make_rule_meta(game, "UP", proto, conn.remote_ip, remote_port, local_port, dscp_class),
+                        "router_conntrack")
+
+                    buffer[#buffer + 1] = string.format(
+                        'add rule %s %s ip saddr %s ip daddr %s %s sport %d %s dport %d %s',
+                        NFT_TABLE, NFT_CHAIN, conn.remote_ip, pc_ip, proto, remote_port, proto, local_port,
+                        agent_rule_actions(dscp_class, safe_game, "DN")
+                    )
+                    rules_meta[#rules_meta + 1] = mark_rule_meta_source(
+                        make_rule_meta(game, "DN", proto, conn.remote_ip, remote_port, local_port, dscp_class),
+                        "router_conntrack")
+                    rules_added = rules_added + 2
+                else
+                    conntrack_unmatched = conntrack_unmatched + 1
+                    ignored_connections = ignored_connections + 1
+                end
+            else
+                ignored_connections = ignored_connections + 1
+            end
+        else
+            ignored_connections = ignored_connections + 1
+        end
+    end
+
+    if rules_added > 0 and state_matches_desired_rules(existing_state, rules_added, rules_meta, dscp_value) then
+        local verification = verify_agent_rules(rules_added, dscp_class, dscp_value)
+        if verification and verification.ok then
+            return rules_added, nil, verification, rules_meta, ignored_connections,
+                conntrack_resolved, conntrack_unmatched, true
+        end
+    end
+
+    if rules_added == 0 and ignored_connections > 0 then
+        local previous_rule_count = tonumber(existing_state and existing_state.rule_count or 0) or 0
+        local previous_dscp = tonumber(existing_state and existing_state.dscp or -1) or -1
+        if previous_rule_count > 0 and previous_dscp == dscp_value then
+            local verification = verify_agent_rules(previous_rule_count, existing_state.dscp_class, tonumber(existing_state.dscp))
+            if verification and verification.ok then
+                return previous_rule_count, nil, verification, existing_state.rules or {},
+                    ignored_connections, conntrack_resolved, conntrack_unmatched, true
+            end
+        end
+    end
+
+    local tmp_file = "/tmp/multiwan_qos_agent_rules.nft"
+    local f = io.open(tmp_file, "w")
+    if not f then
+        return nil, "Failed to write temporary nft rules file", nil, rules_meta, ignored_connections, conntrack_resolved, conntrack_unmatched
+    end
+    f:write(table.concat(buffer, "\n"))
+    f:write("\n")
+    f:close()
+
+    if not command_ok("nft -c -f " .. tmp_file .. " 2>/dev/null") then
+        return nil, "Failed nft syntax validation for agent rules", nil, rules_meta, ignored_connections, conntrack_resolved, conntrack_unmatched
+    end
+    if not command_ok("nft -f " .. tmp_file .. " 2>/dev/null") then
+        return nil, "Failed to apply nft agent rules", nil, rules_meta, ignored_connections, conntrack_resolved, conntrack_unmatched
+    end
+
+    return rules_added, nil, verify_agent_rules(rules_added, dscp_class, dscp_value),
+        rules_meta, ignored_connections, conntrack_resolved, conntrack_unmatched, false
+end
+-- Main CGI handler
+
+local function main()
+    -- Only accept POST
+    local method = os.getenv("REQUEST_METHOD")
+    if method ~= "POST" then
+        send_response(405, "Method not allowed")
+        return
+    end
+
+    -- Check if agent is enabled
+    if not is_agent_enabled() then
+        send_response(403, "Agent is disabled")
+        return
+    end
+
+    if file_exists(RESTARTING_FILE) then
+        send_response(503, "MultiWAN QoS is restarting")
+        return
+    end
+
+    -- Rate limit
+    if not check_rate_limit() then
+        send_response(429, "Too many requests")
+        return
+    end
+
+    -- Read request body
+    local content_length = tonumber(os.getenv("CONTENT_LENGTH") or "0")
+    if content_length <= 0 or content_length > 8192 then
+        send_response(400, "Invalid content length")
+        return
+    end
+
+    local body = io.read(content_length)
+    if not body then
+        send_response(400, "Empty body")
+        return
+    end
+
+    -- Parse JSON
+    local data = jsonc.parse(body)
+    if not data then
+        send_response(400, "Invalid JSON")
+        return
+    end
+
+    -- Validate API key
+    local expected_key = get_api_key()
+    if not expected_key then
+        send_response(500, "API key not configured")
+        return
+    end
+
+    if not constant_time_compare(data.api_key, expected_key) then
+        send_response(401, "Invalid API key")
+        return
+    end
+
+    -- Validate pc_ip
+    if not validate_ip(data.pc_ip) then
+        send_response(400, "Invalid pc_ip")
+        return
+    end
+
+    if not is_private_ip(data.pc_ip) then
+        send_response(400, "pc_ip must be a private LAN address")
+        return
+    end
+
+    -- Handle different actions
+    local action = data.action or "update"
+
+    if action == "update" then
+        local dscp_class, dscp_value = dscp_class_from_value(data.dscp)
+        if not dscp_class then
+            send_response(400, "Unsupported dscp value")
+            return
+        end
+
+        -- Validate connections array
+        if not data.connections or type(data.connections) ~= "table" then
+            send_response(400, "Missing connections array")
+            return
+        end
+
+        if #data.connections > 100 then
+            send_response(400, "Too many connections (max 100)")
+            return
+        end
+
+        -- Validate each connection
+        for i, conn in ipairs(data.connections) do
+            if not validate_proto(conn.proto) then
+                send_response(400, "Invalid proto in connection " .. i)
+                return
+            end
+            if conn.game and not validate_game_name(conn.game) then
+                send_response(400, "Invalid game name in connection " .. i)
+                return
+            end
+        end
+
+        -- Apply rules
+        if not acquire_lock() then
+            send_response(429, "Agent update already in progress")
+            return
+        end
+        cleanup_stale_rules()
+        local rules_added, err, verification, rules_meta, ignored_connections, conntrack_resolved, conntrack_unmatched, rules_reused =
+            apply_connection_rules(data.pc_ip, data.connections, dscp_class, dscp_value)
+        touch_last_seen()
+        local state_written = false
+        local cleared_after_failure = false
+        if rules_added and verification and verification.ok then
+            if rules_added > 0 then
+                state_written = write_agent_state({
+                    endpoint_version = AGENT_ENDPOINT_VERSION,
+                    updated_at = os.time(),
+                    pc_ip = data.pc_ip,
+                    dscp = dscp_value,
+                    dscp_class = dscp_class,
+                    rule_count = rules_added,
+                    rules = rules_meta or {},
+                    verification_status = verification.status,
+                    raw_rule_count = verification.raw_rule_count,
+                    agent_rule_count = verification.agent_rule_count,
+                    non_agent_rule_count = verification.non_agent_rule_count,
+                    agent_comment_count = verification.agent_comment_count,
+                    dscp_rule_count = verification.dscp_rule_count,
+                    conntrack_resolved = conntrack_resolved or 0,
+                    conntrack_unmatched = conntrack_unmatched or 0,
+                    rules_reused = rules_reused and true or false,
+                    rule_shape = "dscp_only"
+                })
+            else
+                clear_agent_state()
+                state_written = true
+            end
+        elseif rules_added and verification and not verification.ok then
+            cleared_after_failure = flush_agent_chain()
+            clear_agent_state()
+        end
+        release_lock()
+        if not rules_added then
+            send_response(500, err or "Failed to apply rules")
+            return
+        end
+
+        local response_meta = {
+            endpoint_version = AGENT_ENDPOINT_VERSION,
+            action = "update",
+            rule_shape = "dscp_only",
+            dscp = dscp_value,
+            dscp_class = dscp_class,
+            rules_expected = rules_added,
+            rules_applied = rules_reused and 0 or rules_added,
+            rule_count = verification and verification.verified_rule_count or 0,
+            raw_rule_count = verification and verification.raw_rule_count or 0,
+            agent_rule_count = verification and verification.agent_rule_count or 0,
+            non_agent_rule_count = verification and verification.non_agent_rule_count or 0,
+            agent_comment_count = verification and verification.agent_comment_count or 0,
+            dscp_rule_count = verification and verification.dscp_rule_count or 0,
+            conntrack_resolved = conntrack_resolved or 0,
+            conntrack_unmatched = conntrack_unmatched or 0,
+            verification_ok = verification and verification.ok or false,
+            verification_status = verification and verification.status or "not_run",
+            ignored_connections = ignored_connections or 0,
+            rules_reused = rules_reused and true or false,
+            state_written = state_written,
+            cleared_after_failure = cleared_after_failure
+        }
+
+        if not verification or not verification.ok then
+            response_meta.nft_output = verification and verification.nft_output or ""
+            send_response(
+                500,
+                "Agent rules applied but verification failed: " .. (verification and verification.message or "verification did not run"),
+                response_meta
+            )
+            return
+        end
+
+        send_response(200,
+            rules_reused and string.format("OK: %d rules unchanged", rules_added) or
+                string.format("OK: %d rules applied", rules_added),
+            response_meta)
+
+    elseif action == "clear" then
+        -- Clear all agent rules
+        if not acquire_lock() then
+            send_response(429, "Agent update already in progress")
+            return
+        end
+        cleanup_stale_rules()
+        local cleared = flush_agent_chain()
+        if cleared then
+            clear_agent_state()
+        end
+        touch_last_seen()
+        release_lock()
+        if cleared then
+            send_response(200, "OK: rules cleared", {
+                endpoint_version = AGENT_ENDPOINT_VERSION,
+                action = "clear",
+                rule_count = 0
+            })
+        else
+            send_response(500, "Failed to clear agent rules; agent chain not found")
+        end
+
+    elseif action == "disconnect" then
+        -- Clear agent rules and mark the PC app as offline.
+        if not acquire_lock() then
+            send_response(429, "Agent update already in progress")
+            return
+        end
+        cleanup_stale_rules()
+        local cleared = true
+        if agent_chain_exists() then
+            cleared = flush_agent_chain()
+        end
+        if cleared then
+            clear_agent_state()
+        end
+        clear_last_seen()
+        release_lock()
+        if cleared then
+            send_response(200, "OK: agent disconnected", {
+                endpoint_version = AGENT_ENDPOINT_VERSION,
+                action = "disconnect",
+                rule_count = 0
+            })
+        else
+            send_response(500, "Failed to clear agent rules; agent chain not found")
+        end
+
+    elseif action == "heartbeat" then
+        if not acquire_lock() then
+            send_response(429, "Agent update already in progress")
+            return
+        end
+        cleanup_stale_rules()
+        touch_last_seen()
+        local heartbeat_status = current_agent_status()
+        release_lock()
+        heartbeat_status.endpoint_version = AGENT_ENDPOINT_VERSION
+        heartbeat_status.action = "heartbeat"
+        send_response(200, "OK: heartbeat received", {
+            endpoint_version = heartbeat_status.endpoint_version,
+            action = heartbeat_status.action,
+            chain_exists = heartbeat_status.chain_exists,
+            rule_count = heartbeat_status.rule_count,
+            raw_rule_count = heartbeat_status.raw_rule_count,
+            agent_rule_count = heartbeat_status.agent_rule_count,
+            non_agent_rule_count = heartbeat_status.non_agent_rule_count,
+            agent_comment_count = heartbeat_status.agent_comment_count,
+            dscp_rule_count = heartbeat_status.dscp_rule_count,
+            state_rule_count = heartbeat_status.state_rule_count,
+            previous_state_rule_count = heartbeat_status.previous_state_rule_count,
+            verification_status = heartbeat_status.verification_status,
+            stale_state_cleared = heartbeat_status.stale_state_cleared,
+            nft_ok = heartbeat_status.nft_ok
+        })
+
+    else
+        send_response(400, "Invalid action")
+    end
+end
+
+main()
+

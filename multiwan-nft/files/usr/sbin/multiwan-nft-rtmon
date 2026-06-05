@@ -1,0 +1,192 @@
+#!/bin/sh
+
+. /lib/functions.sh
+. /lib/functions/network.sh
+. /lib/multiwan-nft/multiwan_nft.sh
+
+rtmon_cleanup()
+{
+	if [ -n "$RTMON_MONITOR_PID" ]; then
+		kill "$RTMON_MONITOR_PID" 2>/dev/null
+		wait "$RTMON_MONITOR_PID" 2>/dev/null
+		RTMON_MONITOR_PID=
+	fi
+	[ -n "$RTMON_LOCKFILE" ] && rm -f "$RTMON_LOCKFILE"
+	[ -n "$RTMON_FIFO" ] && rm -f "$RTMON_FIFO"
+}
+
+rtmon_stop()
+{
+	trap - EXIT INT TERM HUP
+	rtmon_cleanup
+	exit 0
+}
+
+multiwan_nft_add_all_routes()
+{
+	local tid IP route_line family active_tbls tid initial_state error
+	local ipv=$1
+
+	add_active_tbls()
+	{
+		let tid++
+		config_get family "$1" family ipv4
+		config_get initial_state "$1" initial_state "online"
+		[ "$family" != "$ipv" ] && return
+		if $NFT list chain $NFT_FAMILY $NFT_TABLE "multiwan_nft_iface_in_$1" &> /dev/null; then
+			active_tbls="$active_tbls${tid} "
+		fi
+	}
+
+	add_route()
+	{
+		let tid++
+		[ -n "${active_tbls##* $tid *}" ] && return
+		multiwan_nft_route_replace_idempotent "$IP" "$tid" "$route_line"
+	}
+
+	multiwan_nft_update_dev_to_table
+	[ "$ipv" = "ipv6" ] && [ "$NO_IPV6" -ne 0 ] && return
+	if [ "$ipv" = "ipv4" ]; then
+		IP="$IP4"
+	elif [ "$ipv" = "ipv6" ]; then
+		IP="$IP6"
+	fi
+	tid=0
+	active_tbls=" "
+	config_foreach add_active_tbls interface
+	[ "$active_tbls" = " " ] && return
+	multiwan_nft_get_routes | while read -r route_line; do
+		multiwan_nft_route_line_dev "tid" "$route_line" "$ipv"
+		if [ -n "$tid" ] && [ -z "${active_tbls##* $tid *}" ]; then
+			multiwan_nft_route_replace_idempotent "$IP" "$tid" "$route_line"
+		elif [ -n "${route_line##default*}" ] && [ -n "${route_line##fe80::/64*}" ]; then
+			config_foreach add_route interface
+		fi
+	done
+}
+
+multiwan_nft_rtmon_route_handle()
+{
+	local action route_line family tbl device line tid
+
+	route_line=${1##"Deleted "}
+	route_family=$2
+
+	if [ "$route_line" = "$1" ]; then
+		action="replace"
+		multiwan_nft_nft_add_set_element "multiwan_nft_connected_${route_family}" "${route_line%% *}"
+	else
+		action="del"
+		multiwan_nft_set_connected_${route_family}
+	fi
+
+	if [ -z "${route_line##*linkdown*}" ]; then
+		LOG debug "attempting to add link on down interface - $route_line"
+	fi
+
+	if [ "$route_family" = "ipv4" ]; then
+		IP="$IP4"
+	elif [ "$route_family" = "ipv6" ] && [ "$NO_IPV6" -eq 0 ]; then
+		IP="$IP6"
+	else
+		LOG warn "route update called with invalid family - $route_family"
+		return
+	fi
+	route_line=$(echo "$route_line" | sed -ne "$MULTIWAN_NFT_ROUTE_LINE_EXP")
+
+	handle_route() {
+		local error
+		local iface=$1
+		tbl=$($IP route list table $tid 2>/dev/null)$'\n'
+
+		if [ -n "$iface" ] && [ "$(multiwan_nft_get_track_status $iface)" != "active" ]; then
+			LOG debug "interface $iface is disabled - skipping '$route_line'";
+			return
+		fi
+
+		# check that action needs to be performed. May not need to take action if we
+		# got a delete event, but table was already flushed
+		if [ $action = "del" ] && [ -n "${tbl##*$route_line$'\n'*}" ]; then
+			LOG debug "skipping already deleted route table $tid - skipping '$route_line'"
+			return
+		fi
+
+		network_get_device device "$iface"
+		LOG debug "adjusting route $device: '$IP route $action table $tid $route_line'"
+		if [ "$action" = "replace" ]; then
+			multiwan_nft_route_replace_idempotent "$IP" "$tid" "$route_line"
+		else
+			error=$($IP route "$action" table $tid $route_line 2>&1)||
+				LOG warn "failed: '$IP route $action table $tid $route_line' - error: $error"
+		fi
+	}
+	handle_route_cb(){
+		local iface=$1
+		let tid++
+		config_get family "$iface" family ipv4
+		[ "$family" != "$route_family" ] && return
+		handle_route "$iface"
+	}
+
+	multiwan_nft_update_dev_to_table
+	multiwan_nft_route_line_dev "tid" "$route_line" "$route_family"
+
+	if [ -n "$tid" ]; then
+		handle_route
+	elif [ -n "${route_line##default*}" ] && [ -n "${route_line##fe80::/64*}" ]; then
+		config_foreach handle_route_cb interface
+	fi
+}
+
+main()
+{
+	local IP family
+
+	multiwan_nft_init || return 1
+
+	family=$1
+	[ -z "$family" ] && family=ipv4
+	if [ "$family" = "ipv6" ]; then
+		if [ "$NO_IPV6" -ne 0 ]; then
+			LOG warn "multiwan-nft-rtmon started for ipv6, but ipv6 not enabled on system"
+			exit 1
+		fi
+		IP="$IP6"
+	else
+		IP="$IP4"
+	fi
+	
+	# Use a lock file to synchronize route population
+	RTMON_LOCKFILE="/tmp/multiwan-nft-rtmon_init_${family}"
+	RTMON_FIFO="/tmp/multiwan-nft-rtmon-${family}-$$.fifo"
+	RTMON_MONITOR_PID=
+	rm -f "$RTMON_FIFO"
+	
+	trap rtmon_cleanup EXIT
+	trap rtmon_stop INT TERM HUP
+	if ! mkfifo "$RTMON_FIFO"; then
+		LOG error "Could not create rtmon FIFO $RTMON_FIFO"
+		rtmon_cleanup
+		exit 1
+	fi
+	touch "$RTMON_LOCKFILE"
+	
+	# Populate initial routes
+	# Note: multiwan_nft_set_connected_* called from init script to avoid race conditions
+	multiwan_nft_add_all_routes "$family"
+	
+	# Remove lock file to signal we're ready
+	rm -f "$RTMON_LOCKFILE"
+	
+	# Use a FIFO so the route loop runs in this shell. BusyBox ash runs the
+	# right side of a pipe into `while` in a long-lived subshell.
+	$IP monitor route > "$RTMON_FIFO" &
+	RTMON_MONITOR_PID=$!
+	while IFS='' read -r line; do
+		[ -z "${line##*table*}" ] && continue
+		LOG debug "handling route update $family '$line'"
+		multiwan_nft_rtmon_route_handle "$line" "$family"
+	done < "$RTMON_FIFO"
+}
+main "$@"

@@ -1,0 +1,130 @@
+#!/bin/sh
+
+. /lib/functions.sh
+. /lib/functions/network.sh
+. /lib/multiwan-nft/multiwan_nft.sh
+
+initscript=/etc/init.d/multiwan-nft
+. /lib/functions/procd.sh
+
+
+SCRIPTNAME="multiwan_nft-hotplug"
+
+# Enhanced debug logging for troubleshooting
+LOG debug "multiwan_nft hotplug started: ACTION=$ACTION INTERFACE=$INTERFACE DEVICE=$DEVICE MULTIWAN_NFT_STARTUP=$MULTIWAN_NFT_STARTUP FIRSTCONNECT=$FIRSTCONNECT MULTIWAN_NFT_SHUTDOWN=$MULTIWAN_NFT_SHUTDOWN"
+
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || [ "$ACTION" = "connected" ] || [ "$ACTION" = "disconnected" ] || exit 1
+[ -n "$INTERFACE" ] || exit 2
+if [ "$FIRSTCONNECT" = "1" ] || [ "$MULTIWAN_NFT_SHUTDOWN" = "1" ]; then
+	exit 0
+fi
+
+if { [ "$ACTION" = "ifup" ] || [ "$ACTION" = "connected" ] ; } && [ -z "$DEVICE" ]; then
+	LOG notice "$ACTION called on $INTERFACE with no device set"
+	exit 3
+fi
+
+[ "$MULTIWAN_NFT_STARTUP" = "init" ] || procd_lock
+
+multiwan_nft_init || exit 1
+
+/etc/init.d/multiwan-nft running || {
+	LOG notice "multiwan_nft hotplug $ACTION on $INTERFACE not called because globally disabled"
+	exit 0
+}
+
+$NFT list chain $NFT_FAMILY $NFT_TABLE multiwan_nft_hook &>/dev/null || {
+	LOG warn "hotplug called on $INTERFACE before multiwan_nft has been set up"
+	exit 0
+}
+
+if [ "$MULTIWAN_NFT_STARTUP" != "init" ] && [ "$ACTION" = "ifup" ]; then
+	multiwan_nft_set_user_iface_rules_nft $INTERFACE $DEVICE
+fi
+
+config_get_bool enabled $INTERFACE 'enabled' '0'
+[ "${enabled}" -eq 1 ] || {
+	LOG notice "multiwan_nft hotplug on $INTERFACE not called because interface disabled"
+	exit 0
+}
+
+config_get initial_state $INTERFACE initial_state "online"
+if [ "$initial_state" = "offline" ]; then
+	status=$(cat $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/STATUS 2>/dev/null || echo unknown)
+	[ "$status" = "online" ] || status=offline
+else
+	status=online
+fi
+
+LOG notice "Execute $ACTION event on interface $INTERFACE (${DEVICE:-unknown})"
+
+case "$ACTION" in
+	connected)
+		LOG debug "Processing connected: setting route and policies"
+		multiwan_nft_set_iface_hotplug_state $INTERFACE "online"
+		multiwan_nft_restore_iface_main_route $INTERFACE $DEVICE
+		multiwan_nft_create_iface_route $INTERFACE || {
+			LOG warn "connected event on $INTERFACE skipped policy rebuild because route table update failed"
+			exit 1
+		}
+		multiwan_nft_set_policies_nft || LOG warn "connected event on $INTERFACE could not fully rebuild policies"
+		;;
+	ifup)
+		LOG debug "Processing ifup: creating iface rules and nft chains"
+		multiwan_nft_create_iface_nft $INTERFACE $DEVICE || {
+			LOG warn "ifup event on $INTERFACE failed while rebuilding nft interface state"
+			exit 1
+		}
+		multiwan_nft_create_iface_rules $INTERFACE $DEVICE || {
+			LOG warn "ifup event on $INTERFACE failed while rebuilding ip rules"
+			exit 1
+		}
+		multiwan_nft_set_iface_hotplug_state $INTERFACE "$status"
+		# During multiwan_nft restart, already-online interfaces may not emit a later
+		# connected transition, so restore main-table defaults here after multiwan_nft
+		# previously removed them during a disconnected event.
+		[ "$status" = "online" ] && multiwan_nft_restore_iface_main_route $INTERFACE $DEVICE
+		if [ "$MULTIWAN_NFT_STARTUP" != "init" ]; then
+			multiwan_nft_create_iface_route $INTERFACE $DEVICE || {
+				LOG warn "ifup event on $INTERFACE skipped dependent rebuilds because route table update failed"
+				exit 1
+			}
+			multiwan_nft_set_general_rules
+			# Repopulate connected sets to ensure local traffic bypasses multiwan_nft
+			multiwan_nft_set_connected_ipv4
+			[ "$NO_IPV6" -eq 0 ] && multiwan_nft_set_connected_ipv6
+			if [ "$status" = "online" ]; then
+				multiwan_nft_set_policies_nft || LOG warn "ifup event on $INTERFACE could not fully rebuild policies"
+			fi
+		fi
+		multiwan_nft_signal_tracker "$INTERFACE" USR2
+		;;
+	disconnected)
+		LOG debug "Processing disconnected: updating policies and flushing conntrack"
+		multiwan_nft_set_iface_hotplug_state $INTERFACE "offline"
+		multiwan_nft_delete_iface_set_entries $INTERFACE
+		# Remove only the main-table default for this device. The per-interface
+		# table default is restored after all disconnected cleanup below.
+		multiwan_nft_delete_iface_main_route $INTERFACE $DEVICE
+		multiwan_nft_set_policies_nft
+		multiwan_nft_flush_conntrack_iface $INTERFACE
+		;;
+	ifdown)
+		LOG debug "Processing ifdown: cleaning up all rules and routes"
+		multiwan_nft_set_iface_hotplug_state $INTERFACE "offline"
+		multiwan_nft_delete_iface_set_entries $INTERFACE
+		multiwan_nft_delete_iface_rules $INTERFACE
+		multiwan_nft_delete_iface_route $INTERFACE
+		multiwan_nft_delete_iface_nft $INTERFACE
+		multiwan_nft_signal_tracker "$INTERFACE" USR1
+		multiwan_nft_set_policies_nft
+	;;
+esac
+
+multiwan_nft_flush_conntrack "$INTERFACE" "$ACTION"
+
+[ "$ACTION" = "disconnected" ] && multiwan_nft_restore_iface_table_default_route $INTERFACE $DEVICE
+
+LOG debug "multiwan_nft hotplug completed: ACTION=$ACTION INTERFACE=$INTERFACE"
+
+exit 0

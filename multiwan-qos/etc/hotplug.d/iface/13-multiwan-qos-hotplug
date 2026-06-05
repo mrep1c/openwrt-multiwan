@@ -1,0 +1,4 @@
+#!/bin/sh
+# MultiWAN QoS hotplug handler — sources shared logic from a single file
+# to avoid drift between the packaged and init.d-generated copies.
+. /lib/multiwan-qos/hotplug-common.sh

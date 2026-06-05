@@ -1,0 +1,14 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8"
+
+#: htdocs/luci-static/resources/view/multiwan-qos/settings.js:25
+msgid "MultiWAN QoS Settings"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/multiwan-qos/settings.js:26
+msgid "Configure MultiWAN QoS settings."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/multiwan-qos/hfsc.js:15
+msgid "HFSC Settings"
+msgstr ""

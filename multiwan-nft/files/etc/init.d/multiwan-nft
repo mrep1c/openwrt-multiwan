@@ -1,0 +1,425 @@
+#!/bin/sh /etc/rc.common
+
+. "${IPKG_INSTROOT}/lib/functions/network.sh"
+. "${IPKG_INSTROOT}/lib/multiwan-nft/multiwan_nft.sh"
+
+START=21
+USE_PROCD=1
+SCRIPTNAME="multiwan_nft-init"
+EXTRA_COMMANDS="check_deps install_deps"
+EXTRA_HELP="	check_deps	Check required runtime packages
+	install_deps	Install missing runtime packages with apk/opkg"
+
+MULTIWAN_NFT_REQUIRED_PACKAGES="ip-full nftables jshn rpcd conntrack"
+MULTIWAN_NFT_PACKAGE_LOCK="/tmp/multiwan_nft-package-install.lock"
+MULTIWAN_NFT_PACKAGE_LOCK_HELD=0
+
+multiwan_nft_detect_package_manager() {
+	if command -v apk >/dev/null 2>&1; then
+		echo "apk"
+	elif command -v opkg >/dev/null 2>&1; then
+		echo "opkg"
+	else
+		echo "unknown"
+	fi
+}
+
+multiwan_nft_check_package() {
+	local manager="$1"
+	local pkg="$2"
+
+	case "$manager" in
+		apk)
+			apk info -e "$pkg" >/dev/null 2>&1
+			;;
+		opkg)
+			opkg list-installed | grep -q "^$pkg "
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+multiwan_nft_acquire_package_lock() {
+	local oldpid wait_count
+
+	if mkdir "$MULTIWAN_NFT_PACKAGE_LOCK" 2>/dev/null; then
+		echo "$$" > "$MULTIWAN_NFT_PACKAGE_LOCK/pid"
+		MULTIWAN_NFT_PACKAGE_LOCK_HELD=1
+		return 0
+	fi
+
+	oldpid="$(cat "$MULTIWAN_NFT_PACKAGE_LOCK/pid" 2>/dev/null)"
+	if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+		LOG notice "Waiting for another package install to finish (pid $oldpid)"
+		wait_count=0
+		while [ "$wait_count" -lt 60 ]; do
+			sleep 1
+			if mkdir "$MULTIWAN_NFT_PACKAGE_LOCK" 2>/dev/null; then
+				echo "$$" > "$MULTIWAN_NFT_PACKAGE_LOCK/pid"
+				MULTIWAN_NFT_PACKAGE_LOCK_HELD=1
+				return 0
+			fi
+			wait_count=$((wait_count + 1))
+		done
+		LOG error "Timed out waiting for package install lock"
+		return 1
+	fi
+
+	rm -f "$MULTIWAN_NFT_PACKAGE_LOCK/pid" 2>/dev/null
+	rmdir "$MULTIWAN_NFT_PACKAGE_LOCK" 2>/dev/null
+	mkdir "$MULTIWAN_NFT_PACKAGE_LOCK" 2>/dev/null || {
+		LOG error "Could not acquire package install lock"
+		return 1
+	}
+	echo "$$" > "$MULTIWAN_NFT_PACKAGE_LOCK/pid"
+	MULTIWAN_NFT_PACKAGE_LOCK_HELD=1
+	return 0
+}
+
+multiwan_nft_release_package_lock() {
+	[ "$MULTIWAN_NFT_PACKAGE_LOCK_HELD" = "1" ] || return 0
+	rm -f "$MULTIWAN_NFT_PACKAGE_LOCK/pid" 2>/dev/null
+	rmdir "$MULTIWAN_NFT_PACKAGE_LOCK" 2>/dev/null
+	MULTIWAN_NFT_PACKAGE_LOCK_HELD=0
+}
+
+multiwan_nft_check_required_packages() {
+	local manager missing_packages pkg
+
+	manager="$(multiwan_nft_detect_package_manager)"
+	case "$manager" in
+		apk|opkg) ;;
+		*)
+			LOG error "No supported package manager found; cannot verify multiwan_nft dependencies"
+			return 1
+			;;
+	esac
+
+	for pkg in $MULTIWAN_NFT_REQUIRED_PACKAGES; do
+		multiwan_nft_check_package "$manager" "$pkg" || missing_packages="$missing_packages $pkg"
+	done
+
+	[ -z "$missing_packages" ] && return 0
+
+	LOG error "Missing required multiwan_nft packages:$missing_packages"
+	LOG error "Install multiwan_nft through the OpenWrt feed, or run '/etc/init.d/multiwan-nft install_deps' to attempt repair"
+	return 1
+}
+
+multiwan_nft_install_missing_packages() {
+	local manager missing_packages pkg
+
+	manager="$(multiwan_nft_detect_package_manager)"
+	case "$manager" in
+		apk|opkg) ;;
+		*)
+			LOG error "No supported package manager found; cannot install multiwan_nft dependencies"
+			return 1
+			;;
+	esac
+
+	for pkg in $MULTIWAN_NFT_REQUIRED_PACKAGES; do
+		multiwan_nft_check_package "$manager" "$pkg" || missing_packages="$missing_packages $pkg"
+	done
+
+	[ -z "$missing_packages" ] && return 0
+
+	multiwan_nft_acquire_package_lock || return 1
+
+	missing_packages=""
+	for pkg in $MULTIWAN_NFT_REQUIRED_PACKAGES; do
+		multiwan_nft_check_package "$manager" "$pkg" || missing_packages="$missing_packages $pkg"
+	done
+
+	if [ -n "$missing_packages" ]; then
+		LOG notice "Installing missing multiwan_nft packages:$missing_packages"
+		case "$manager" in
+			apk)
+				apk update || {
+					LOG error "apk update failed while installing multiwan_nft dependencies"
+					multiwan_nft_release_package_lock
+					return 1
+				}
+				apk add $missing_packages || {
+					LOG error "apk add failed while installing multiwan_nft dependencies:$missing_packages"
+					multiwan_nft_release_package_lock
+					return 1
+				}
+				;;
+			opkg)
+				opkg update || {
+					LOG error "opkg update failed while installing multiwan_nft dependencies"
+					multiwan_nft_release_package_lock
+					return 1
+				}
+				opkg install $missing_packages || {
+					LOG error "opkg install failed while installing multiwan_nft dependencies:$missing_packages"
+					multiwan_nft_release_package_lock
+					return 1
+				}
+				;;
+		esac
+	fi
+
+	multiwan_nft_release_package_lock
+
+	for pkg in $MULTIWAN_NFT_REQUIRED_PACKAGES; do
+		multiwan_nft_check_package "$manager" "$pkg" || {
+			LOG error "Required multiwan_nft package is still missing after install: $pkg"
+			return 1
+		}
+	done
+
+	return 0
+}
+
+check_deps() {
+	multiwan_nft_check_required_packages
+}
+
+install_deps() {
+	multiwan_nft_install_missing_packages
+}
+
+multiwan_nft_is_package_script_context() {
+	local cmdline
+
+	[ -n "${APK_SCRIPT:-}" ] && return 0
+	[ -r "/proc/$PPID/cmdline" ] || return 1
+	cmdline="$(tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null)"
+	case "$cmdline" in
+		*/lib/apk/db/scripts/*|*/usr/lib/opkg/info/*|*post-install*|*post-upgrade*)
+			return 0
+			;;
+	esac
+	return 1
+}
+
+# Wait for basic network readiness (at least one interface + routes)
+# Does NOT wait for all interfaces - late PPPoE connections handled by hotplug
+# This allows multiwan_nft to start quickly and add interfaces as they come online
+wait_for_network() {
+	local timeout=5
+	local count=0
+	local device
+	
+	# Initialize multiwan_nft config loading for check_iface
+	config_load 'multiwan-nft'
+	
+	while [ "$count" -lt "$timeout" ]; do
+		# Check if at least one multiwan_nft interface has a device
+		local has_device=0
+		check_iface() {
+			network_get_device device "$1" 2>/dev/null
+			[ -n "$device" ] && has_device=1
+		}
+		config_foreach check_iface interface
+		
+		# Check if basic routes exist (LAN at minimum)
+		local has_routes=0
+		[ -n "$($IP4 route show 2>/dev/null | head -1)" ] && has_routes=1
+		
+		# If any device + routes available, we're ready
+		# Late interfaces (slow PPPoE) will be handled by hotplug
+		if [ "$has_device" = "1" ] && [ "$has_routes" = "1" ]; then
+			LOG notice "Network ready after ${count}s - late interfaces handled by hotplug"
+			return 0
+		fi
+		
+		sleep 1
+		count=$((count + 1))
+	done
+	
+	LOG warn "Network wait timeout after ${timeout}s, proceeding anyway"
+	return 0
+}
+
+service_running() {
+	[ -d "$MULTIWAN_NFT_STATUS_DIR" ]
+}
+
+multiwan_nft_helper_pids() {
+	local helper="$1" pid_dir pid cmdline
+
+	for pid_dir in /proc/[0-9]*; do
+		[ -r "$pid_dir/cmdline" ] || continue
+		pid="${pid_dir##*/}"
+		[ "$pid" = "$$" ] && continue
+		cmdline="$(tr '\0' ' ' < "$pid_dir/cmdline" 2>/dev/null)"
+		case "$cmdline" in
+			*"/usr/sbin/$helper "*|*"/usr/sbin/$helper")
+				printf '%s\n' "$pid"
+				;;
+		esac
+	done
+}
+
+multiwan_nft_stop_helper_processes() {
+	local helper pid
+
+	for helper in "$@"; do
+		for pid in $(multiwan_nft_helper_pids "$helper"); do
+			kill "$pid" 2>/dev/null || true
+		done
+	done
+
+	sleep 1
+
+	for helper in "$@"; do
+		for pid in $(multiwan_nft_helper_pids "$helper"); do
+			if kill -0 "$pid" 2>/dev/null; then
+				LOG warn "Force killing stale $helper process $pid"
+				kill -KILL "$pid" 2>/dev/null || true
+			fi
+		done
+	done
+}
+
+start_tracker() {
+	local enabled interface
+	interface=$1
+	config_get_bool enabled $interface 'enabled' '0'
+	[ "$enabled" -eq 0 ] && return
+	[ -z "$(config_get $interface track_ip)" ] && return
+
+	procd_open_instance "track_${1}"
+	procd_set_param command /usr/sbin/multiwan-nft-track $interface
+	procd_set_param respawn
+	procd_close_instance
+}
+
+start_service() {
+	enabled=""
+	hotplug_pids=""
+
+	if multiwan_nft_is_package_script_context; then
+		LOG notice "Skipping service start during package installation"
+		return 0
+	fi
+	
+	# Wait for network interfaces and routes to be available
+	wait_for_network
+
+	multiwan_nft_check_required_packages || return 1
+
+	multiwan_nft_init || return 1
+	config_foreach start_tracker interface
+
+	multiwan_nft_update_iface_to_table
+	
+	# Load base nftables ruleset atomically
+	multiwan_nft_load_base_ruleset || {
+		LOG error "Failed to load base nftables ruleset"
+		return 1
+	}
+	
+	# Populate sets and create interface/policy rules
+	# Small delay ensures base ruleset is fully committed before populating sets
+	sleep 1
+	multiwan_nft_set_connected_ipv4
+	[ "$NO_IPV6" -eq 0 ] && multiwan_nft_set_connected_ipv6
+	multiwan_nft_set_general_rules
+	
+	# multiwan_nft_ifup serializes init-time setup because MULTIWAN_NFT_STARTUP=init
+	# bypasses the hotplug procd_lock.
+	config_foreach multiwan_nft_ifup interface "init"
+	# Kept for compatibility with older library code that backgrounded init hotplug.
+	[ -n "$hotplug_pids" ] && wait $hotplug_pids
+	
+	# Create routes for each interface (hotplug skips this during init)
+	config_foreach multiwan_nft_create_iface_route interface
+
+	# Ensure main-table default routes exist for all online interfaces.
+	# The hotplug ifup handler skips multiwan_nft_restore_iface_main_route during
+	# init (MULTIWAN_NFT_STARTUP=init guard), and tracking won't fire a 'connected'
+	# event for interfaces that start online (no offline->online transition).
+	# If a previous 'disconnected' event removed the main-table route,
+	# it would stay missing without this explicit restore.
+	multiwan_nft_restore_main_routes_init() {
+		local iface="$1" device status_file
+		network_get_device device "$iface" 2>/dev/null
+		[ -n "$device" ] || return 0
+		status_file="$MULTIWAN_NFT_TRACK_STATUS_DIR/$iface/STATUS"
+		# Only restore for interfaces that are (or will start as) online
+		local iface_status
+		iface_status=$(cat "$status_file" 2>/dev/null || echo "unknown")
+		if [ "$iface_status" = "online" ] || [ "$iface_status" = "unknown" ]; then
+			multiwan_nft_restore_iface_main_route "$iface" "$device"
+		fi
+	}
+	config_foreach multiwan_nft_restore_main_routes_init interface
+	
+	# Repopulate connected sets now that routes are available
+	multiwan_nft_set_connected_ipv4
+	[ "$NO_IPV6" -eq 0 ] && multiwan_nft_set_connected_ipv6
+	
+	# Add policy and user rules (these use direct nft add which is safe after base is loaded)
+	multiwan_nft_set_policies_nft
+	multiwan_nft_set_user_rules_nft
+
+	# rtmon manages its own `ip monitor route` child; procd owns and respawns
+	# the rtmon shell if that monitor loop exits.
+	procd_open_instance rtmon_ipv4
+	procd_set_param command /usr/sbin/multiwan-nft-rtmon ipv4
+	procd_set_param respawn
+	procd_close_instance
+
+	if [ "$NO_IPV6" -eq 0 ]; then
+		procd_open_instance rtmon_ipv6
+		procd_set_param command /usr/sbin/multiwan-nft-rtmon ipv6
+		procd_set_param respawn
+		procd_close_instance
+	fi
+}
+
+stop_service() {
+	local rule IP tid route_cleanup_allowed
+
+	multiwan_nft_init || return 1
+	
+	# Kill helper shells that procd may not know about. The process name is
+	# truncated to 15 chars, and cmdline starts with /bin/sh, so killall/pkill
+	# by argv[0] misses stale multiwan-nft-rtmon and track workers.
+	multiwan_nft_stop_helper_processes multiwan-nft-rtmon multiwan-nft-track
+	
+	config_foreach multiwan_nft_interface_shutdown interface
+
+	# Flush routing tables and rules for both families
+	route_cleanup_allowed=1
+	case "$MULTIWAN_NFT_INTERFACE_MAX" in
+		""|*[!0-9]*)
+			LOG warn "Skipping route table cleanup: invalid MULTIWAN_NFT_INTERFACE_MAX='$MULTIWAN_NFT_INTERFACE_MAX'"
+			route_cleanup_allowed=0
+			;;
+	esac
+	if [ "$route_cleanup_allowed" -eq 1 ]; then
+		for IP in "$IP4" "$IP6"; do
+			[ "$IP" = "$IP6" ] && [ "$NO_IPV6" -ne 0 ] && continue
+
+			for tid in $($IP route list table all | sed -ne 's/.*table \([0-9]\+\).*/\1/p' | sort -u); do
+				[ "$tid" -gt "$MULTIWAN_NFT_INTERFACE_MAX" ] 2>/dev/null && continue
+				$IP route flush table $tid &> /dev/null
+			done
+
+			for rule in $($IP rule list | grep -E '^[1-3][0-9]{3}\:' | cut -d ':' -f 1); do
+				$IP rule del pref $rule &> /dev/null
+			done
+		done
+	fi
+
+	# Delete the entire nftables table (removes all chains and sets)
+	$NFT delete table $NFT_FAMILY $NFT_TABLE 2>/dev/null
+
+	rm -rf $MULTIWAN_NFT_STATUS_DIR $MULTIWAN_NFT_TRACK_STATUS_DIR
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger 'multiwan-nft'
+}

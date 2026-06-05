@@ -1,0 +1,28 @@
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+*.pyc
+__pycache__/
+
+# OpenWrt build outputs
+bin/
+build_dir/
+dl/
+feeds/
+key-build*
+logs/
+package-lock.json
+staging_dir/
+tmp/
+
+# Binary packages and target-specific artifacts
+*.apk
+*.ipk
+*.so
+*.so.*
+*.adb
+Packages
+Packages.gz
+Packages.manifest
