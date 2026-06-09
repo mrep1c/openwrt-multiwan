@@ -1,35 +1,33 @@
 name: Build OpenWrt OPKG feed
+run-name: OpenWrt opkg-24.10-noarch + opkg-23.05-noarch
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
-    inputs:
-      openwrt_release:
-        description: OpenWrt release version
-        required: true
-        default: "24.10.6"
-      target:
-        description: OpenWrt target
-        required: true
-        default: rockchip
-      subtarget:
-        description: OpenWrt subtarget
-        required: true
-        default: armv8
-      sdk_url:
-        description: OpenWrt SDK tarball URL
-        required: true
-        default: https://downloads.openwrt.org/releases/24.10.6/targets/rockchip/armv8/openwrt-sdk-24.10.6-rockchip-armv8_gcc-13.3.0_musl.Linux-x86_64.tar.zst
-      release_tag:
-        description: GitHub release tag for OPKG feed assets
-        required: true
-        default: opkg-24.10-noarch
 
 permissions:
   contents: write
 
 jobs:
   build:
+    name: OpenWrt ${{ matrix.release_tag }}
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - openwrt_release: "24.10.6"
+            target: rockchip
+            subtarget: armv8
+            sdk_url: https://downloads.openwrt.org/releases/24.10.6/targets/rockchip/armv8/openwrt-sdk-24.10.6-rockchip-armv8_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+            release_tag: opkg-24.10-noarch
+          - openwrt_release: "23.05.6"
+            target: rockchip
+            subtarget: armv8
+            sdk_url: https://downloads.openwrt.org/releases/23.05.6/targets/rockchip/armv8/openwrt-sdk-23.05.6-rockchip-armv8_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+            release_tag: opkg-23.05-noarch
 
     steps:
       - name: Checkout package feed
@@ -61,8 +59,8 @@ jobs:
       - name: Download OpenWrt SDK
         run: |
           mkdir -p "$RUNNER_TEMP/openwrt-sdk"
-          wget -O "$RUNNER_TEMP/openwrt-sdk.tar" "${{ inputs.sdk_url }}"
-          case "${{ inputs.sdk_url }}" in
+          wget -O "$RUNNER_TEMP/openwrt-sdk.tar" "${{ matrix.sdk_url }}"
+          case "${{ matrix.sdk_url }}" in
             *.tar.zst) tar -I zstd -xf "$RUNNER_TEMP/openwrt-sdk.tar" -C "$RUNNER_TEMP/openwrt-sdk" --strip-components=1 ;;
             *.tar.xz) tar -Jxf "$RUNNER_TEMP/openwrt-sdk.tar" -C "$RUNNER_TEMP/openwrt-sdk" --strip-components=1 ;;
             *.tar.gz|*.tgz) tar -zxf "$RUNNER_TEMP/openwrt-sdk.tar" -C "$RUNNER_TEMP/openwrt-sdk" --strip-components=1 ;;
@@ -184,14 +182,14 @@ jobs:
           test -s "$GITHUB_WORKSPACE/dist/mrep1c-openwrt-multiwan-opkg.pub"
 
           {
-            echo "OpenWrt ${{ inputs.openwrt_release }} architecture-independent OPKG feed"
+            echo "OpenWrt ${{ matrix.openwrt_release }} architecture-independent OPKG feed"
             echo
             echo "Install the feed public key first:"
-            echo "uclient-fetch -O /tmp/mrep1c-openwrt-multiwan-opkg.pub https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ inputs.release_tag }}/mrep1c-openwrt-multiwan-opkg.pub"
+            echo "uclient-fetch -O /tmp/mrep1c-openwrt-multiwan-opkg.pub https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ matrix.release_tag }}/mrep1c-openwrt-multiwan-opkg.pub"
             echo "opkg-key add /tmp/mrep1c-openwrt-multiwan-opkg.pub"
             echo
             echo "Router OPKG feed URL:"
-            echo "src/gz multiwan https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ inputs.release_tag }}"
+            echo "src/gz multiwan https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ matrix.release_tag }}"
             echo
             echo "Packages:"
             find "$GITHUB_WORKSPACE/dist" -maxdepth 1 -type f -name "*.ipk" -printf "- %f\n" | sort
@@ -200,13 +198,13 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-opkg-feed-${{ inputs.openwrt_release }}-${{ inputs.target }}-${{ inputs.subtarget }}
+          name: openwrt-opkg-feed-${{ matrix.openwrt_release }}-${{ matrix.target }}-${{ matrix.subtarget }}
           path: dist/*
 
       - name: Publish GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.release_tag }}
+          TAG: ${{ matrix.release_tag }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release view "$TAG" --json assets --jq '.assets[].name' |
@@ -218,7 +216,7 @@ jobs:
             [ -f dist/Packages.manifest ] && gh release upload "$TAG" dist/Packages.manifest --clobber || true
           else
             gh release create "$TAG" \
-              --title "OpenWrt ${{ inputs.openwrt_release }} architecture-independent OPKG feed" \
+              --title "OpenWrt ${{ matrix.openwrt_release }} architecture-independent OPKG feed" \
               --notes-file dist/RELEASE_NOTES.txt
             gh release upload "$TAG" dist/*.ipk dist/Packages dist/Packages.gz dist/Packages.sig dist/mrep1c-openwrt-multiwan-opkg.pub --clobber
             [ -f dist/Packages.manifest ] && gh release upload "$TAG" dist/Packages.manifest --clobber || true

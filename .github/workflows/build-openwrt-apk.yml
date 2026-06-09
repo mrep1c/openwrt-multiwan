@@ -1,31 +1,21 @@
 name: Build OpenWrt APK feed
+run-name: OpenWrt apk-25.12-noarch
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
-    inputs:
-      openwrt_release:
-        description: OpenWrt release version
-        required: true
-        default: "25.12.4"
-      target:
-        description: OpenWrt target
-        required: true
-        default: rockchip
-      subtarget:
-        description: OpenWrt subtarget
-        required: true
-        default: armv8
-      sdk_url:
-        description: OpenWrt SDK tarball URL
-        required: true
-        default: https://downloads.openwrt.org/releases/25.12.4/targets/rockchip/armv8/openwrt-sdk-25.12.4-rockchip-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst
-      release_tag:
-        description: GitHub release tag for APK feed assets
-        required: true
-        default: apk-25.12-noarch
 
 permissions:
   contents: write
+
+env:
+  OPENWRT_RELEASE: "25.12.4"
+  TARGET: rockchip
+  SUBTARGET: armv8
+  SDK_URL: https://downloads.openwrt.org/releases/25.12.4/targets/rockchip/armv8/openwrt-sdk-25.12.4-rockchip-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+  RELEASE_TAG: apk-25.12-noarch
 
 jobs:
   build:
@@ -60,7 +50,7 @@ jobs:
       - name: Download OpenWrt SDK
         run: |
           mkdir -p "$RUNNER_TEMP/openwrt-sdk"
-          wget -O "$RUNNER_TEMP/openwrt-sdk.tar.zst" "${{ inputs.sdk_url }}"
+          wget -O "$RUNNER_TEMP/openwrt-sdk.tar.zst" "$SDK_URL"
           tar -I zstd -xf "$RUNNER_TEMP/openwrt-sdk.tar.zst" \
             -C "$RUNNER_TEMP/openwrt-sdk" \
             --strip-components=1
@@ -144,13 +134,13 @@ jobs:
           test -s "$GITHUB_WORKSPACE/dist/mrep1c-openwrt-multiwan-apk.pem"
 
           {
-            echo "OpenWrt ${{ inputs.openwrt_release }} architecture-independent APK feed"
+            echo "OpenWrt $OPENWRT_RELEASE architecture-independent APK feed"
             echo
             echo "Install the feed public key first:"
-            echo "uclient-fetch -O /etc/apk/keys/mrep1c-openwrt-multiwan-apk.pem https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ inputs.release_tag }}/mrep1c-openwrt-multiwan-apk.pem"
+            echo "uclient-fetch -O /etc/apk/keys/mrep1c-openwrt-multiwan-apk.pem https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/mrep1c-openwrt-multiwan-apk.pem"
             echo
             echo "Router APK feed URL:"
-            echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ inputs.release_tag }}/packages.adb"
+            echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/packages.adb"
             echo
             echo "Packages:"
             find "$GITHUB_WORKSPACE/dist" -maxdepth 1 -type f -name "*.apk" -printf "- %f\n" | sort
@@ -159,13 +149,13 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-apk-feed-${{ inputs.openwrt_release }}-${{ inputs.target }}-${{ inputs.subtarget }}
+          name: openwrt-apk-feed-${{ env.OPENWRT_RELEASE }}-${{ env.TARGET }}-${{ env.SUBTARGET }}
           path: dist/*
 
       - name: Publish GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.release_tag }}
+          TAG: ${{ env.RELEASE_TAG }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release view "$TAG" --json assets --jq '.assets[].name' |
@@ -177,7 +167,7 @@ jobs:
             gh release upload "$TAG" dist/packages.adb --clobber
           else
             gh release create "$TAG" \
-              --title "OpenWrt ${{ inputs.openwrt_release }} architecture-independent APK feed" \
+              --title "OpenWrt $OPENWRT_RELEASE architecture-independent APK feed" \
               --notes-file dist/RELEASE_NOTES.txt
             gh release upload "$TAG" dist/*.apk dist/mrep1c-openwrt-multiwan-apk.pem --clobber
             gh release upload "$TAG" dist/packages.adb --clobber
