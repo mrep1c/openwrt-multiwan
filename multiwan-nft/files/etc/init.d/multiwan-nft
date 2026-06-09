@@ -256,6 +256,22 @@ multiwan_nft_helper_pids() {
 	done
 }
 
+multiwan_nft_exact_cmdline_pids() {
+	local needle="$1" pid_dir pid cmdline
+
+	for pid_dir in /proc/[0-9]*; do
+		[ -r "$pid_dir/cmdline" ] || continue
+		pid="${pid_dir##*/}"
+		[ "$pid" = "$$" ] && continue
+		cmdline="$(tr '\0' ' ' < "$pid_dir/cmdline" 2>/dev/null)"
+		case "$cmdline" in
+			"$needle"|"$needle ")
+				printf '%s\n' "$pid"
+				;;
+		esac
+	done
+}
+
 multiwan_nft_stop_helper_processes() {
 	local helper pid
 
@@ -271,6 +287,27 @@ multiwan_nft_stop_helper_processes() {
 		for pid in $(multiwan_nft_helper_pids "$helper"); do
 			if kill -0 "$pid" 2>/dev/null; then
 				LOG warn "Force killing stale $helper process $pid"
+				kill -KILL "$pid" 2>/dev/null || true
+			fi
+		done
+	done
+}
+
+multiwan_nft_stop_route_monitor_processes() {
+	local cmd pid
+
+	for cmd in "ip -4 monitor route" "ip -6 monitor route"; do
+		for pid in $(multiwan_nft_exact_cmdline_pids "$cmd"); do
+			kill "$pid" 2>/dev/null || true
+		done
+	done
+
+	sleep 1
+
+	for cmd in "ip -4 monitor route" "ip -6 monitor route"; do
+		for pid in $(multiwan_nft_exact_cmdline_pids "$cmd"); do
+			if kill -0 "$pid" 2>/dev/null; then
+				LOG warn "Force killing stale route monitor process $pid ($cmd)"
 				kill -KILL "$pid" 2>/dev/null || true
 			fi
 		done
@@ -389,6 +426,7 @@ stop_service() {
 	# truncated to 15 chars, and cmdline starts with /bin/sh, so killall/pkill
 	# by argv[0] misses stale multiwan-nft-rtmon and track workers.
 	multiwan_nft_stop_helper_processes multiwan-nft-rtmon multiwan-nft-track
+	multiwan_nft_stop_route_monitor_processes
 	
 	config_foreach multiwan_nft_interface_shutdown interface
 

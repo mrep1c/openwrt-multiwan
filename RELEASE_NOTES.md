@@ -1,5 +1,13 @@
 # Release Notes
 
+## v1.0.2
+
+NFT-only hotfix on top of v1.0.1.
+
+- Cleans up orphaned `ip -4 monitor route` and `ip -6 monitor route`
+  processes during MultiWAN NFT stop/restart.
+- Keeps QoS packages at v1.0.1-r1.
+
 ## v1.0.1
 
 Safe quality-of-life backport on top of v1.0.0.
