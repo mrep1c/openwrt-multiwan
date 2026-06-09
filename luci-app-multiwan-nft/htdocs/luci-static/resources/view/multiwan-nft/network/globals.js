@@ -12,9 +12,10 @@ return view.extend({
 		s = m.section(form.NamedSection, 'globals', 'globals');
 
 		o = s.option(form.Value, 'mmx_mask', _('Firewall mask'),
-			_('Enter value in hex, starting with <code>0x</code>'));
+			_('Hex routing mark mask. Use at least three bits and avoid the lower byte, which is reserved for MultiWAN QoS.'));
 		o.datatype = 'hex(6)';
 		o.default = '0x3F0000';
+		o.placeholder = '0x3F0000';
 
 		o = s.option(form.Flag, 'logging', _('Logging'),
 			_('Enables global firewall logging'));

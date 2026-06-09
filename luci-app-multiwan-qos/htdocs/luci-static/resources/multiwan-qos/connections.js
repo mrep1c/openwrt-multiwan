@@ -12,26 +12,83 @@ var callMultiWANQoSConntrackDSCP = rpc.declare({
     expect: {}
 });
 
-// Extract multiwan_nft interface ID from ct mark.
-// Current multiwan_nft uses mmx_mask=0x003F0000 (bits 16-21). Older builds used
-// 0x00003F00 (bits 8-13), so keep that as a fallback for compatibility.
+var DEFAULT_MMX_MASK = 0x003F0000;
+var LEGACY_MMX_MASK = 0x00003F00;
+
+var countMaskBits = function (mask) {
+    var bits = 0;
+    mask = Number(mask) >>> 0;
+    while (mask) {
+        bits += mask & 1;
+        mask >>>= 1;
+    }
+    return bits;
+};
+
+var parseMmxMask = function () {
+    var value = uci.get('multiwan-nft', 'globals', 'mmx_mask');
+    if (typeof value !== 'string' || !/^0x[0-9a-fA-F]{1,8}$/.test(value))
+        return DEFAULT_MMX_MASK;
+
+    var mask = parseInt(value.substring(2), 16) >>> 0;
+    if ((mask & 0x000000ff) !== 0 || countMaskBits(mask) < 3)
+        return DEFAULT_MMX_MASK;
+
+    return mask;
+};
+
+var markToInterfaceId = function (mark, mask) {
+    var id = 0, bitVal = 0;
+
+    mark = Number(mark) >>> 0;
+    mask = Number(mask) >>> 0;
+
+    for (var bit = 0; bit < 32; bit++) {
+        if (((mask >>> bit) & 1) === 1) {
+            if (((mark >>> bit) & 1) === 1)
+                id += Math.pow(2, bitVal);
+            bitVal++;
+        }
+    }
+
+    return id;
+};
+
+var buildInterfaceMap = function (mask) {
+    var ifaceMap = { 0: '-' };
+    var interfaces = uci.sections('multiwan-nft', 'interface') || [];
+    var maxId = Math.pow(2, countMaskBits(mask)) - 1;
+
+    for (var i = 0; i < interfaces.length; i++)
+        ifaceMap[i + 1] = interfaces[i]['.name'] || ('iface' + (i + 1));
+
+    if (interfaces.length === 0) {
+        ifaceMap[1] = 'wan';
+        ifaceMap[2] = 'wanb';
+        ifaceMap[3] = 'wan3';
+        ifaceMap[4] = 'wan4';
+    }
+
+    ifaceMap[maxId - 2] = 'Blackhole';
+    ifaceMap[maxId - 1] = 'Unreachable';
+    ifaceMap[maxId] = 'Default';
+
+    return ifaceMap;
+};
+
+// Extract multiwan_nft interface ID from ct mark using the configured mask.
 var getWanInterface = function (mark) {
     mark = Number(mark) >>> 0;
-    var ifaceId = (mark & 0x003F0000) >>> 16;
+    var mmxMask = parseMmxMask();
+    var activeMask = mmxMask;
+    var ifaceId = markToInterfaceId(mark, mmxMask);
 
-    if (ifaceId == 0)
-        ifaceId = (mark & 0x00003F00) >>> 8;
+    if (ifaceId == 0 && mmxMask !== LEGACY_MMX_MASK) {
+        ifaceId = markToInterfaceId(mark, LEGACY_MMX_MASK);
+        activeMask = LEGACY_MMX_MASK;
+    }
 
-    var ifaceMap = {
-        0: '-',
-        1: 'wan',
-        2: 'wanb',
-        3: 'wan3',
-        4: 'wan4',
-        61: 'Blackhole',
-        62: 'Unreachable',
-        63: 'Default'
-    };
+    var ifaceMap = buildInterfaceMap(ifaceId > 0 ? activeMask : DEFAULT_MMX_MASK);
     return ifaceMap[ifaceId] || ('iface' + ifaceId);
 };
 
@@ -90,7 +147,8 @@ return view.extend({
     load: function () {
         return Promise.all([
             L.resolveDefault(callMultiWANQoSConntrackDSCP(), { connections: {} }),
-            uci.load('multiwan-qos')
+            uci.load('multiwan-qos'),
+            L.resolveDefault(uci.load('multiwan-nft'), null)
         ]);
     },
 

@@ -7,12 +7,33 @@
 
 # Set to 1 to enable debug logging, 0 to disable
 DEBUG=0
+CACHE_TTL=5
+CACHE_DIR="/tmp"
 
 # Debug logging function
 debug_log() {
     if [ "$DEBUG" -eq 1 ]; then
         echo "$1" >> /tmp/multiwan_qos_debug.log
     fi
+}
+
+cache_read() {
+    local name="$1" file now mtime age
+    file="${CACHE_DIR}/multiwan_qos_${name}.json"
+    [ -s "$file" ] || return 1
+    now="$(date +%s 2>/dev/null)" || return 1
+    mtime="$(stat -c %Y "$file" 2>/dev/null)" || return 1
+    age=$((now - mtime))
+    [ "$age" -ge 0 ] 2>/dev/null || return 1
+    [ "$age" -le "$CACHE_TTL" ] || return 1
+    cat "$file"
+}
+
+cache_write() {
+    local name="$1" body="$2" file tmp
+    file="${CACHE_DIR}/multiwan_qos_${name}.json"
+    tmp="${file}.$$"
+    printf '%s\n' "$body" > "$tmp" 2>/dev/null && mv "$tmp" "$file" 2>/dev/null
 }
 
 # Function to safely get JSON from tc command
@@ -372,7 +393,11 @@ handle_call() {
     # Process based on method
     case "$method" in
         getStats)
-            get_stats
+            cache_read "stats" || {
+                result="$(get_stats)"
+                cache_write "stats" "$result"
+                printf '%s\n' "$result"
+            }
             ;;
         getHistoricalStats)
             get_historical_stats
@@ -381,7 +406,11 @@ handle_call() {
             get_rrd_data
             ;;
         getRuleCounters)
-            get_rule_counters
+            cache_read "rule_counters" || {
+                result="$(get_rule_counters)"
+                cache_write "rule_counters" "$result"
+                printf '%s\n' "$result"
+            }
             ;;
         *)
             echo '{"error": "Method not found"}'

@@ -20,7 +20,8 @@ MMX_UNREACHABLE=""
 MM_UNREACHABLE=""
 MAX_SLEEP=$(((1<<31)-1))
 
-# Check for IPv6 support
+# Check for kernel IPv6 support. Configured MultiWAN IPv6 use is checked
+# separately after UCI has been loaded.
 [ -f /proc/net/if_inet6 ]
 NO_IPV6=$?
 
@@ -45,30 +46,42 @@ multiwan_nft_nft_buf_add() {
 
 # Load the buffered rules atomically
 multiwan_nft_nft_buf_commit() {
-	local tmpfile
-	# FIX: Use mktemp instead of $$ to prevent symlink attacks (Bug #5)
-	tmpfile="$(mktemp /tmp/multiwan_nft-rules-XXXXXX.nft)" || {
+	local tmpfile errfile
+	tmpfile="$(mktemp /tmp/multiwan_nft-rules.XXXXXX)" || {
 		LOG error "Failed to create temp file for nftables rules"
 		return 1
 	}
-	echo "$MULTIWAN_NFT_NFT_BUF" > "$tmpfile"
-	if $NFT -f "$tmpfile" 2>/dev/null; then
-		rm -f "$tmpfile"
+	errfile="${tmpfile}.error"
+	printf '%s' "$MULTIWAN_NFT_NFT_BUF" > "$tmpfile"
+	if $NFT -f "$tmpfile" >"$errfile" 2>&1; then
+		rm -f "$tmpfile" "$errfile"
 		return 0
 	else
 		LOG error "Failed to load nftables rules from $tmpfile"
-		# Keep file for debugging
+		if [ -s "$errfile" ]; then
+			while IFS= read -r line; do
+				[ -n "$line" ] && LOG error "nft: $line"
+			done < "$errfile"
+		else
+			rm -f "$errfile"
+		fi
+		# Keep the transaction and any error output for troubleshooting.
 		return 1
 	fi
+}
+
+multiwan_nft_debug_enabled()
+{
+	case "${MULTIWAN_NFT_DEBUG:-0}" in
+		1|yes|true|on) return 0 ;;
+	esac
+	return 1
 }
 
 LOG()
 {
 	local facility=$1; shift
-	# in development, we want to show 'debug' level logs
-	# when this release is out of beta, the comment in the line below
-	# should be removed
-	[ "$facility" = "debug" ] && return
+	[ "$facility" = "debug" ] && ! multiwan_nft_debug_enabled && return
 	logger -t "${SCRIPTNAME}[$$]" -p $facility "$*"
 }
 
@@ -146,9 +159,34 @@ multiwan_nft_get_track_status()
 	echo "$tracking"
 }
 
+multiwan_nft_has_enabled_family()
+{
+	local wanted_family="$1"
+
+	case "$wanted_family" in
+		ipv4|ipv6) ;;
+		*) return 1 ;;
+	esac
+
+	MULTIWAN_NFT_ENABLED_FAMILY_FOUND=0
+	multiwan_nft_check_enabled_family()
+	{
+		local section="$1" enabled family
+
+		config_get_bool enabled "$section" enabled 0
+		[ "$enabled" -eq 1 ] || return
+		config_get family "$section" family ipv4
+		[ "$family" = "$wanted_family" ] &&
+			MULTIWAN_NFT_ENABLED_FAMILY_FOUND=1
+	}
+
+	config_foreach multiwan_nft_check_enabled_family interface
+	[ "$MULTIWAN_NFT_ENABLED_FAMILY_FOUND" -eq 1 ]
+}
+
 multiwan_nft_init()
 {
-	local bitcnt mmdefault source_routing
+	local bitcnt mmdefault source_routing mask_file mask_tmp cached_mask
 
 	config_load 'multiwan-nft'
 
@@ -156,17 +194,40 @@ multiwan_nft_init()
 	[ -d "$MULTIWAN_NFT_STATUS_NFT_LOG_DIR" ] || mkdir -p "$MULTIWAN_NFT_STATUS_NFT_LOG_DIR"
 
 	# multiwan_nft's MARKing mask (at least 3 bits should be set)
-	if [ -e "${MULTIWAN_NFT_STATUS_DIR}/mmx_mask" ]; then
-		MMX_MASK=$(cat "${MULTIWAN_NFT_STATUS_DIR}/mmx_mask" 2>/dev/null)
-	else
-		config_get MMX_MASK globals mmx_mask '0x3F0000'
-		echo "$MMX_MASK"| tr 'A-F' 'a-f' > "${MULTIWAN_NFT_STATUS_DIR}/mmx_mask"
-		LOG debug "Using firewall mask ${MMX_MASK}"
-	fi
+	mask_file="${MULTIWAN_NFT_STATUS_DIR}/mmx_mask"
+	cached_mask=
+	[ -s "$mask_file" ] && cached_mask="$(cat "$mask_file" 2>/dev/null)"
+	case "$cached_mask" in
+		0x[0-9a-fA-FxX]*|0X[0-9a-fA-FxX]*) MMX_MASK="$cached_mask" ;;
+		"")
+			config_get MMX_MASK globals mmx_mask '0x3F0000'
+			;;
+		*)
+			LOG warn "Ignoring invalid cached firewall mask; reloading it from UCI"
+			config_get MMX_MASK globals mmx_mask '0x3F0000'
+			;;
+	esac
 
 	case "$MMX_MASK" in
 		""|*[!0-9a-fA-FxX]*) MMX_MASK='0x3F0000' ;;
 	esac
+
+	mask_tmp="$(mktemp "${MULTIWAN_NFT_STATUS_DIR}/mmx_mask.XXXXXX")" || {
+		LOG error "Failed to create temporary firewall mask state file"
+		return 1
+	}
+	if echo "$MMX_MASK" | tr 'A-F' 'a-f' > "$mask_tmp"; then
+		mv "$mask_tmp" "$mask_file" || {
+			rm -f "$mask_tmp"
+			LOG error "Failed to update firewall mask state file"
+			return 1
+		}
+	else
+		rm -f "$mask_tmp"
+		LOG error "Failed to write firewall mask state file"
+		return 1
+	fi
+	LOG debug "Using firewall mask ${MMX_MASK}"
 
 	bitcnt=$(multiwan_nft_count_one_bits "$MMX_MASK")
 	mmdefault=$(((1<<bitcnt)-1))

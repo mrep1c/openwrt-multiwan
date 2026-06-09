@@ -4,6 +4,7 @@
 'require ui';
 
 var isReadonlyView = !L.hasViewPermission() || null;
+var LARGE_USER_SCRIPT_BYTES = 64 * 1024;
 
 return view.extend({
 	load: function() {
@@ -12,9 +13,13 @@ return view.extend({
 
 	handleSave: function(ev) {
 		var value = (document.querySelector('textarea').value || '').trim().replace(/\r\n/g, '\n') + '\n';
+		var size = new Blob([ value ]).size;
 
 		return fs.write('/etc/multiwan-nft.user', value).then(function(rc) {
 			document.querySelector('textarea').value = value;
+			if (size > LARGE_USER_SCRIPT_BYTES)
+				ui.addNotification(null, E('p', _('Contents have been saved. File is %d bytes; very large notify scripts can make hotplug events slower.').format(size)), 'warning');
+			else
 				ui.addNotification(null, E('p', _('Contents have been saved.')), 'info');
 			}).catch(function(e) {
 				ui.addNotification(null, E('p', _('Unable to save contents: %s').format(e.message)));

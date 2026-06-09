@@ -27,6 +27,9 @@ The two services are designed to coexist. MultiWAN QoS uses the lower byte of
 conntrack marks for DSCP state, while MultiWAN NFT uses separate upper routing
 mark bits.
 
+If you customize `multiwan-nft.globals.mmx_mask`, keep the lower byte
+(`0x000000ff`) clear so QoS can preserve DSCP state in conntrack marks.
+
 ## Requirements
 
 - OpenWrt 25.12 or newer for the APK feed.

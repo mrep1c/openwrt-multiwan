@@ -8,7 +8,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=multiwan-nft
-PKG_VERSION:=1.0.0
+PKG_VERSION:=1.0.1
 PKG_RELEASE:=1
 PKG_MAINTAINER:=Florian Eckert <fe@dev.tdt.de>, \
 		Aaron Goodman <aaronjg@alumni.stanford.edu>

@@ -67,6 +67,7 @@ multiwan_nft_nft_delete_matching_rules()
 multiwan_nft_nft_dump()
 {
 	local name="$1"
+	multiwan_nft_debug_enabled || return 0
 	$NFT list table $NFT_FAMILY $NFT_TABLE > "${MULTIWAN_NFT_STATUS_NFT_LOG_DIR}/nft-${name}.dump" 2>&1
 }
 
@@ -1559,9 +1560,14 @@ multiwan_nft_flush_conntrack_iface()
 	mark_val=$(multiwan_nft_id2mask id MMX_MASK)
 
 	if command -v conntrack >/dev/null 2>&1; then
-		local count
-		count=$(conntrack -D -m "$mark_val/$MMX_MASK" 2>/dev/null | grep -c "flow" 2>/dev/null)
-		LOG notice "Flushed conntrack entries for interface $iface (mark=$mark_val/$MMX_MASK, entries=${count:-0})"
+		if multiwan_nft_debug_enabled; then
+			local count
+			count=$(conntrack -D -m "$mark_val/$MMX_MASK" 2>/dev/null | grep -c "flow" 2>/dev/null)
+			LOG notice "Flushed conntrack entries for interface $iface (mark=$mark_val/$MMX_MASK, entries=${count:-0})"
+		else
+			conntrack -D -m "$mark_val/$MMX_MASK" >/dev/null 2>&1
+			LOG notice "Flushed conntrack entries for interface $iface (mark=$mark_val/$MMX_MASK)"
+		fi
 	else
 		LOG notice "conntrack tool not found, skipping targeted flush for $iface (failover via route removal)"
 	fi

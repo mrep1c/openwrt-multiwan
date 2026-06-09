@@ -73,7 +73,15 @@ jobs:
         run: |
           cd "$RUNNER_TEMP/openwrt-sdk"
           echo "src-link multiwan $GITHUB_WORKSPACE" >> feeds.conf.default
-          ./scripts/feeds update -a
+          for attempt in 1 2 3; do
+            if ./scripts/feeds update -a; then
+              break
+            fi
+            echo "OpenWrt feed update failed (attempt $attempt of 3)" >&2
+            [ "$attempt" -lt 3 ] || exit 1
+            rm -rf feeds/luci feeds/luci.index
+            sleep $((attempt * 30))
+          done
           ./scripts/feeds install -p multiwan multiwan-nft
           ./scripts/feeds install -p multiwan luci-app-multiwan-nft
           ./scripts/feeds install -p multiwan multiwan-qos

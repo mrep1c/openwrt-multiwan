@@ -30,23 +30,23 @@ WRAP() {
 				# the source address can still let policy/default routing send
 				# the probe through another WAN, which makes a healthy backup
 				# interface look down when the preferred WAN is wedged.
-				$cmd -I "$DEVICE" "$@"
+				"$cmd" -I "$DEVICE" "$@"
 				;;
 			arping)
 				# arping already uses -I, just run as-is
-				$cmd "$@"
+				"$cmd" "$@"
 				;;
 			httping)
 				# httping supports -b for source address binding
-				$cmd -b "$SRC_IP" "$@"
+				"$cmd" -b "$SRC_IP" "$@"
 				;;
 			nping)
 				# nping supports -S for source IP and -e for device
-				$cmd -S "$SRC_IP" -e "$DEVICE" "$@"
+				"$cmd" -S "$SRC_IP" -e "$DEVICE" "$@"
 				;;
 			*)
 				# For other commands, just run without special binding
-				$cmd "$@"
+				"$cmd" "$@"
 				;;
 		esac
 	fi
@@ -255,18 +255,19 @@ firstconnect() {
 }
 
 update_status() {
-	local track_ip=$1
+	local track_ip="$1"
 
-	echo "$2" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/TRACK_${track_ip}
+	echo "$2" > "$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/TRACK_${track_ip}"
 	[ -z "$3" ] && return
-	echo "$3" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/LATENCY_${track_ip}
-	echo "$4" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/LOSS_${track_ip}
+	echo "$3" > "$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/LATENCY_${track_ip}"
+	echo "$4" > "$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/LOSS_${track_ip}"
 }
 
 log_tracking_failure_context() {
 	local target="$1" next_state="$2" current_score="$3" current_lost="$4"
 	local IP route_default route_src route_oif route_marked
 
+	multiwan_nft_debug_enabled || return 0
 	[ -n "$target" ] || return 0
 	[ "$FAMILY" = "ipv6" ] && IP="$IP6" || IP="$IP4"
 
@@ -291,9 +292,9 @@ main() {
 	STARTED=0
 	TRACK_OUTPUT=$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/TRACK_OUTPUT
 
-	multiwan_nft_init
+	multiwan_nft_init || return 1
 
-	mkdir -p $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE
+	mkdir -p "$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE"
 
 	trap clean_up TERM
 	trap if_down USR1

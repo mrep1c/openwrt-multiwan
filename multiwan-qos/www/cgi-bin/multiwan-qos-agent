@@ -130,28 +130,39 @@ local function constant_time_compare(a, b)
     return result == 0
 end
 
-local function get_api_key()
-    local f = io.popen("uci -q get multiwan-qos.agent.api_key 2>/dev/null")
-    if not f then return nil end
-    local key = f:read("*l")
+local uci_cache = {}
+
+local function get_uci_value(path)
+    if uci_cache[path] ~= nil then
+        return uci_cache[path] or nil
+    end
+
+    local f = io.popen("uci -q get " .. shell_quote(path) .. " 2>/dev/null")
+    if not f then
+        uci_cache[path] = false
+        return nil
+    end
+    local value = f:read("*l")
     f:close()
-    if key and key ~= "" then return key end
+    if value and value ~= "" then
+        uci_cache[path] = value
+        return value
+    end
+    uci_cache[path] = false
     return nil
 end
 
+local function get_api_key()
+    return get_uci_value("multiwan-qos.agent.api_key")
+end
+
 local function is_agent_enabled()
-    local f = io.popen("uci -q get multiwan-qos.agent.enabled 2>/dev/null")
-    if not f then return false end
-    local val = f:read("*l")
-    f:close()
+    local val = get_uci_value("multiwan-qos.agent.enabled")
     return val == "1"
 end
 
 local function get_timeout()
-    local f = io.popen("uci -q get multiwan-qos.agent.timeout 2>/dev/null")
-    if not f then return 300 end
-    local val = f:read("*l")
-    f:close()
+    local val = get_uci_value("multiwan-qos.agent.timeout")
     return tonumber(val) or 300
 end
 
@@ -305,6 +316,23 @@ local function conntrack_paths()
     return { "/proc/net/nf_conntrack", "/proc/net/ip_conntrack" }
 end
 
+local function read_conntrack_lines()
+    local lines = {}
+    for _, path in ipairs(conntrack_paths()) do
+        local f = io.open(path, "r")
+        if f then
+            for line in f:lines() do
+                lines[#lines + 1] = line
+            end
+            f:close()
+            if #lines > 0 then
+                break
+            end
+        end
+    end
+    return lines
+end
+
 local function maybe_conntrack_candidate(src, dst, sport, dport, pc_ip, remote_ip, score)
     sport = tonumber(sport)
     dport = tonumber(dport)
@@ -354,46 +382,37 @@ local function consider_conntrack_candidate(candidate, reported_remote_port, rep
     return best, best_score
 end
 
-local function find_router_conntrack_flow(pc_ip, remote_ip, reported_remote_port, reported_local_port)
+local function find_router_conntrack_flow(conntrack_lines, pc_ip, remote_ip, reported_remote_port, reported_local_port)
     local best = nil
     local best_score = -1
 
-    for _, path in ipairs(conntrack_paths()) do
-        local f = io.open(path, "r")
-        if f then
-            for line in f:lines() do
-                if line:match("%sudp%s") and line:find(pc_ip, 1, true) and line:find(remote_ip, 1, true) then
-                    local src1, dst1, sport1, dport1, packets1, bytes1,
-                        src2, dst2, sport2, dport2, packets2, bytes2 =
-                        line:match("src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+)%s+packets=(%d+)%s+bytes=(%d+).*src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+)%s+packets=(%d+)%s+bytes=(%d+)")
+    for _, line in ipairs(conntrack_lines or {}) do
+        if line:match("%sudp%s") and line:find(pc_ip, 1, true) and line:find(remote_ip, 1, true) then
+            local src1, dst1, sport1, dport1, packets1, bytes1,
+                src2, dst2, sport2, dport2, packets2, bytes2 =
+                line:match("src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+)%s+packets=(%d+)%s+bytes=(%d+).*src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+)%s+packets=(%d+)%s+bytes=(%d+)")
 
-                    local score = 0
-                    if not (src1 and src2) then
-                        src1, dst1, sport1, dport1,
-                            src2, dst2, sport2, dport2 =
-                            line:match("src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+).*src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+)")
-                    end
-
-                    if src1 and src2 then
-                        score = (tonumber(bytes1) or 0) + (tonumber(bytes2) or 0) +
-                            (tonumber(packets1) or 0) + (tonumber(packets2) or 0)
-                        best, best_score = consider_conntrack_candidate(
-                            maybe_conntrack_candidate(src1, dst1, sport1, dport1, pc_ip, remote_ip, score),
-                            reported_remote_port, reported_local_port, best, best_score)
-                        best, best_score = consider_conntrack_candidate(
-                            maybe_conntrack_candidate(src2, dst2, sport2, dport2, pc_ip, remote_ip, score),
-                            reported_remote_port, reported_local_port, best, best_score)
-                    end
-                end
+            local score = 0
+            if not (src1 and src2) then
+                src1, dst1, sport1, dport1,
+                    src2, dst2, sport2, dport2 =
+                    line:match("src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+).*src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+)")
             end
-            f:close()
-            if best then
-                return best
+
+            if src1 and src2 then
+                score = (tonumber(bytes1) or 0) + (tonumber(bytes2) or 0) +
+                    (tonumber(packets1) or 0) + (tonumber(packets2) or 0)
+                best, best_score = consider_conntrack_candidate(
+                    maybe_conntrack_candidate(src1, dst1, sport1, dport1, pc_ip, remote_ip, score),
+                    reported_remote_port, reported_local_port, best, best_score)
+                best, best_score = consider_conntrack_candidate(
+                    maybe_conntrack_candidate(src2, dst2, sport2, dport2, pc_ip, remote_ip, score),
+                    reported_remote_port, reported_local_port, best, best_score)
             end
         end
     end
 
-    return nil
+    return best
 end
 
 -- Validate the pc_ip is a private LAN address
@@ -755,6 +774,7 @@ local function apply_connection_rules(pc_ip, connections, dscp_class, dscp_value
     end
 
     buffer[#buffer + 1] = "flush chain " .. NFT_TABLE .. " " .. NFT_CHAIN
+    local conntrack_lines = read_conntrack_lines()
 
     for _, conn in ipairs(connections) do
         local game = conn.game or "unknown"
@@ -766,7 +786,7 @@ local function apply_connection_rules(pc_ip, connections, dscp_class, dscp_value
             local remote_port = tonumber(conn.remote_port)
             if validate_ip(conn.remote_ip) and validate_port(remote_port) then
                 local local_port = tonumber(conn.local_port)
-                local resolved = find_router_conntrack_flow(pc_ip, conn.remote_ip, remote_port, local_port)
+                local resolved = find_router_conntrack_flow(conntrack_lines, pc_ip, conn.remote_ip, remote_port, local_port)
                 if resolved then
                     remote_port = resolved.remote_port
                     local_port = resolved.local_port
@@ -1112,4 +1132,3 @@ local function main()
 end
 
 main()
-

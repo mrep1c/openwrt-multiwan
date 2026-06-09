@@ -1,5 +1,17 @@
 # Release Notes
 
+## v1.0.1
+
+Safe quality-of-life backport on top of v1.0.0.
+
+- Keeps OpenWrt 23.05 OPKG, 24.10 OPKG, and 25.12+ APK feed support.
+- Adds version-sync tooling for future package-visible releases.
+- Synchronizes QoS package, runtime, and LuCI-displayed versions.
+- Makes QoS LuCI health checks read-only and quiet.
+- Reduces repeated QoS LuCI/agent reads without changing generated QoS rules.
+- Adds defensive NFT temp-file, diagnostics, and helper-cleanup fixes.
+- Improves LuCI guidance for MultiWAN mark masks and status display.
+
 ## v1.0.0
 
 OpenWrt MultiWAN provides one signed package feed for MultiWAN NFT,
