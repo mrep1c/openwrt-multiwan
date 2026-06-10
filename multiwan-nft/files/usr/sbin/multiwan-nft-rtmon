@@ -1,22 +1,126 @@
 #!/bin/sh
 
-. /lib/functions.sh
-. /lib/functions/network.sh
-. /lib/multiwan-nft/multiwan_nft.sh
+MULTIWAN_NFT_LIB_ROOT="${MULTIWAN_NFT_LIB_ROOT:-/lib}"
+. "$MULTIWAN_NFT_LIB_ROOT/functions.sh"
+. "$MULTIWAN_NFT_LIB_ROOT/functions/network.sh"
+. "$MULTIWAN_NFT_LIB_ROOT/multiwan-nft/multiwan_nft.sh"
+. "$MULTIWAN_NFT_LIB_ROOT/multiwan-nft/process-lock.sh"
 
-trap_with_arg()
+RTMON_PID=""
+RTMON_START=""
+RTMON_SELF_START=""
+RTMON_WORK_DIR=""
+RTMON_OWNER_TOKEN=""
+RTMON_FIFO=""
+RTMON_ERROR_FILE=""
+RTMON_INIT_LOCK=""
+RTMON_CLEANED=0
+
+multiwan_nft_rtmon_child_stop()
 {
-	func="$1" ; shift
-	pid="$1" ; shift
-	for sig ; do
-		# shellcheck disable=SC2064
-		trap "$func $sig $pid" "$sig"
+	local count=0
+
+	if mw_process_identity_alive "$RTMON_PID" "$RTMON_START"; then
+		kill "$RTMON_PID" 2>/dev/null
+		while mw_process_identity_alive "$RTMON_PID" "$RTMON_START" && [ "$count" -lt 2 ]; do
+			sleep 1
+			count=$((count + 1))
+		done
+		if mw_process_identity_alive "$RTMON_PID" "$RTMON_START"; then
+			LOG warn "Force killing route monitor child $RTMON_PID"
+			kill -KILL "$RTMON_PID" 2>/dev/null
+		fi
+	fi
+	[ -n "$RTMON_PID" ] && wait "$RTMON_PID" 2>/dev/null
+	RTMON_PID=""
+	RTMON_START=""
+}
+
+multiwan_nft_rtmon_cleanup()
+{
+	[ "$RTMON_CLEANED" -eq 0 ] || return 0
+	RTMON_CLEANED=1
+	trap - EXIT HUP INT TERM
+	multiwan_nft_rtmon_child_stop
+	exec 3>&- 2>/dev/null
+	exec 3<&- 2>/dev/null
+	rm -f "$RTMON_INIT_LOCK"
+	if [ -n "$RTMON_WORK_DIR" ] &&
+		mw_lock_read_owner "$RTMON_WORK_DIR" &&
+		[ "$MW_LOCK_OWNER_PID" = "$$" ] &&
+		[ "$MW_LOCK_OWNER_START" = "$RTMON_SELF_START" ] &&
+		[ "$MW_LOCK_OWNER_TOKEN" = "$RTMON_OWNER_TOKEN" ]; then
+		rm -f "$RTMON_FIFO" "$RTMON_ERROR_FILE" \
+			"$RTMON_WORK_DIR/owner" "$RTMON_WORK_DIR"/.owner.* 2>/dev/null
+		rmdir "$RTMON_WORK_DIR" 2>/dev/null
+	fi
+}
+
+multiwan_nft_rtmon_signal()
+{
+	exit 0
+}
+
+multiwan_nft_rtmon_remove_orphans()
+{
+	local family_flag="$1" pid_dir pid ppid start cmdline count
+
+	for pid_dir in /proc/[0-9]*; do
+		[ -r "$pid_dir/cmdline" ] || continue
+		pid="${pid_dir##*/}"
+		ppid="$(sed -n 's/^PPid:[[:space:]]*//p' "$pid_dir/status" 2>/dev/null)"
+		[ "$ppid" = "1" ] || continue
+		start="$(mw_process_start_time "$pid" 2>/dev/null)"
+		cmdline="$(tr '\0' ' ' 2>/dev/null < "$pid_dir/cmdline")"
+		case "$cmdline" in
+			"ip -$family_flag monitor route"|"ip -$family_flag monitor route "|\
+			"/sbin/ip -$family_flag monitor route"|"/sbin/ip -$family_flag monitor route "|\
+			"/usr/sbin/ip -$family_flag monitor route"|"/usr/sbin/ip -$family_flag monitor route ")
+				mw_process_identity_alive "$pid" "$start" || continue
+				LOG warn "Stopping orphaned IPv$family_flag route monitor process $pid"
+				kill "$pid" 2>/dev/null
+				count=0
+				while mw_process_identity_alive "$pid" "$start" && [ "$count" -lt 2 ]; do
+					sleep 1
+					count=$((count + 1))
+				done
+				mw_process_identity_alive "$pid" "$start" && kill -KILL "$pid" 2>/dev/null
+				;;
+		esac
 	done
 }
 
-func_trap()
+multiwan_nft_rtmon_remove_stale_workdirs()
 {
-	kill -${1} ${2} 2>/dev/null
+	local family="$1" work_dir
+
+	for work_dir in /tmp/multiwan-nft-rtmon-"$family".*; do
+		[ -d "$work_dir" ] && [ ! -L "$work_dir" ] || continue
+		mw_lock_read_owner "$work_dir" || continue
+		mw_process_identity_alive "$MW_LOCK_OWNER_PID" "$MW_LOCK_OWNER_START" && continue
+
+		LOG warn "Removing stale $family route monitor workspace $work_dir"
+		rm -f "$work_dir/events" "$work_dir/error" \
+			"$work_dir/owner" "$work_dir"/.owner.* 2>/dev/null
+		rmdir "$work_dir" 2>/dev/null
+	done
+}
+
+multiwan_nft_rtmon_create_workdir()
+{
+	local family="$1"
+
+	RTMON_SELF_START="$(mw_process_start_time "$$")" || return 1
+	RTMON_WORK_DIR="$(mktemp -d "/tmp/multiwan-nft-rtmon-${family}.XXXXXX")" || return 1
+	RTMON_OWNER_TOKEN="rtmon:$$:$RTMON_SELF_START:${RTMON_WORK_DIR##*.}"
+	if ! mw_lock_write_owner "$RTMON_WORK_DIR" "$$" \
+		"$RTMON_SELF_START" "$RTMON_OWNER_TOKEN"; then
+		rmdir "$RTMON_WORK_DIR" 2>/dev/null
+		RTMON_WORK_DIR=""
+		return 1
+	fi
+	RTMON_FIFO="$RTMON_WORK_DIR/events"
+	RTMON_ERROR_FILE="$RTMON_WORK_DIR/error"
 }
 
 multiwan_nft_add_all_routes()
@@ -138,41 +242,90 @@ multiwan_nft_rtmon_route_handle()
 
 main()
 {
-	local IP family lockfile
+	local IP family family_flag line child_status error_line
 
 	multiwan_nft_init
 
 	family=$1
-	[ -z $family ] && family=ipv4
+	[ -z "$family" ] && family=ipv4
 	if [ "$family" = "ipv6" ]; then
 		if [ "$NO_IPV6" -ne 0 ]; then
 			LOG warn "multiwan-nft-rtmon started for ipv6, but ipv6 not enabled on system"
 			exit 1
 		fi
 		IP="$IP6"
+		family_flag=6
 	else
 		IP="$IP4"
+		family_flag=4
 	fi
-	
+
+	RTMON_INIT_LOCK="/tmp/multiwan-nft-rtmon_init_${family}"
+	trap multiwan_nft_rtmon_cleanup EXIT
+	trap multiwan_nft_rtmon_signal HUP INT TERM
+
+	multiwan_nft_rtmon_remove_orphans "$family_flag"
+	multiwan_nft_rtmon_remove_stale_workdirs "$family"
+
 	# Use a lock file to synchronize route population
-	lockfile="/tmp/multiwan-nft-rtmon_init_${family}"
-	touch "$lockfile"
-	
-	# Cleanup on exit
-	trap "rm -f '$lockfile'" EXIT
-	
+	touch "$RTMON_INIT_LOCK"
+
 	# Populate initial routes
 	# Note: multiwan_nft_set_connected_* called from init script to avoid race conditions
-	multiwan_nft_add_all_routes ${family}
-	
+	multiwan_nft_add_all_routes "$family"
+
 	# Remove lock file to signal we're ready
-	rm -f "$lockfile"
-	
-	# Monitor routes in a simple loop (no subshell, no signals)
-	$IP monitor route | while IFS='' read -r line; do
+	rm -f "$RTMON_INIT_LOCK"
+
+	umask 077
+	multiwan_nft_rtmon_create_workdir "$family" || {
+		LOG error "Unable to create private IPv$family_flag route monitor workspace"
+		return 1
+	}
+	mkfifo "$RTMON_FIFO" || {
+		LOG error "Unable to create route monitor FIFO $RTMON_FIFO"
+		return 1
+	}
+
+	# Keeping one read/write descriptor open prevents FIFO EOF spin. Integer
+	# timed reads let the parent notice a dead monitor without relying on
+	# fractional timeout behavior.
+	exec 3<> "$RTMON_FIFO" || {
+		LOG error "Unable to open route monitor FIFO $RTMON_FIFO"
+		return 1
+	}
+	$IP monitor route > "$RTMON_FIFO" 2> "$RTMON_ERROR_FILE" &
+	RTMON_PID=$!
+	RTMON_START="$(mw_process_start_time "$RTMON_PID")"
+	if [ -z "$RTMON_START" ]; then
+		sleep 1
+		RTMON_START="$(mw_process_start_time "$RTMON_PID")"
+	fi
+	[ -n "$RTMON_START" ] || {
+		LOG error "Unable to identify route monitor child $RTMON_PID"
+		return 1
+	}
+
+	while :; do
+		line=""
+		if ! IFS= read -r -t 5 line <&3; then
+			if mw_process_identity_alive "$RTMON_PID" "$RTMON_START"; then
+				continue
+			fi
+			wait "$RTMON_PID" 2>/dev/null
+			child_status=$?
+			LOG error "IPv$family_flag route monitor exited unexpectedly with status $child_status"
+			if [ -s "$RTMON_ERROR_FILE" ]; then
+				while IFS= read -r error_line; do
+					[ -n "$error_line" ] && LOG error "ip monitor: $error_line"
+				done < "$RTMON_ERROR_FILE"
+			fi
+			return 1
+		fi
+		[ -n "$line" ] || continue
 		[ -z "${line##*table*}" ] && continue
 		LOG debug "handling route update $family '$line'"
 		multiwan_nft_rtmon_route_handle "$line" "$family"
 	done
 }
-main "$@"
+[ "${MULTIWAN_NFT_RTMON_LIBRARY_ONLY:-0}" = "1" ] || main "$@"

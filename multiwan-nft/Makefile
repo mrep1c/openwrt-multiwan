@@ -8,7 +8,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=multiwan-nft
-PKG_VERSION:=1.0.2
+PKG_VERSION:=1.0.3
 PKG_RELEASE:=1
 PKG_MAINTAINER:=Florian Eckert <fe@dev.tdt.de>, \
 		Aaron Goodman <aaronjg@alumni.stanford.edu>
@@ -73,6 +73,8 @@ define Package/multiwan-nft/install
 	$(INSTALL_DATA) ./files/lib/multiwan-nft/common.sh \
 		$(1)/lib/multiwan-nft/
 	$(INSTALL_DATA) ./files/lib/multiwan-nft/multiwan_nft.sh \
+		$(1)/lib/multiwan-nft/
+	$(INSTALL_DATA) ./files/lib/multiwan-nft/process-lock.sh \
 		$(1)/lib/multiwan-nft/
 
 	$(INSTALL_DIR) $(1)/usr/libexec/rpcd

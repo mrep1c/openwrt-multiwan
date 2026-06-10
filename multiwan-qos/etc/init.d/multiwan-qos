@@ -6,8 +6,10 @@ STOP=99
 
 USE_PROCD=1
 
-VERSION="1.0.1"
+VERSION="1.0.3"
 UPD_CHANNEL="release"
+
+. "${IPKG_INSTROOT}/lib/multiwan-qos/process-lock.sh"
 
 EXTRA_COMMANDS="check_version update auto_setup auto_setup_noninteractive validate_custom_rules health_check refresh check_deps install_deps"
 EXTRA_HELP="
@@ -56,6 +58,7 @@ TMP_CFG_FILE=$TMP_CFG_DIR/multiwan-qos
 MULTIWAN_QOS_RESTARTING_FILE=/tmp/multiwan_qos_restarting
 MULTIWAN_QOS_PACKAGE_LOCK=/tmp/multiwan_qos-package-install.lock
 MULTIWAN_QOS_PACKAGE_LOCK_HELD=0
+MULTIWAN_QOS_PACKAGE_LOCK_TOKEN=
 MULTIWAN_QOS_DEFAULTS_FILE=${MULTIWAN_QOS_D}/multiwan-qos-defaults
 MULTIWAN_QOS_CUSTOM_RULES_FILE=${MULTIWAN_QOS_D}/custom_rules.nft
 MULTIWAN_QOS_INLINE_RULES_FILE=${MULTIWAN_QOS_D}/inline_dscptag.nft
@@ -83,6 +86,7 @@ MULTIWAN_QOS_GEN_FILES_BACKEND="
     $MULTIWAN_QOS_MAIN_SCRIPT
     $MULTIWAN_QOS_DEFAULTS_FILE
     $MULTIWAN_QOS_HOTPLUG_COMMON
+    /lib/multiwan-qos/process-lock.sh
     /usr/lib/tc/experimental.dist
     /usr/lib/tc/normal.dist
     /usr/lib/tc/normmix20-64.dist
@@ -149,7 +153,7 @@ is_package_script_context() {
 
     [ -n "${APK_SCRIPT:-}" ] && return 0
     [ -r "/proc/$PPID/cmdline" ] || return 1
-    cmdline="$(tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null)"
+    cmdline="$(tr '\0' ' ' 2>/dev/null < "/proc/$PPID/cmdline")"
     case "$cmdline" in
         */lib/apk/db/scripts/*|*/usr/lib/opkg/info/*|*post-install*|*post-upgrade*)
             return 0
@@ -233,7 +237,17 @@ clear_multiwan_qos_restarting() {
 }
 
 cleanup_agent_runtime_files() {
-    rm -rf /tmp/multiwan_qos_agent.lock
+    local lock_dir=/tmp/multiwan_qos_agent.lock wait_count=0
+
+    while mw_lock_owner_alive "$lock_dir" && [ "$wait_count" -lt 10 ]; do
+        sleep 1
+        wait_count=$((wait_count + 1))
+    done
+    if mw_lock_owner_alive "$lock_dir"; then
+        log_msg -warn "Agent request pid $MW_LOCK_OWNER_PID is still active; preserving its runtime files."
+        return 1
+    fi
+    mw_lock_reclaim_stale "$lock_dir" 2>/dev/null
     rm -f /tmp/multiwan_qos_agent_rules.nft /tmp/multiwan_qos_agent_last_seen /tmp/multiwan_qos_agent_rate_limit /tmp/multiwan_qos_agent_state.json
 }
 
@@ -1563,47 +1577,37 @@ check_package() {
 }
 
 acquire_package_lock() {
-    local oldpid wait_count
+    local wait_count
 
-    if mkdir "$MULTIWAN_QOS_PACKAGE_LOCK" 2>/dev/null; then
-        echo "$$" > "$MULTIWAN_QOS_PACKAGE_LOCK/pid"
+    if mw_lock_acquire "$MULTIWAN_QOS_PACKAGE_LOCK"; then
         MULTIWAN_QOS_PACKAGE_LOCK_HELD=1
+        MULTIWAN_QOS_PACKAGE_LOCK_TOKEN="$MW_LOCK_TOKEN"
         return 0
     fi
 
-    oldpid="$(cat "$MULTIWAN_QOS_PACKAGE_LOCK/pid" 2>/dev/null)"
-    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
-        log_msg "Waiting for another package install to finish (pid $oldpid)"
-        wait_count=0
-        while [ "$wait_count" -lt 60 ]; do
-            sleep 1
-            if mkdir "$MULTIWAN_QOS_PACKAGE_LOCK" 2>/dev/null; then
-                echo "$$" > "$MULTIWAN_QOS_PACKAGE_LOCK/pid"
-                MULTIWAN_QOS_PACKAGE_LOCK_HELD=1
-                return 0
-            fi
-            wait_count=$((wait_count + 1))
-        done
-        error_out "Timed out waiting for package install lock."
-        return 1
+    if mw_lock_owner_alive "$MULTIWAN_QOS_PACKAGE_LOCK"; then
+        log_msg "Waiting for another package install to finish (pid $MW_LOCK_OWNER_PID)"
     fi
 
-    rm -f "$MULTIWAN_QOS_PACKAGE_LOCK/pid" 2>/dev/null
-    rmdir "$MULTIWAN_QOS_PACKAGE_LOCK" 2>/dev/null
-    mkdir "$MULTIWAN_QOS_PACKAGE_LOCK" 2>/dev/null || {
-        error_out "Could not acquire package install lock."
-        return 1
-    }
-    echo "$$" > "$MULTIWAN_QOS_PACKAGE_LOCK/pid"
-    MULTIWAN_QOS_PACKAGE_LOCK_HELD=1
-    return 0
+    wait_count=0
+    while [ "$wait_count" -lt 60 ]; do
+        sleep 1
+        if mw_lock_acquire "$MULTIWAN_QOS_PACKAGE_LOCK"; then
+            MULTIWAN_QOS_PACKAGE_LOCK_HELD=1
+            MULTIWAN_QOS_PACKAGE_LOCK_TOKEN="$MW_LOCK_TOKEN"
+            return 0
+        fi
+        wait_count=$((wait_count + 1))
+    done
+    error_out "Timed out waiting for package install lock."
+    return 1
 }
 
 release_package_lock() {
     [ "$MULTIWAN_QOS_PACKAGE_LOCK_HELD" = "1" ] || return 0
-    rm -f "$MULTIWAN_QOS_PACKAGE_LOCK/pid" 2>/dev/null
-    rmdir "$MULTIWAN_QOS_PACKAGE_LOCK" 2>/dev/null
+    mw_lock_release_for "$MULTIWAN_QOS_PACKAGE_LOCK" "$MULTIWAN_QOS_PACKAGE_LOCK_TOKEN"
     MULTIWAN_QOS_PACKAGE_LOCK_HELD=0
+    MULTIWAN_QOS_PACKAGE_LOCK_TOKEN=
 }
 
 install_packages() {
@@ -1803,11 +1807,65 @@ start_service() {
     fi
 
     mark_multiwan_qos_restarting
-    cleanup_agent_runtime_files
+    if ! cleanup_agent_runtime_files; then
+        clear_multiwan_qos_restarting
+        return 1
+    fi
     start_service_impl
     rv=$?
     clear_multiwan_qos_restarting
     return $rv
+}
+
+stop_legacy_processes() {
+    local script_path="$1" pid_file="$2" pid_dir pid start cmdline
+
+    if [ -r "$pid_file" ]; then
+        pid="$(cat "$pid_file" 2>/dev/null)"
+        case "$pid" in
+            ""|*[!0-9]*) pid="" ;;
+        esac
+        if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ]; then
+            start="$(mw_process_start_time "$pid" 2>/dev/null)"
+            cmdline="$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline")"
+            case "$cmdline" in
+                *"$script_path"*)
+                    mw_process_identity_alive "$pid" "$start" && kill "$pid" 2>/dev/null
+                    ;;
+            esac
+        fi
+        rm -f "$pid_file"
+    fi
+
+    for pid_dir in /proc/[0-9]*; do
+        [ -r "$pid_dir/cmdline" ] || continue
+        pid="${pid_dir##*/}"
+        [ "$pid" = "$$" ] && continue
+        start="$(mw_process_start_time "$pid" 2>/dev/null)"
+        cmdline="$(tr '\0' ' ' 2>/dev/null < "$pid_dir/cmdline")"
+        case "$cmdline" in
+            *"$script_path"*)
+                mw_process_identity_alive "$pid" "$start" && kill "$pid" 2>/dev/null
+                ;;
+        esac
+    done
+
+    sleep 1
+    for pid_dir in /proc/[0-9]*; do
+        [ -r "$pid_dir/cmdline" ] || continue
+        pid="${pid_dir##*/}"
+        [ "$pid" = "$$" ] && continue
+        start="$(mw_process_start_time "$pid" 2>/dev/null)"
+        cmdline="$(tr '\0' ' ' 2>/dev/null < "$pid_dir/cmdline")"
+        case "$cmdline" in
+            *"$script_path"*)
+                if mw_process_identity_alive "$pid" "$start"; then
+                    log_msg -warn "Force killing stale legacy process $pid ($script_path)"
+                    kill -KILL "$pid" 2>/dev/null
+                fi
+                ;;
+        esac
+    done
 }
 
 stop_service_impl() {
@@ -1847,23 +1905,14 @@ stop_service_impl() {
     # Remove custom rules table
     nft destroy table inet multiwan_qos_custom 2>/dev/null
 
-    cleanup_agent_runtime_files
-
-    # Remove legacy CAKE watchdog from earlier custom builds.
-    if [ -f /var/run/multiwan_qos-cake-watchdog.pid ]; then
-        kill "$(cat /var/run/multiwan_qos-cake-watchdog.pid)" 2>/dev/null
-        rm -f /var/run/multiwan_qos-cake-watchdog.pid
-    fi
-    killall multiwan_qos-cake-watchdog.sh 2>/dev/null
+    # Remove watchdogs from earlier builds, but only after verifying the
+    # process command line. A reused PID must never receive the signal.
+    stop_legacy_processes /etc/multiwan_qos-cake-watchdog.sh /var/run/multiwan_qos-cake-watchdog.pid
     rm -f /etc/multiwan_qos-cake-watchdog.sh
     rm -rf /var/run/multiwan_qos-cake-watchdog.lock /var/run/multiwan_qos-cake-watchdog.state
 
-    # Kill agent watchdog
-    if [ -f /var/run/multiwan-qos-agent-watchdog.pid ]; then
-        kill "$(cat /var/run/multiwan-qos-agent-watchdog.pid)" 2>/dev/null
-        rm -f /var/run/multiwan-qos-agent-watchdog.pid
-    fi
-    killall multiwan-qos-agent-watchdog.lua 2>/dev/null
+    stop_legacy_processes /etc/multiwan-qos-agent-watchdog.lua /var/run/multiwan-qos-agent-watchdog.pid
+    rm -f /etc/multiwan-qos-agent-watchdog.lua
 
     ## Delete files
     rm -f "$MULTIWAN_QOS_HOTPLUG_SCRIPT"
@@ -1889,7 +1938,14 @@ stop_service_impl() {
 stop_service() {
     local rv
     mark_multiwan_qos_restarting
-    cleanup_agent_runtime_files
+    if ! cleanup_agent_runtime_files; then
+        if [ -n "$FROM_SHUTDOWN" ]; then
+            log_msg -warn "Continuing system shutdown while an agent request is still active."
+        else
+            clear_multiwan_qos_restarting
+            return 1
+        fi
+    fi
     stop_service_impl
     rv=$?
     clear_multiwan_qos_restarting
@@ -2163,7 +2219,10 @@ refresh() {
 restart() {
     local rv
     mark_multiwan_qos_restarting
-    cleanup_agent_runtime_files
+    if ! cleanup_agent_runtime_files; then
+        clear_multiwan_qos_restarting
+        return 1
+    fi
     DISABLE_ON_STOP=0 stop_service_impl
     rv=$?
     if [ "$rv" -eq 0 ]; then

@@ -27,4 +27,8 @@ if [ -d "$old_dir" ]; then
 	rm -rf "$old_dir"
 fi
 
+# The agent watchdog was never supervised or started by the service. Remove
+# leftovers from older package versions without introducing a new daemon.
+rm -f /etc/multiwan-qos-agent-watchdog.lua
+
 exit 0

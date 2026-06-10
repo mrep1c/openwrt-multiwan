@@ -1,18 +1,46 @@
 #!/bin/sh
 
-. /lib/functions.sh
-. /lib/functions/network.sh
-. /lib/multiwan-nft/common.sh
+MULTIWAN_NFT_LIB_ROOT="${MULTIWAN_NFT_LIB_ROOT:-/lib}"
+. "$MULTIWAN_NFT_LIB_ROOT/functions.sh"
+. "$MULTIWAN_NFT_LIB_ROOT/functions/network.sh"
+. "$MULTIWAN_NFT_LIB_ROOT/multiwan-nft/common.sh"
+. "$MULTIWAN_NFT_LIB_ROOT/multiwan-nft/process-lock.sh"
 
 INTERFACE=""
 DEVICE=""
 
 IFDOWN_EVENT=0
 IFUP_EVENT=0
+SLEEP_PID=""
+SLEEP_START=""
+TRACK_PID=""
+TRACK_START=""
+
+stop_child() {
+	local pid="$1" start="$2" label="$3" count=0
+
+	if mw_process_identity_alive "$pid" "$start"; then
+		kill "$pid" 2>/dev/null
+		while mw_process_identity_alive "$pid" "$start" && [ "$count" -lt 2 ]; do
+			sleep 1
+			count=$((count + 1))
+		done
+		if mw_process_identity_alive "$pid" "$start"; then
+			LOG warn "Force killing $label child $pid for interface $INTERFACE"
+			kill -KILL "$pid" 2>/dev/null
+		fi
+	fi
+	[ -n "$pid" ] && wait "$pid" 2>/dev/null || true
+	return 0
+}
 
 stop_subprocs() {
-	[ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" && unset SLEEP_PID
-	[ -n "$TRACK_PID" ] && kill "$TRACK_PID" && unset TRACK_PID
+	stop_child "$SLEEP_PID" "$SLEEP_START" "sleep"
+	stop_child "$TRACK_PID" "$TRACK_START" "tracking probe"
+	SLEEP_PID=""
+	SLEEP_START=""
+	TRACK_PID=""
+	TRACK_START=""
 }
 
 WRAP() {
@@ -296,7 +324,7 @@ main() {
 
 	mkdir -p "$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE"
 
-	trap clean_up TERM
+	trap clean_up HUP INT TERM
 	trap if_down USR1
 	trap if_up USR2
 
@@ -344,8 +372,14 @@ main() {
 
 	firstconnect
 	while true; do
-		[ "$STARTED" -eq 0 ] && { sleep $MAX_SLEEP & SLEEP_PID=$!; wait; }
-		unset SLEEP_PID
+		if [ "$STARTED" -eq 0 ]; then
+			sleep "$MAX_SLEEP" &
+			SLEEP_PID=$!
+			SLEEP_START="$(mw_process_start_time "$SLEEP_PID")"
+			wait "$SLEEP_PID"
+		fi
+		SLEEP_PID=""
+		SLEEP_START=""
 		sleep_time=$interval
 		last_failed_target=
 		for track_ip in $track_ips; do
@@ -355,13 +389,19 @@ main() {
 						if [ "$check_quality" -eq 0 ]; then
 							WRAP $PING -n -c $count -W $timeout -s $size -t $max_ttl -q $track_ip &> /dev/null &
 							TRACK_PID=$!
-							wait $TRACK_PID
+							TRACK_START="$(mw_process_start_time "$TRACK_PID")"
+							wait "$TRACK_PID"
 							result=$?
+							TRACK_PID=""
+							TRACK_START=""
 						else
 							WRAP $PING -n -c $count -W $timeout -s $size -t $max_ttl -q $track_ip 2>/dev/null > $TRACK_OUTPUT &
 							TRACK_PID=$!
-							wait $TRACK_PID
+							TRACK_START="$(mw_process_start_time "$TRACK_PID")"
+							wait "$TRACK_PID"
 							ping_status=$?
+							TRACK_PID=""
+							TRACK_START=""
 							loss="$(sed $TRACK_OUTPUT -ne 's/.*\([0-9]\+\)% packet loss.*/\1/p')"
 							if [ "$ping_status" -ne 0 ] || [ "$loss" -eq 100 ]; then
 								latency=999999
@@ -374,8 +414,11 @@ main() {
 					arping)
 						WRAP arping -I $DEVICE -c $count -w $timeout -q $track_ip &> /dev/null &
 						TRACK_PID=$!
-						wait $TRACK_PID
+						TRACK_START="$(mw_process_start_time "$TRACK_PID")"
+						wait "$TRACK_PID"
 						result=$?
+						TRACK_PID=""
+						TRACK_START=""
 					;;
 					httping)
 						if [ "$httping_ssl" -eq 1 ]; then
@@ -384,14 +427,20 @@ main() {
 							WRAP httping -c $count -t $timeout -q "http://$track_ip" &> /dev/null &
 						fi
 						TRACK_PID=$!
-						wait $TRACK_PID
+						TRACK_START="$(mw_process_start_time "$TRACK_PID")"
+						wait "$TRACK_PID"
 						result=$?
+						TRACK_PID=""
+						TRACK_START=""
 					;;
 					nping-*)
 						WRAP nping -${FAMILY#ipv} -c $count $track_ip --${track_method#nping-} > $TRACK_OUTPUT &
 						TRACK_PID=$!
-						wait $TRACK_PID
+						TRACK_START="$(mw_process_start_time "$TRACK_PID")"
+						wait "$TRACK_PID"
 						result=$(grep Lost $TRACK_OUTPUT | awk '{print $12}')
+						TRACK_PID=""
+						TRACK_START=""
 					;;
 				esac
 				do_log=""
@@ -496,8 +545,10 @@ main() {
 		if [ "${IFDOWN_EVENT}" -eq 0 ] && [ "${IFUP_EVENT}" -eq 0 ]; then
 			sleep "${sleep_time}" &
 			SLEEP_PID=$!
-			wait
-			unset SLEEP_PID
+			SLEEP_START="$(mw_process_start_time "$SLEEP_PID")"
+			wait "$SLEEP_PID"
+			SLEEP_PID=""
+			SLEEP_START=""
 		fi
 
 		if [ "${IFDOWN_EVENT}" -eq 1 ]; then
@@ -514,4 +565,4 @@ main() {
 	done
 }
 
-main "$@"
+[ "${MULTIWAN_NFT_TRACK_LIBRARY_ONLY:-0}" = "1" ] || main "$@"

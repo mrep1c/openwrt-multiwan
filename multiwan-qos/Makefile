@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=multiwan-qos
-PKG_VERSION:=1.0.1
+PKG_VERSION:=1.0.3
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=Markus Hütter <mh@hudra.net>
@@ -49,12 +49,12 @@ define Package/multiwan-qos/install
 	$(INSTALL_BIN) ./etc/multiwan-qos.sh $(1)/etc/
 	$(INSTALL_BIN) ./etc/init.d/multiwan-qos $(1)/etc/init.d/
 	$(INSTALL_DATA) ./lib/multiwan-qos/hotplug-common.sh $(1)/lib/multiwan-qos/
+	$(INSTALL_DATA) ./lib/multiwan-qos/process-lock.sh $(1)/lib/multiwan-qos/
 	$(INSTALL_CONF) ./etc/hotplug.d/iface/13-multiwan-qos-hotplug $(1)/etc/hotplug.d/iface/
 	$(INSTALL_CONF) ./etc/config/multiwan-qos $(1)/etc/config/
 	$(INSTALL_BIN) ./etc/uci-defaults/10-multiwan-qos-migrate-config $(1)/etc/uci-defaults/
 	$(INSTALL_DATA) ./etc/config/multiwan-qos $(1)/etc/multiwan-qos.d/multiwan-qos-defaults
 	$(INSTALL_DATA) ./usr/lib/tc/*.dist $(1)/usr/lib/tc/
-	$(INSTALL_BIN) ./etc/multiwan-qos-agent-watchdog.lua $(1)/etc/
 	$(INSTALL_BIN) ./www/cgi-bin/multiwan-qos-agent $(1)/www/cgi-bin/
 	$(INSTALL_BIN) ./www/cgi-bin/qosmate-agent $(1)/www/cgi-bin/
 endef

@@ -1,5 +1,22 @@
 # Release Notes
 
+## v1.0.3
+
+Process lifecycle hardening for NFT and QoS.
+
+- Makes the procd-supervised route monitor own and reap its `ip monitor`
+  child, preventing duplicate orphan processes after stop/restart races.
+- Uses private owner-validated route-monitor workspaces so stale FIFOs from a
+  forcibly killed process cannot collide when the kernel reuses its PID.
+- Disables procd respawn before NFT fallback cleanup and limits orphan
+  recovery to exact route-monitor commands adopted by PID 1.
+- Hardens tracking probe and sleep child cleanup.
+- Protects NFT and QoS package, hotplug, and agent locks against PID reuse
+  and cross-request lock deletion.
+- Removes the dormant unsupervised QoS agent watchdog and verifies legacy
+  process identity before signalling old watchdog processes.
+- Preserves routing policy, QoS packet handling, and DSCP behavior.
+
 ## v1.0.2
 
 NFT-only hotfix on top of v1.0.1.

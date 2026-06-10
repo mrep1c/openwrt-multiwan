@@ -7,6 +7,7 @@
 [ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || exit 0
 
 . /lib/functions.sh
+. /lib/multiwan-qos/process-lock.sh
 
 is_managed=0
 
@@ -31,23 +32,24 @@ if [ "$is_managed" -eq 1 ]; then
     pending_file="/tmp/multiwan_qos-hotplug.pending"
     max_restarts=4
 
-    if ! mkdir "$lockdir" 2>/dev/null; then
-        oldpid="$(cat "$lockdir/pid" 2>/dev/null)"
-        if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+    if ! mw_lock_acquire "$lockdir"; then
+        if mw_lock_owner_alive "$lockdir"; then
             echo "$ACTION $INTERFACE $DEVICE" > "$pending_file"
-            logger -t multiwan_qos "Queued hotplug restart for $INTERFACE ($DEVICE); restart already running as pid $oldpid"
+            logger -t multiwan_qos "Queued hotplug restart for $INTERFACE ($DEVICE); restart already running as pid $MW_LOCK_OWNER_PID"
             exit 0
         fi
-        rm -f "$lockdir/pid" 2>/dev/null
-        rmdir "$lockdir" 2>/dev/null
-        mkdir "$lockdir" 2>/dev/null || {
-            echo "$ACTION $INTERFACE $DEVICE" > "$pending_file"
-            logger -t multiwan_qos "Queued hotplug restart for $INTERFACE ($DEVICE); restart lock is busy"
-            exit 0
-        }
+        echo "$ACTION $INTERFACE $DEVICE" > "$pending_file"
+        logger -t multiwan_qos "Queued hotplug restart for $INTERFACE ($DEVICE); restart lock is busy"
+        exit 0
     fi
-    echo "$$" > "$lockdir/pid"
-    trap 'rm -f "$lockdir/pid"; rmdir "$lockdir" 2>/dev/null' EXIT INT TERM
+    lock_token="$MW_LOCK_TOKEN"
+    release_hotplug_lock() {
+        mw_lock_release_for "$lockdir" "$lock_token"
+    }
+    trap release_hotplug_lock EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     restart_count=0
     while :; do

@@ -135,7 +135,7 @@ multiwan_nft_get_src_ip()
 
 multiwan_nft_get_track_status()
 {
-	local track_ips pid
+	local track_ips pid pid_dir cmdline child_dir child_ppid child_cmdline
 	multiwan_nft_list_track_ips()
 	{
 		track_ips="$1 $track_ips"
@@ -143,13 +143,31 @@ multiwan_nft_get_track_status()
 	config_list_foreach "$1" track_ip multiwan_nft_list_track_ips
 
 	if [ -n "$track_ips" ]; then
-		pid="$(pgrep -f "multiwan-nft-track $1$")"
+		pid=""
+		for pid_dir in /proc/[0-9]*; do
+			[ -r "$pid_dir/cmdline" ] || continue
+			cmdline="$(tr '\0' ' ' 2>/dev/null < "$pid_dir/cmdline")"
+			case "$cmdline" in
+				*"/usr/sbin/multiwan-nft-track $1"|*"/usr/sbin/multiwan-nft-track $1 ")
+					pid="${pid_dir##*/}"
+					break
+					;;
+			esac
+		done
 		if [ -n "$pid" ]; then
-			if [ "$(cat /proc/"$(pgrep -P $pid)"/cmdline)" = "sleep${MAX_SLEEP}" ]; then
-				tracking="paused"
-			else
-				tracking="active"
-			fi
+			tracking="active"
+			for child_dir in /proc/[0-9]*; do
+				[ -r "$child_dir/status" ] || continue
+				child_ppid="$(sed -n 's/^PPid:[[:space:]]*//p' "$child_dir/status" 2>/dev/null)"
+				[ "$child_ppid" = "$pid" ] || continue
+				child_cmdline="$(tr '\0' ' ' 2>/dev/null < "$child_dir/cmdline")"
+				case "$child_cmdline" in
+					"sleep $MAX_SLEEP"|"sleep $MAX_SLEEP ")
+						tracking="paused"
+						break
+						;;
+				esac
+			done
 		else
 			tracking="down"
 		fi

@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.1" # will become obsolete in future releases as version string is now in the init script
+VERSION="1.0.3" # will become obsolete in future releases as version string is now in the init script
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1
@@ -17,6 +17,7 @@ IFS="$DEFAULT_IFS"
 : "${MULTIWAN_QOS_RESTARTING_FILE:=/tmp/multiwan_qos_restarting}"
 
 . /lib/functions.sh
+. /lib/multiwan-qos/process-lock.sh
 
 # Config is loaded by the caller (multiwan_qos init), this is a fallback just in case
 [ -n "$MULTIWAN_QOS_CONFIG_LOADED" ] || {
@@ -2531,16 +2532,26 @@ if [ "$1" = "refresh-device" ]; then
     }
 
     refresh_lock_acquired=0
+    refresh_lock_token=
     refresh_lock_cleanup() {
         [ "$refresh_lock_acquired" -eq 1 ] || return 0
-        rmdir "$MULTIWAN_QOS_REFRESH_LOCK_DIR" 2>/dev/null
+        mw_lock_release_for "$MULTIWAN_QOS_REFRESH_LOCK_DIR" "$refresh_lock_token"
+        refresh_lock_acquired=0
     }
-    trap refresh_lock_cleanup EXIT INT TERM HUP
-    mkdir "$MULTIWAN_QOS_REFRESH_LOCK_DIR" 2>/dev/null || {
-        error_out "MultiWAN QoS refresh is already in progress."
+    trap refresh_lock_cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    mw_lock_acquire "$MULTIWAN_QOS_REFRESH_LOCK_DIR" || {
+        if mw_lock_owner_alive "$MULTIWAN_QOS_REFRESH_LOCK_DIR"; then
+            error_out "MultiWAN QoS refresh is already in progress as pid $MW_LOCK_OWNER_PID."
+        else
+            error_out "MultiWAN QoS refresh lock is busy."
+        fi
         exit 1
     }
     refresh_lock_acquired=1
+    refresh_lock_token="$MW_LOCK_TOKEN"
 
     # Per-device cooldown: prevent rapid sequential rebuilds from any caller.
     # The multiwan_nfttrack side has its own 60s cooldown; this 30s guard is

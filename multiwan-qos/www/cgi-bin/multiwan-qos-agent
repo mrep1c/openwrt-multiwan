@@ -20,9 +20,13 @@ local RESTARTING_FILE = "/tmp/multiwan_qos_restarting"
 local NFT_TABLE = "inet dscptag"
 local NFT_CHAIN = "multiwan_qos_agent"
 local LOCK_DIR = "/tmp/multiwan_qos_agent.lock"
+local LOCK_HELPER = "/lib/multiwan-qos/process-lock.sh"
 local MIN_REQUEST_INTERVAL_SEC = 1  -- minimum seconds between requests
 local DEFAULT_DSCP = 46
 local AGENT_ENDPOINT_VERSION = 4
+local lock_token = nil
+local lock_owned = false
+local response_sent = false
 local DSCP_CLASS_BY_VALUE = {
     [46] = "ef",
     [40] = "cs5",
@@ -65,37 +69,46 @@ local function read_command(cmd)
     return output, (a == true or a == 0 or c == 0)
 end
 
+local function self_process_identity()
+    local f = io.open("/proc/self/stat", "r")
+    if not f then return nil, nil end
+    local stat = f:read("*l") or ""
+    f:close()
+
+    local pid, rest = stat:match("^(%d+)%s+%b()%s+(.+)$")
+    if not pid or not rest then return nil, nil end
+    local fields = {}
+    for value in rest:gmatch("%S+") do
+        fields[#fields + 1] = value
+    end
+    return pid, fields[20]
+end
+
 local function acquire_lock()
-    if command_ok("mkdir " .. LOCK_DIR .. " 2>/dev/null") then
-        local f = io.open(LOCK_DIR .. "/ts", "w")
-        if f then
-            f:write(tostring(os.time()) .. "\n")
-            f:close()
-        end
-        return true
-    end
+    local pid, start_time = self_process_identity()
+    if not pid or not start_time then return false end
 
-    local f = io.open(LOCK_DIR .. "/ts", "r")
-    local ts = f and tonumber(f:read("*l")) or nil
-    if f then f:close() end
+    local identity = tostring({}):match("0x%x+") or tostring(os.time())
+    local token = table.concat({ "agent", pid, start_time, tostring(os.time()), identity }, ":")
+    local cmd = "sh " .. shell_quote(LOCK_HELPER) ..
+        " --claim " .. shell_quote(LOCK_DIR) ..
+        " " .. shell_quote(pid) ..
+        " " .. shell_quote(start_time) ..
+        " " .. shell_quote(token)
+    if not command_ok(cmd) then return false end
 
-    if ts and (os.time() - ts) > 30 then
-        os.execute("rm -rf " .. LOCK_DIR .. " 2>/dev/null")
-        if command_ok("mkdir " .. LOCK_DIR .. " 2>/dev/null") then
-            local wf = io.open(LOCK_DIR .. "/ts", "w")
-            if wf then
-                wf:write(tostring(os.time()) .. "\n")
-                wf:close()
-            end
-            return true
-        end
-    end
-
-    return false
+    lock_token = token
+    lock_owned = true
+    return true
 end
 
 local function release_lock()
-    os.execute("rm -rf " .. LOCK_DIR .. " 2>/dev/null")
+    if not lock_owned or not lock_token then return end
+    command_ok("sh " .. shell_quote(LOCK_HELPER) ..
+        " --release " .. shell_quote(LOCK_DIR) ..
+        " " .. shell_quote(lock_token))
+    lock_owned = false
+    lock_token = nil
 end
 
 local function file_exists(path)
@@ -115,6 +128,7 @@ local function send_response(status, message, extra)
         end
     end
 
+    response_sent = true
     print("Status: " .. status)
     print("Content-Type: application/json")
     print("")
@@ -1131,4 +1145,21 @@ local function main()
     end
 end
 
-main()
+local function format_traceback(err)
+    if debug and debug.traceback then
+        return debug.traceback(err, 2)
+    end
+    return tostring(err)
+end
+
+local ok, err = xpcall(main, format_traceback)
+if lock_owned then
+    release_lock()
+end
+if not ok then
+    os.execute("logger -t multiwan-qos-agent " ..
+        shell_quote("Unhandled agent request error: " .. tostring(err)))
+    if not response_sent then
+        send_response(500, "Internal agent error")
+    end
+end

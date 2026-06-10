@@ -2,6 +2,7 @@
 
 . "${IPKG_INSTROOT}/lib/functions/network.sh"
 . "${IPKG_INSTROOT}/lib/multiwan-nft/multiwan_nft.sh"
+. "${IPKG_INSTROOT}/lib/multiwan-nft/process-lock.sh"
 
 START=19
 USE_PROCD=1
@@ -13,6 +14,7 @@ EXTRA_HELP="	check_deps	Check required runtime packages
 MULTIWAN_NFT_REQUIRED_PACKAGES="ip-full nftables jshn rpcd conntrack"
 MULTIWAN_NFT_PACKAGE_LOCK="/tmp/multiwan_nft-package-install.lock"
 MULTIWAN_NFT_PACKAGE_LOCK_HELD=0
+MULTIWAN_NFT_PACKAGE_LOCK_TOKEN=""
 
 multiwan_nft_detect_package_manager() {
 	if command -v apk >/dev/null 2>&1; then
@@ -42,47 +44,37 @@ multiwan_nft_check_package() {
 }
 
 multiwan_nft_acquire_package_lock() {
-	local oldpid wait_count
+	local wait_count
 
-	if mkdir "$MULTIWAN_NFT_PACKAGE_LOCK" 2>/dev/null; then
-		echo "$$" > "$MULTIWAN_NFT_PACKAGE_LOCK/pid"
+	if mw_lock_acquire "$MULTIWAN_NFT_PACKAGE_LOCK"; then
 		MULTIWAN_NFT_PACKAGE_LOCK_HELD=1
+		MULTIWAN_NFT_PACKAGE_LOCK_TOKEN="$MW_LOCK_TOKEN"
 		return 0
 	fi
 
-	oldpid="$(cat "$MULTIWAN_NFT_PACKAGE_LOCK/pid" 2>/dev/null)"
-	if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
-		LOG notice "Waiting for another package install to finish (pid $oldpid)"
-		wait_count=0
-		while [ "$wait_count" -lt 60 ]; do
-			sleep 1
-			if mkdir "$MULTIWAN_NFT_PACKAGE_LOCK" 2>/dev/null; then
-				echo "$$" > "$MULTIWAN_NFT_PACKAGE_LOCK/pid"
-				MULTIWAN_NFT_PACKAGE_LOCK_HELD=1
-				return 0
-			fi
-			wait_count=$((wait_count + 1))
-		done
-		LOG error "Timed out waiting for package install lock"
-		return 1
+	if mw_lock_owner_alive "$MULTIWAN_NFT_PACKAGE_LOCK"; then
+		LOG notice "Waiting for another package install to finish (pid $MW_LOCK_OWNER_PID)"
 	fi
 
-	rm -f "$MULTIWAN_NFT_PACKAGE_LOCK/pid" 2>/dev/null
-	rmdir "$MULTIWAN_NFT_PACKAGE_LOCK" 2>/dev/null
-	mkdir "$MULTIWAN_NFT_PACKAGE_LOCK" 2>/dev/null || {
-		LOG error "Could not acquire package install lock"
-		return 1
-	}
-	echo "$$" > "$MULTIWAN_NFT_PACKAGE_LOCK/pid"
-	MULTIWAN_NFT_PACKAGE_LOCK_HELD=1
-	return 0
+	wait_count=0
+	while [ "$wait_count" -lt 60 ]; do
+		sleep 1
+		if mw_lock_acquire "$MULTIWAN_NFT_PACKAGE_LOCK"; then
+			MULTIWAN_NFT_PACKAGE_LOCK_HELD=1
+			MULTIWAN_NFT_PACKAGE_LOCK_TOKEN="$MW_LOCK_TOKEN"
+			return 0
+		fi
+		wait_count=$((wait_count + 1))
+	done
+	LOG error "Timed out waiting for package install lock"
+	return 1
 }
 
 multiwan_nft_release_package_lock() {
 	[ "$MULTIWAN_NFT_PACKAGE_LOCK_HELD" = "1" ] || return 0
-	rm -f "$MULTIWAN_NFT_PACKAGE_LOCK/pid" 2>/dev/null
-	rmdir "$MULTIWAN_NFT_PACKAGE_LOCK" 2>/dev/null
+	mw_lock_release_for "$MULTIWAN_NFT_PACKAGE_LOCK" "$MULTIWAN_NFT_PACKAGE_LOCK_TOKEN"
 	MULTIWAN_NFT_PACKAGE_LOCK_HELD=0
+	MULTIWAN_NFT_PACKAGE_LOCK_TOKEN=""
 }
 
 multiwan_nft_check_required_packages() {
@@ -188,7 +180,7 @@ multiwan_nft_is_package_script_context() {
 
 	[ -n "${APK_SCRIPT:-}" ] && return 0
 	[ -r "/proc/$PPID/cmdline" ] || return 1
-	cmdline="$(tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null)"
+	cmdline="$(tr '\0' ' ' 2>/dev/null < "/proc/$PPID/cmdline")"
 	case "$cmdline" in
 		*/lib/apk/db/scripts/*|*/usr/lib/opkg/info/*|*post-install*|*post-upgrade*)
 			return 0
@@ -241,74 +233,88 @@ service_running() {
 }
 
 multiwan_nft_helper_pids() {
-	local helper="$1" pid_dir pid cmdline
+	local helper="$1" pid_dir pid start cmdline
 
 	for pid_dir in /proc/[0-9]*; do
 		[ -r "$pid_dir/cmdline" ] || continue
 		pid="${pid_dir##*/}"
 		[ "$pid" = "$$" ] && continue
-		cmdline="$(tr '\0' ' ' < "$pid_dir/cmdline" 2>/dev/null)"
+		start="$(mw_process_start_time "$pid" 2>/dev/null)"
+		[ -n "$start" ] || continue
+		cmdline="$(tr '\0' ' ' 2>/dev/null < "$pid_dir/cmdline")"
 		case "$cmdline" in
 			*"/usr/sbin/$helper "*|*"/usr/sbin/$helper")
-				printf '%s\n' "$pid"
+				printf '%s:%s\n' "$pid" "$start"
 				;;
 		esac
 	done
 }
 
 multiwan_nft_exact_cmdline_pids() {
-	local needle="$1" pid_dir pid cmdline
+	local needle="$1" pid_dir pid ppid start cmdline
 
 	for pid_dir in /proc/[0-9]*; do
 		[ -r "$pid_dir/cmdline" ] || continue
 		pid="${pid_dir##*/}"
 		[ "$pid" = "$$" ] && continue
-		cmdline="$(tr '\0' ' ' < "$pid_dir/cmdline" 2>/dev/null)"
+		ppid="$(sed -n 's/^PPid:[[:space:]]*//p' "$pid_dir/status" 2>/dev/null)"
+		[ "$ppid" = "1" ] || continue
+		start="$(mw_process_start_time "$pid" 2>/dev/null)"
+		[ -n "$start" ] || continue
+		cmdline="$(tr '\0' ' ' 2>/dev/null < "$pid_dir/cmdline")"
 		case "$cmdline" in
 			"$needle"|"$needle ")
-				printf '%s\n' "$pid"
+				printf '%s:%s\n' "$pid" "$start"
 				;;
 		esac
 	done
 }
 
 multiwan_nft_stop_helper_processes() {
-	local helper pid
+	local helper entry pid start
 
 	for helper in "$@"; do
-		for pid in $(multiwan_nft_helper_pids "$helper"); do
-			kill "$pid" 2>/dev/null || true
+		for entry in $(multiwan_nft_helper_pids "$helper"); do
+			pid="${entry%%:*}"
+			start="${entry#*:}"
+			mw_process_identity_alive "$pid" "$start" && kill "$pid" 2>/dev/null
 		done
 	done
 
 	sleep 1
 
 	for helper in "$@"; do
-		for pid in $(multiwan_nft_helper_pids "$helper"); do
-			if kill -0 "$pid" 2>/dev/null; then
+		for entry in $(multiwan_nft_helper_pids "$helper"); do
+			pid="${entry%%:*}"
+			start="${entry#*:}"
+			if mw_process_identity_alive "$pid" "$start"; then
 				LOG warn "Force killing stale $helper process $pid"
-				kill -KILL "$pid" 2>/dev/null || true
+				kill -KILL "$pid" 2>/dev/null
 			fi
 		done
 	done
 }
 
 multiwan_nft_stop_route_monitor_processes() {
-	local cmd pid
+	local cmd entry pid start
 
 	for cmd in "ip -4 monitor route" "ip -6 monitor route"; do
-		for pid in $(multiwan_nft_exact_cmdline_pids "$cmd"); do
-			kill "$pid" 2>/dev/null || true
+		for entry in $(multiwan_nft_exact_cmdline_pids "$cmd"); do
+			pid="${entry%%:*}"
+			start="${entry#*:}"
+			mw_process_identity_alive "$pid" "$start" && kill "$pid" 2>/dev/null
 		done
 	done
 
 	sleep 1
 
 	for cmd in "ip -4 monitor route" "ip -6 monitor route"; do
-		for pid in $(multiwan_nft_exact_cmdline_pids "$cmd"); do
-			if kill -0 "$pid" 2>/dev/null; then
+		for entry in $(multiwan_nft_exact_cmdline_pids "$cmd"); do
+			pid="${entry%%:*}"
+			start="${entry#*:}"
+			if mw_process_identity_alive "$pid" "$start"; then
 				LOG warn "Force killing stale route monitor process $pid ($cmd)"
-				kill -KILL "$pid" 2>/dev/null || true
+				kill -KILL "$pid" 2>/dev/null
 			fi
 		done
 	done
@@ -418,8 +424,16 @@ start_service() {
 }
 
 stop_service() {
+	# rc.common calls procd_kill after this hook, then service_stopped.
+	# Keep this hook side-effect free so the service is deleted exactly once.
+	return 0
+}
+
+service_stopped() {
 	local rule IP tid route_cleanup_allowed
 
+	# procd has disabled respawn and stopped registered instances before this
+	# callback. Clean up any identity-matched helpers that escaped supervision.
 	multiwan_nft_init || return 1
 	
 	# Kill helper shells that procd may not know about. The process name is
