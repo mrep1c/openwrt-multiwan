@@ -1,5 +1,14 @@
 # Release Notes
 
+## v1.0.4
+
+QoS adds explicit PPPoE link-layer presets for Ethernet and GPON shaping.
+
+- Adds PPPoE over Ethernet and PPPoE over VLAN/Ethernet presets for copper or Ethernet handoffs.
+- Adds PPPoE over GPON and PPPoE over VLAN/GPON presets for fiber ONT/OLT bottlenecks without Ethernet preamble/IFG accounting.
+- Documents `pppoe-vlan-gpon` as the intended preset for bridged GPON ONT + VLAN + OpenWrt PPPoE setups.
+- Keeps per-interface manual `overhead` and `mpu` overrides available when preset defaults need adjustment.
+
 ## v1.0.3
 
 Process lifecycle hardening for NFT and QoS.

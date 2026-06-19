@@ -8,7 +8,7 @@
 'require poll';
 'require tools.widgets as widgets';
 
-const UI_VERSION = '1.0.3';
+const UI_VERSION = '1.0.4';
 const UI_UPD_CHANNEL = 'release';
 
 var callInitAction = rpc.declare({
@@ -377,19 +377,23 @@ return view.extend({
         o.default = 'hfsc';
 
         // Link Layer Settings (Moved from Advanced)
-        o = s_interfaces.option(form.ListValue, 'preset', _('Link Type'), _('Overhead calculation preset'));
+        o = s_interfaces.option(form.ListValue, 'preset', _('Link Type'), _('Overhead calculation preset. Use GPON presets for fiber ONT/OLT PPPoE bridges; use Ethernet presets for copper/Ethernet bottlenecks.'));
         o.value('ethernet', _('Ethernet (40B/38B)'));
+        o.value('pppoe-ethernet', _('PPPoE over Ethernet (46B, MPU 84)'));
+        o.value('pppoe-vlan-ethernet', _('PPPoE + VLAN over Ethernet (50B, MPU 84)'));
+        o.value('pppoe-gpon', _('PPPoE over GPON (31B, MPU 69)'));
+        o.value('pppoe-vlan-gpon', _('PPPoE + VLAN over GPON (35B, MPU 69)'));
         o.value('docsis', _('Cable DOCSIS (25B)'));
         o.value('atm', _('DSL ATM/ADSL (44B)'));
         o.value('cake-ethernet', _('[CAKE] Ethernet (38B)'));
         o.value('raw', _('Raw (No overhead)'));
         o.default = 'ethernet';
 
-        o = s_interfaces.option(form.Value, 'overhead', _('Manual Overhead'), _('Override automatic overhead (bytes)'));
+        o = s_interfaces.option(form.Value, 'overhead', _('Manual Overhead'), _('Override preset overhead (bytes). Leave empty to use the selected preset default.'));
         o.datatype = 'uinteger';
         o.placeholder = 'Auto';
 
-        o = s_interfaces.option(form.Value, 'mpu', _('MPU'), _('Minimum Packet Unit (bytes). Typical values: 64 for Ethernet, 68 for ATM'));
+        o = s_interfaces.option(form.Value, 'mpu', _('MPU'), _('Override preset minimum packet unit (bytes). Leave empty to use the selected preset default. GPON PPPoE defaults to 69; use 73 for conservative tagged minimum accounting.'));
         o.datatype = 'uinteger';
         o.placeholder = 'Auto';
 

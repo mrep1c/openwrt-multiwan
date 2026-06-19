@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.3" # will become obsolete in future releases as version string is now in the init script
+VERSION="1.0.4" # will become obsolete in future releases as version string is now in the init script
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1
@@ -92,6 +92,18 @@ get_tc_overhead_params() {
     
     # Detect ATM-based presets
     case "$preset" in
+        pppoe-ethernet)
+            printf '%s' "stab mtu 2047 tsize 512 mpu ${mpu:-84} overhead ${overhead:-46} linklayer ethernet"
+            ;;
+        pppoe-vlan-ethernet)
+            printf '%s' "stab mtu 2047 tsize 512 mpu ${mpu:-84} overhead ${overhead:-50} linklayer ethernet"
+            ;;
+        pppoe-gpon)
+            printf '%s' "stab mtu 2047 tsize 512 mpu ${mpu:-69} overhead ${overhead:-31} linklayer ethernet"
+            ;;
+        pppoe-vlan-gpon)
+            printf '%s' "stab mtu 2047 tsize 512 mpu ${mpu:-69} overhead ${overhead:-35} linklayer ethernet"
+            ;;
         *atm*|*adsl*|*pppoa*|*pppoe*|*bridged*|*ipoa*|conservative)
             printf '%s' "stab mtu 2047 tsize 512 mpu ${mpu:-68} overhead ${overhead:-44} linklayer atm"
             ;;
@@ -102,7 +114,11 @@ get_tc_overhead_params() {
             printf '%s' "stab mtu 2047 tsize 512 mpu ${mpu:-64} overhead ${overhead:-38} linklayer ethernet"
             ;;
         raw)
-            printf '%s' "stab overhead ${overhead:-0} linklayer ethernet"
+            if [ -n "$mpu" ]; then
+                printf '%s' "stab mpu $mpu overhead ${overhead:-0} linklayer ethernet"
+            else
+                printf '%s' "stab overhead ${overhead:-0} linklayer ethernet"
+            fi
             ;;
         *)
             printf '%s' "stab mtu 2047 tsize 512 mpu ${mpu:-64} overhead ${overhead:-40} linklayer ethernet"
@@ -127,9 +143,22 @@ get_cake_link_params() {
     local mpu="$3"
     local mode="$4"
     local base=""
+    local vlan_keyword="${ETHER_VLAN_KEYWORD:+ $ETHER_VLAN_KEYWORD}"
 
     # Determine base keyword and default overhead
     case "$preset" in
+        pppoe-ethernet)
+            base="ethernet"; : "${oh:=46}"; : "${mpu:=84}"; vlan_keyword=""
+            ;;
+        pppoe-vlan-ethernet)
+            base="ethernet"; : "${oh:=50}"; : "${mpu:=84}"; vlan_keyword=""
+            ;;
+        pppoe-gpon)
+            base="raw";      : "${oh:=31}"; : "${mpu:=69}"; vlan_keyword=""
+            ;;
+        pppoe-vlan-gpon)
+            base="raw";      : "${oh:=35}"; : "${mpu:=69}"; vlan_keyword=""
+            ;;
         *atm*|*adsl*|*pppoa*|*pppoe*|*bridged*|*ipoa*|conservative)
             [ "$mode" = "hybrid" ] && base="atm" || base="${preset}"
             : "${oh:=44}"
@@ -145,7 +174,7 @@ get_cake_link_params() {
         "$base" \
         "${oh:+ overhead $oh}" \
         "${mpu:+ mpu $mpu}" \
-        "${ETHER_VLAN_KEYWORD:+ $ETHER_VLAN_KEYWORD}"
+        "$vlan_keyword"
 }
 
 ##############################
