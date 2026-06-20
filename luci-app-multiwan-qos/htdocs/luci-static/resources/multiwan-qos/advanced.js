@@ -107,6 +107,10 @@ return view.extend({
             o = s.option(form.Flag, 'WASHDSCPDOWNDELIVERY', _('Clean Delivery to LAN'), _('Washes DSCP to CS0 on download packets just before they reach your LAN devices. Ensures clean delivery after shaping is complete.'));
             o.rmempty = false;
 
+            o = s.option(form.Flag, 'DOWNLOAD_IFB_STAB', _('Download IFB STAB'), _('Apply link-layer overhead accounting to download IFB roots for HFSC, HTB, and Hybrid. Pure CAKE is unchanged because it already applies link parameters directly.'));
+            o.rmempty = false;
+            o.default = '0';
+
             createOption('BWMAXRATIO', _('Bandwidth Max Ratio'), _('Max download/upload ratio to prevent upstream congestion'), _('Default: 20'), 'uinteger');
             // Note: ACKRATE has been moved to per-interface settings
 

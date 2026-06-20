@@ -1,5 +1,13 @@
 # Release Notes
 
+## v1.0.5
+
+Adds opt-in download IFB link-layer accounting and a conservative GPON VLAN preset.
+
+- Adds the Download IFB STAB advanced toggle for HFSC, HTB, and Hybrid download IFB roots.
+- Adds `pppoe-vlan-gpon-conservative` with overhead 39 and MPU 73.
+- Keeps `pppoe-vlan-gpon` at 35/69 and keeps per-interface manual `overhead` and `mpu` overrides available.
+
 ## v1.0.4
 
 QoS adds explicit PPPoE link-layer presets for Ethernet and GPON shaping.

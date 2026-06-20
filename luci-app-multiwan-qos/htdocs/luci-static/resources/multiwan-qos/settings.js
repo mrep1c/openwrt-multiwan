@@ -8,7 +8,7 @@
 'require poll';
 'require tools.widgets as widgets';
 
-const UI_VERSION = '1.0.4';
+const UI_VERSION = '1.0.5';
 const UI_UPD_CHANNEL = 'release';
 
 var callInitAction = rpc.declare({
@@ -383,6 +383,7 @@ return view.extend({
         o.value('pppoe-vlan-ethernet', _('PPPoE + VLAN over Ethernet (50B, MPU 84)'));
         o.value('pppoe-gpon', _('PPPoE over GPON (31B, MPU 69)'));
         o.value('pppoe-vlan-gpon', _('PPPoE + VLAN over GPON (35B, MPU 69)'));
+        o.value('pppoe-vlan-gpon-conservative', _('PPPoE + VLAN over GPON conservative (39B, MPU 73)'));
         o.value('docsis', _('Cable DOCSIS (25B)'));
         o.value('atm', _('DSL ATM/ADSL (44B)'));
         o.value('cake-ethernet', _('[CAKE] Ethernet (38B)'));
@@ -393,7 +394,7 @@ return view.extend({
         o.datatype = 'uinteger';
         o.placeholder = 'Auto';
 
-        o = s_interfaces.option(form.Value, 'mpu', _('MPU'), _('Override preset minimum packet unit (bytes). Leave empty to use the selected preset default. GPON PPPoE defaults to 69; use 73 for conservative tagged minimum accounting.'));
+        o = s_interfaces.option(form.Value, 'mpu', _('MPU'), _('Override preset minimum packet unit (bytes). Leave empty to use the selected preset default. Standard GPON PPPoE presets use 69; the conservative VLAN/GPON preset uses 73.'));
         o.datatype = 'uinteger';
         o.placeholder = 'Auto';
 

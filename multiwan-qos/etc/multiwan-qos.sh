@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.4" # will become obsolete in future releases as version string is now in the init script
+VERSION="1.0.5" # will become obsolete in future releases as version string is now in the init script
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1
@@ -13,6 +13,7 @@ IFS="$DEFAULT_IFS"
 
 : "${VERSION}" "${global_enabled:=}" "${nongameqdisc:=}" "${nongameqdiscoptions:=}" "${OVERHEAD:=}"
 : "${gameqdisc:=pfifo}" "${nongameqdisc:=fq_codel}" "${ACK_FILTER_EGRESS:=auto}"
+: "${DOWNLOAD_IFB_STAB:=0}"
 : "${MULTIWAN_QOS_REFRESH_LOCK_DIR:=/var/run/multiwan_qos-refresh.lock}"
 : "${MULTIWAN_QOS_RESTARTING_FILE:=/tmp/multiwan_qos_restarting}"
 
@@ -104,6 +105,9 @@ get_tc_overhead_params() {
         pppoe-vlan-gpon)
             printf '%s' "stab mtu 2047 tsize 512 mpu ${mpu:-69} overhead ${overhead:-35} linklayer ethernet"
             ;;
+        pppoe-vlan-gpon-conservative)
+            printf '%s' "stab mtu 2047 tsize 512 mpu ${mpu:-73} overhead ${overhead:-39} linklayer ethernet"
+            ;;
         *atm*|*adsl*|*pppoa*|*pppoe*|*bridged*|*ipoa*|conservative)
             printf '%s' "stab mtu 2047 tsize 512 mpu ${mpu:-68} overhead ${overhead:-44} linklayer atm"
             ;;
@@ -159,6 +163,9 @@ get_cake_link_params() {
         pppoe-vlan-gpon)
             base="raw";      : "${oh:=35}"; : "${mpu:=69}"; vlan_keyword=""
             ;;
+        pppoe-vlan-gpon-conservative)
+            base="raw";      : "${oh:=39}"; : "${mpu:=73}"; vlan_keyword=""
+            ;;
         *atm*|*adsl*|*pppoa*|*pppoe*|*bridged*|*ipoa*|conservative)
             [ "$mode" = "hybrid" ] && base="atm" || base="${preset}"
             : "${oh:=44}"
@@ -175,6 +182,11 @@ get_cake_link_params() {
         "${oh:+ overhead $oh}" \
         "${mpu:+ mpu $mpu}" \
         "$vlan_keyword"
+}
+
+should_apply_root_stab() {
+    local dir="$1"
+    [ "$dir" != "lan" ] || [ "${DOWNLOAD_IFB_STAB:-0}" = "1" ]
 }
 
 ##############################
@@ -1671,12 +1683,12 @@ setup_hfsc() {
     local TC_OH_PARAMS
     TC_OH_PARAMS=$(get_tc_overhead_params "$PRESET" "$OVERHEAD" "$MPU")
     
-    # Apply root qdisc. IFB devices are virtual, so do not apply link-layer STAB.
-    if [ "$DIR" = "lan" ]; then
-        tc qdisc replace dev "$DEV" handle 1: root hfsc default 13
-    else
+    # Apply STAB on upload roots, and on download IFB roots only when enabled.
+    if should_apply_root_stab "$DIR"; then
         # shellcheck disable=SC2086
         tc qdisc replace dev "$DEV" handle 1: root ${TC_OH_PARAMS} hfsc default 13
+    else
+        tc qdisc replace dev "$DEV" handle 1: root hfsc default 13
     fi
 
     # DUR calculation
@@ -1827,12 +1839,12 @@ setup_hybrid() {
     
     # Ensure previous root is deleted before replacing
     tc qdisc del dev "$DEV" root > /dev/null 2>&1
-    # IFB devices are virtual, so do not apply link-layer STAB.
-    if [ "$DIR" = "lan" ]; then
-        tc qdisc replace dev "$DEV" handle 1: root hfsc default 13
-    else
+    # Apply STAB on upload roots, and on download IFB roots only when enabled.
+    if should_apply_root_stab "$DIR"; then
         # shellcheck disable=SC2086
         tc qdisc replace dev "$DEV" handle 1: root ${TC_OH_PARAMS} hfsc default 13
+    else
+        tc qdisc replace dev "$DEV" handle 1: root hfsc default 13
     fi
 
     # Main link class
@@ -2001,12 +2013,12 @@ setup_htb() {
     TC_OH_PARAMS=$(get_tc_overhead_params "$PRESET" "$OVERHEAD" "$MPU")
 
     # Setup HTB root with default to best effort (class 13).
-    # IFB devices are virtual, so do not apply link-layer STAB.
-    if [ "$DIR" = "lan" ]; then
-        tc qdisc add dev "$DEV" root handle 1: htb default 13
-    else
+    # Apply STAB on upload roots, and on download IFB roots only when enabled.
+    if should_apply_root_stab "$DIR"; then
         # shellcheck disable=SC2086
         tc qdisc add dev "$DEV" root handle 1: $TC_OH_PARAMS htb default 13
+    else
+        tc qdisc add dev "$DEV" root handle 1: htb default 13
     fi
 
     # Calculate HTB quantum for root (all use same quantum)
