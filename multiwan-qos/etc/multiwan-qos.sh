@@ -1578,9 +1578,25 @@ setup_game_qdisc() {
     [ "$GAMERATE" -le 0 ] && GAMERATE=1
     [ "$PACKETSIZE" -le 0 ] && PACKETSIZE=1
 
-    # Calculate REDMIN and REDMAX based on gamerate and MAXDEL
-    local REDMIN=$((GAMERATE * MAXDEL / 3 / 8))
+    local BFIFO_MIN_BYTES=4500
+    local PFIFO_MIN_PACKETS=12
+    local RED_MIN_BYTES=4500
+    local NETEM_MIN_PACKETS=12
+
+    local bfifo_limit=$((MAXDEL * GAMERATE / 8))
+    [ "$bfifo_limit" -lt "$BFIFO_MIN_BYTES" ] && bfifo_limit=$BFIFO_MIN_BYTES
+
+    local pfifo_limit=$((PFIFOMIN + MAXDEL * GAMERATE / 8 / PACKETSIZE))
+    [ "$pfifo_limit" -lt "$PFIFO_MIN_PACKETS" ] && pfifo_limit=$PFIFO_MIN_PACKETS
+
+    local netem_limit=$((4 + 9 * GAMERATE / 8 / 500))
+    [ "$netem_limit" -lt "$NETEM_MIN_PACKETS" ] && netem_limit=$NETEM_MIN_PACKETS
+
+    # Calculate RED thresholds from gamerate/MAXDEL, with a burst floor for low-rate links.
     local REDMAX=$((GAMERATE * MAXDEL / 8))
+    [ "$REDMAX" -lt "$RED_MIN_BYTES" ] && REDMAX=$RED_MIN_BYTES
+    local REDMIN=$((REDMAX / 3))
+    [ "$REDMIN" -lt 1 ] && REDMIN=1
     # Calculate BURST: (min + min + max)/(3 * avpkt) as per RED documentation
     local BURST=$(( (REDMIN + REDMIN + REDMAX) / (3 * 500) )); [ "$BURST" -lt 2 ] && BURST=2
 
@@ -1611,10 +1627,10 @@ setup_game_qdisc() {
             tc qdisc add dev "$DEV" parent 10:3 handle 13: red limit 150000 min $REDMIN max $REDMAX avpkt 500 bandwidth "${GAMERATE}kbit" probability 1.0 burst $BURST
         ;;
         "pfifo")
-            tc qdisc add dev "$DEV" parent 1:11 handle 10: pfifo limit $((PFIFOMIN+MAXDEL*GAMERATE/8/PACKETSIZE))
+            tc qdisc add dev "$DEV" parent 1:11 handle 10: pfifo limit "$pfifo_limit"
         ;;
         "bfifo")
-            tc qdisc add dev "$DEV" parent 1:11 handle 10: bfifo limit $((MAXDEL * GAMERATE / 8))
+            tc qdisc add dev "$DEV" parent 1:11 handle 10: bfifo limit "$bfifo_limit"
             #tc qdisc add dev "$DEV" parent 1:11 handle 10: bfifo limit $((MAXDEL * RATE / 8))
         ;;
         "red")
@@ -1631,7 +1647,6 @@ setup_game_qdisc() {
                { [ "$NETEM_DIRECTION" = "ingress" ] && [ "$DIR" = "lan" ]; }; then
                 
                 # Build netem arguments as positional params instead of eval (#9)
-                local netem_limit=$((4+9*GAMERATE/8/500))
                 local netem_args="limit $netem_limit"
                 
                 # If jitter is set but delay is 0, force minimum delay of 1ms
@@ -1659,13 +1674,13 @@ setup_game_qdisc() {
                 tc qdisc add dev "$DEV" parent 1:11 handle 10: netem $netem_args
             else
                 # Use pfifo as fallback when NETEM is not applied in this direction
-                tc qdisc add dev "$DEV" parent 1:11 handle 10: pfifo limit $((PFIFOMIN+MAXDEL*GAMERATE/8/PACKETSIZE))
+                tc qdisc add dev "$DEV" parent 1:11 handle 10: pfifo limit "$pfifo_limit"
             fi
         ;;
         *)
             print_msg -err "Unsupported game qdisc type '$QDISC_TYPE'. Using pfifo fallback."
             # pfifo fallback limit calculation
-            tc qdisc add dev "$DEV" parent 1:11 handle 10: pfifo limit $((PFIFOMIN+MAXDEL*GAMERATE/8/PACKETSIZE))
+            tc qdisc add dev "$DEV" parent 1:11 handle 10: pfifo limit "$pfifo_limit"
         ;;
     esac
 }
@@ -1969,15 +1984,18 @@ calculate_htb_burst() {
 }
 
 # Calculate the realtime/game lane as a small reserve: 1% plus 500 kbit,
-# capped at 2000 kbit. HFSC/HTB priority handles latency; this rate only
-# needs to cover actual game/voice traffic plus modest overhead.
+# with a 1000 kbit floor and 3000 kbit ceiling. HFSC/HTB priority handles
+# latency; this rate only needs to cover game/voice traffic plus modest overhead.
 calculate_realtime_rate() {
-    local rate="$1" dir="$2" realtime max_rate cap
+    local rate="$1" dir="$2" realtime min_rate max_rate cap
 
     [ "$rate" -gt 0 ] 2>/dev/null || rate=1
 
     realtime=$((rate / 100 + 500))
-    max_rate=2000
+    min_rate=1000
+    [ "$realtime" -lt "$min_rate" ] && realtime=$min_rate
+
+    max_rate=3000
     [ "$realtime" -gt "$max_rate" ] && realtime=$max_rate
 
     # On very slow links, do not let the realtime lane consume the connection.
