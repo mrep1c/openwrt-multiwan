@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.8" # will become obsolete in future releases as version string is now in the init script
+VERSION="1.0.9" # will become obsolete in future releases as version string is now in the init script
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1

@@ -1,5 +1,16 @@
 # Release Notes
 
+## v1.0.9
+
+QoS adds managed offload control for accurate shaping across restarts.
+
+- Adds the Disable QoS Offloads advanced toggle, enabled by default.
+- Disables only QoS-relevant offloads on managed WAN and IFB devices: GRO, GSO, TSO, rx-gro-list, tx-udp-segmentation, and hardware TC offload.
+- Adds Extra Offload Devices for optional physical lower ports such as `eth1 eth2`.
+- Adds `ethtool` as a backend dependency and runtime dependency.
+- Re-applies offload control during QoS start, restart, soft refresh, hotplug/interface rebuilds, and package-managed setup.
+- Leaves checksum, scatter-gather, and VLAN offloads untouched, and ignores fixed or unsupported `ethtool` features.
+
 ## v1.0.8
 
 QoS adds adaptive realtime game lane sizing for lower-speed links and PC-agent gameplay.
