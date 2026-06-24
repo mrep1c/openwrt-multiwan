@@ -1622,23 +1622,32 @@ setup_game_qdisc() {
     [ "$GAMERATE" -le 0 ] && GAMERATE=1
     [ "$PACKETSIZE" -le 0 ] && PACKETSIZE=1
 
-    local BFIFO_MIN_BYTES=4500
+    local BFIFO_BURST_CAP_BYTES=3000
     local PFIFO_MIN_PACKETS=12
-    local RED_MIN_BYTES=4500
     local NETEM_MIN_PACKETS=12
 
-    local bfifo_limit=$((MAXDEL * GAMERATE / 8))
-    [ "$bfifo_limit" -lt "$BFIFO_MIN_BYTES" ] && bfifo_limit=$BFIFO_MIN_BYTES
+    local target_bytes=$((MAXDEL * GAMERATE / 8))
+    [ "$target_bytes" -lt 1 ] && target_bytes=1
+
+    local burst_floor_bytes="$target_bytes"
+    [ "$burst_floor_bytes" -gt "$BFIFO_BURST_CAP_BYTES" ] && burst_floor_bytes="$BFIFO_BURST_CAP_BYTES"
+
+    local bfifo_limit="$target_bytes"
+    [ "$bfifo_limit" -lt "$burst_floor_bytes" ] && bfifo_limit="$burst_floor_bytes"
 
     local pfifo_limit=$((PFIFOMIN + MAXDEL * GAMERATE / 8 / PACKETSIZE))
+    local pfifo_delay_cap="$pfifo_limit"
     [ "$pfifo_limit" -lt "$PFIFO_MIN_PACKETS" ] && pfifo_limit=$PFIFO_MIN_PACKETS
+    [ "$pfifo_limit" -gt "$pfifo_delay_cap" ] && pfifo_limit="$pfifo_delay_cap"
 
     local netem_limit=$((4 + 9 * GAMERATE / 8 / 500))
+    local netem_delay_cap=$((target_bytes / 500))
+    [ "$netem_delay_cap" -lt 1 ] && netem_delay_cap=1
     [ "$netem_limit" -lt "$NETEM_MIN_PACKETS" ] && netem_limit=$NETEM_MIN_PACKETS
+    [ "$netem_limit" -gt "$netem_delay_cap" ] && netem_limit="$netem_delay_cap"
 
-    # Calculate RED thresholds from gamerate/MAXDEL, with a burst floor for low-rate links.
-    local REDMAX=$((GAMERATE * MAXDEL / 8))
-    [ "$REDMAX" -lt "$RED_MIN_BYTES" ] && REDMAX=$RED_MIN_BYTES
+    # Calculate RED thresholds from the same stale-packet delay budget as BFIFO.
+    local REDMAX="$target_bytes"
     local REDMIN=$((REDMAX / 3))
     [ "$REDMIN" -lt 1 ] && REDMIN=1
     # Calculate BURST: (min + min + max)/(3 * avpkt) as per RED documentation
@@ -2028,7 +2037,7 @@ calculate_htb_burst() {
 }
 
 # Calculate the realtime/game lane as a small reserve: 1% plus 500 kbit,
-# with a 1000 kbit floor and 3000 kbit ceiling. HFSC/HTB priority handles
+# with a 750 kbit floor and 1500 kbit ceiling. HFSC/HTB priority handles
 # latency; this rate only needs to cover game/voice traffic plus modest overhead.
 calculate_realtime_rate() {
     local rate="$1" dir="$2" realtime min_rate max_rate cap
@@ -2036,10 +2045,10 @@ calculate_realtime_rate() {
     [ "$rate" -gt 0 ] 2>/dev/null || rate=1
 
     realtime=$((rate / 100 + 500))
-    min_rate=1000
+    min_rate=750
     [ "$realtime" -lt "$min_rate" ] && realtime=$min_rate
 
-    max_rate=3000
+    max_rate=1500
     [ "$realtime" -gt "$max_rate" ] && realtime=$max_rate
 
     # On very slow links, do not let the realtime lane consume the connection.
