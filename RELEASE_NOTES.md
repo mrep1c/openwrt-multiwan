@@ -1,5 +1,14 @@
 # Release Notes
 
+## v1.0.7
+
+QoS cleans up first-install behavior and official package integrity checks.
+
+- Ships backend and frontend MD5 registries in the package feed so official installs validate without missing-registry warnings.
+- Downgrades missing integrity registries to a quiet custom/manual-install condition instead of printing an error.
+- Runs config migration and dependency checking from the backend package post-install hook.
+- Lets service start attempt one automatic dependency repair outside package-manager transactions before failing.
+
 ## v1.0.6
 
 QoS fixes package dependency detection for fresh installs using the nftables-json flavor.

@@ -1,9 +1,9 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-multiwan-qos
-PKG_VERSION:=1.0.6
+PKG_VERSION:=1.0.7
 PKG_RELEASE:=1
-PKG_PO_VERSION:=1.0.6-r1
+PKG_PO_VERSION:=1.0.7-r1
 
 PKG_MAINTAINER:=Markus Hütter <mh@hudra.net>
 PKG_LICENSE:=GPL-3.0-or-later
@@ -27,6 +27,7 @@ define Package/$(PKG_NAME)/install
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
 	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
+	$(INSTALL_DIR) $(1)/etc/multiwan-qos.d
 
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/multiwan-qos/*.js $(1)/www/luci-static/resources/view/multiwan-qos/
 
@@ -35,6 +36,24 @@ define Package/$(PKG_NAME)/install
 
 	$(INSTALL_BIN) ./root/usr/libexec/rpcd/luci.multiwan_qos $(1)/usr/libexec/rpcd/
 	$(INSTALL_BIN) ./root/usr/libexec/rpcd/luci.multiwan_qos_stats $(1)/usr/libexec/rpcd/
+	( cd $(1); \
+		md5sum \
+			usr/share/luci/menu.d/luci-app-multiwan-qos.json \
+			usr/share/rpcd/acl.d/luci-app-multiwan-qos.json \
+			usr/libexec/rpcd/luci.multiwan_qos \
+			usr/libexec/rpcd/luci.multiwan_qos_stats \
+			www/luci-static/resources/view/multiwan-qos/settings.js \
+			www/luci-static/resources/view/multiwan-qos/hfsc.js \
+			www/luci-static/resources/view/multiwan-qos/cake.js \
+			www/luci-static/resources/view/multiwan-qos/advanced.js \
+			www/luci-static/resources/view/multiwan-qos/rules.js \
+			www/luci-static/resources/view/multiwan-qos/ratelimits.js \
+			www/luci-static/resources/view/multiwan-qos/connections.js \
+			www/luci-static/resources/view/multiwan-qos/custom_rules.js \
+			www/luci-static/resources/view/multiwan-qos/ipsets.js \
+			www/luci-static/resources/view/multiwan-qos/statistics.js \
+			www/luci-static/resources/view/multiwan-qos/agent.js | \
+		sed 's#  #  /#' > etc/multiwan-qos.d/frontend_reg.md5 )
 endef
 
 # call BuildPackage - OpenWrt buildroot signature

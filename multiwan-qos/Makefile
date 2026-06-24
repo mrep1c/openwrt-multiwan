@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=multiwan-qos
-PKG_VERSION:=1.0.6
+PKG_VERSION:=1.0.7
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=Markus Hütter <mh@hudra.net>
@@ -57,6 +57,34 @@ define Package/multiwan-qos/install
 	$(INSTALL_DATA) ./usr/lib/tc/*.dist $(1)/usr/lib/tc/
 	$(INSTALL_BIN) ./www/cgi-bin/multiwan-qos-agent $(1)/www/cgi-bin/
 	$(INSTALL_BIN) ./www/cgi-bin/qosmate-agent $(1)/www/cgi-bin/
+	( cd $(1); \
+		md5sum \
+			etc/init.d/multiwan-qos \
+			etc/multiwan-qos.sh \
+			etc/multiwan-qos.d/multiwan-qos-defaults \
+			lib/multiwan-qos/hotplug-common.sh \
+			lib/multiwan-qos/process-lock.sh \
+			usr/lib/tc/experimental.dist \
+			usr/lib/tc/normal.dist \
+			usr/lib/tc/normmix20-64.dist \
+			usr/lib/tc/pareto.dist \
+			usr/lib/tc/paretonormal.dist | \
+		sed 's#  #  /#' > etc/multiwan-qos.d/backend_reg.md5 )
+endef
+
+define Package/multiwan-qos/postinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+
+if [ -x /etc/uci-defaults/10-multiwan-qos-migrate-config ]; then
+	/bin/sh /etc/uci-defaults/10-multiwan-qos-migrate-config || true
+	rm -f /etc/uci-defaults/10-multiwan-qos-migrate-config
+fi
+
+/etc/init.d/multiwan-qos check_deps >/dev/null 2>&1 || {
+	echo "MultiWAN QoS: runtime dependency check failed; run '/etc/init.d/multiwan-qos install_deps' after package installation."
+}
+exit 0
 endef
 
 $(eval $(call BuildPackage,multiwan-qos))
