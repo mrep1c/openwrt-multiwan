@@ -1,5 +1,13 @@
 # Release Notes
 
+## v1.0.6
+
+QoS fixes package dependency detection for fresh installs using the nftables-json flavor.
+
+- Treats `nftables-json` as satisfying the `nftables` runtime dependency.
+- Allows installs where the package manager provides the `nft` command through the JSON-capable nftables package.
+- Keeps the existing dependency list and install behavior compatible with systems that use plain `nftables`.
+
 ## v1.0.5
 
 Adds opt-in download IFB link-layer accounting and a conservative GPON VLAN preset.

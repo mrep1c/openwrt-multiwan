@@ -6,7 +6,7 @@ STOP=99
 
 USE_PROCD=1
 
-VERSION="1.0.5"
+VERSION="1.0.6"
 UPD_CHANNEL="release"
 
 . "${IPKG_INSTROOT}/lib/multiwan-qos/process-lock.sh"
@@ -1557,18 +1557,46 @@ check_pkg_manager() {
     esac
 }
 
+# Packages that may be provided by a flavor with a different installed name.
+package_aliases() {
+    case "$1" in
+        nftables)
+            echo "nftables-json"
+            ;;
+    esac
+}
+
+package_command_satisfied() {
+    case "$1" in
+        nftables)
+            check_util nft
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # Check if a package is installed
 check_package() {
-    local pkg="$1"
+    local pkg="$1" alt
     
     case "$pkg_manager" in
         "apk")
-            apk info -e "$pkg" >/dev/null 2>&1
-            return $?
+            apk info -e "$pkg" >/dev/null 2>&1 && return 0
+            for alt in $(package_aliases "$pkg"); do
+                apk info -e "$alt" >/dev/null 2>&1 && return 0
+            done
+            package_command_satisfied "$pkg" && return 0
+            return 1
             ;;
         "opkg")
-            opkg list-installed | grep -q "^$pkg "
-            return $?
+            opkg list-installed | grep -q "^$pkg " && return 0
+            for alt in $(package_aliases "$pkg"); do
+                opkg list-installed | grep -q "^$alt " && return 0
+            done
+            package_command_satisfied "$pkg" && return 0
+            return 1
             ;;
         *)
             return 1
