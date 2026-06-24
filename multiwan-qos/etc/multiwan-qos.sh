@@ -14,8 +14,12 @@ IFS="$DEFAULT_IFS"
 : "${VERSION}" "${global_enabled:=}" "${nongameqdisc:=}" "${nongameqdiscoptions:=}" "${OVERHEAD:=}"
 : "${gameqdisc:=pfifo}" "${nongameqdisc:=fq_codel}" "${ACK_FILTER_EGRESS:=auto}"
 : "${DOWNLOAD_IFB_STAB:=0}"
+: "${DISABLE_QOS_OFFLOADS:=1}"
+: "${OFFLOAD_EXTRA_DEVICES:=}"
 : "${MULTIWAN_QOS_REFRESH_LOCK_DIR:=/var/run/multiwan_qos-refresh.lock}"
 : "${MULTIWAN_QOS_RESTARTING_FILE:=/tmp/multiwan_qos_restarting}"
+QOS_OFFLOAD_EXTRA_APPLIED=0
+QOS_OFFLOAD_WARNED_MISSING_ETHTOOL=0
 
 . /lib/functions.sh
 . /lib/multiwan-qos/process-lock.sh
@@ -187,6 +191,46 @@ get_cake_link_params() {
 should_apply_root_stab() {
     local dir="$1"
     [ "$dir" != "lan" ] || [ "${DOWNLOAD_IFB_STAB:-0}" = "1" ]
+}
+
+disable_qos_offload_feature() {
+    local dev="$1" feature="$2"
+    ethtool -K "$dev" "$feature" off >/dev/null 2>&1 || true
+}
+
+disable_qos_offloads() {
+    local dev="$1" role="$2" feature
+
+    [ "${DISABLE_QOS_OFFLOADS:-1}" = "1" ] || return 0
+    [ -n "$dev" ] || return 0
+
+    if ! command -v ethtool >/dev/null 2>&1; then
+        if [ "${QOS_OFFLOAD_WARNED_MISSING_ETHTOOL:-0}" -eq 0 ] 2>/dev/null; then
+            log_msg -warn "QoS offload control requested but ethtool is not installed; skipping offload changes."
+            QOS_OFFLOAD_WARNED_MISSING_ETHTOOL=1
+        fi
+        return 0
+    fi
+
+    if ! ip link show "$dev" >/dev/null 2>&1; then
+        [ "$role" = "extra" ] && log_msg -warn "QoS offload extra device $dev not found; skipping."
+        return 0
+    fi
+
+    for feature in gro gso tso rx-gro-list tx-udp-segmentation hw-tc-offload; do
+        disable_qos_offload_feature "$dev" "$feature"
+    done
+}
+
+disable_configured_extra_offloads() {
+    local dev
+
+    [ "${QOS_OFFLOAD_EXTRA_APPLIED:-0}" -eq 0 ] 2>/dev/null || return 0
+    QOS_OFFLOAD_EXTRA_APPLIED=1
+
+    for dev in $OFFLOAD_EXTRA_DEVICES; do
+        disable_qos_offloads "$dev" "extra"
+    done
 }
 
 ##############################
@@ -2455,6 +2499,8 @@ setup_interface() {
     local lan_dev="ifb-$device"
     local ifb_mq_args=""
     cleanup_interface_state "$device" "$lan_dev"
+    disable_qos_offloads "$device" "wan"
+    disable_configured_extra_offloads
 
     if [ "$qdisc" = "cake" ]; then
         local wan_tx_queues
@@ -2472,24 +2518,8 @@ setup_interface() {
     ip link set "$lan_dev" up || \
         qdisc_setup_failed "Failed to bring up IFB device $lan_dev."
 
-    # Disable segmentation/aggregation offloads for proper per-packet QoS scheduling
-    # Without this, qdiscs see super-packets (up to 64KB) instead of individual packets
-    # IFB virtual devices enable all software offloads by default â€” must explicitly disable
-    if command -v ethtool >/dev/null 2>&1; then
-        ethtool -K "$lan_dev" \
-            tso off gso off gro off \
-            rx-gro-list off \
-            tx-udp-segmentation off \
-            tx-gre-segmentation off \
-            tx-gre-csum-segmentation off \
-            tx-ipxip4-segmentation off \
-            tx-ipxip6-segmentation off \
-            tx-udp_tnl-segmentation off \
-            tx-udp_tnl-csum-segmentation off \
-            tx-sctp-segmentation off 2>/dev/null
-        # Disable GRO on WAN device to prevent aggregation before ingress qdisc
-        ethtool -K "$device" gro off rx-gro-list off 2>/dev/null
-    fi
+    # Disable segmentation/aggregation offloads for proper per-packet QoS scheduling.
+    disable_qos_offloads "$lan_dev" "ifb"
 
     # 1. Automatic Restoration (Priority 1): Restore DSCP from the Connection Mark
     # This must happen on ingress (ffff:) BEFORE the mirred redirect to carry the priority into the IFB.
@@ -2679,6 +2709,9 @@ if [ "$1" = "refresh-device" ]; then
         fi
 
         log_msg "Soft-refreshing qdisc tree for $device via $lan_dev"
+        disable_qos_offloads "$device" "wan"
+        disable_qos_offloads "$lan_dev" "ifb"
+        disable_configured_extra_offloads
         setup_interface_qdisc_direction "$lan_dev" "$download" "$game_down" "lan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu" || return 1
         apply_tc_custom_ingress_rules "$lan_dev" "$qdisc"
     }
@@ -2716,6 +2749,7 @@ fi
 
 # Check for interfaces and remove empty ones
 [ -z "$WAN_INTERFACES" ] && WAN_INTERFACES=""
+disable_configured_extra_offloads
 
 # Iterate interfaces
 config_foreach setup_interface interface

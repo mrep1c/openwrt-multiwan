@@ -15,7 +15,7 @@ define Package/multiwan-qos
   CATEGORY:=Base system
   PKGARCH:=all
   TITLE:=MultiWAN QoS - Quality of Service management tool
-  DEPENDS:=+kmod-sched +ip-full +nftables +kmod-veth +tc-full +kmod-netem +kmod-sched-ctinfo +kmod-ifb +kmod-sched-cake +kmod-sched-red +kmod-sched-flower +lua +luci-lib-jsonc +jsonfilter +uclient-fetch
+  DEPENDS:=+kmod-sched +ip-full +nftables +kmod-veth +tc-full +kmod-netem +kmod-sched-ctinfo +kmod-ifb +kmod-sched-cake +kmod-sched-red +kmod-sched-flower +lua +luci-lib-jsonc +jsonfilter +uclient-fetch +ethtool
   PROVIDES:=qosmate
   CONFLICTS:=qosmate
   REPLACES:=qosmate

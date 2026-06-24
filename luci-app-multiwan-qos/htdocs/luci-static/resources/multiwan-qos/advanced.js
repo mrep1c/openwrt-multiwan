@@ -111,6 +111,15 @@ return view.extend({
             o.rmempty = false;
             o.default = '0';
 
+            o = s.option(form.Flag, 'DISABLE_QOS_OFFLOADS', _('Disable QoS Offloads'), _('Disable GRO, GSO, TSO, rx-gro-list, tx-udp-segmentation, and hardware TC offload on managed WAN and IFB devices for accurate QoS scheduling.'));
+            o.rmempty = false;
+            o.default = '1';
+
+            o = s.option(form.Value, 'OFFLOAD_EXTRA_DEVICES', _('Extra Offload Devices'), _('Optional space-separated physical devices to apply QoS offload control to, such as PPPoE lower ports.'));
+            o.placeholder = 'eth0 eth1 eth2';
+            o.rmempty = true;
+            o.depends('DISABLE_QOS_OFFLOADS', '1');
+
             createOption('BWMAXRATIO', _('Bandwidth Max Ratio'), _('Max download/upload ratio to prevent upstream congestion'), _('Default: 20'), 'uinteger');
             // Note: ACKRATE has been moved to per-interface settings
 
