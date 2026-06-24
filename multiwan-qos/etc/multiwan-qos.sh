@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.9" # will become obsolete in future releases as version string is now in the init script
+VERSION="1.0.10" # will become obsolete in future releases as version string is now in the init script
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1
@@ -2036,20 +2036,15 @@ calculate_htb_burst() {
     echo $burst
 }
 
-# Calculate the realtime/game lane as a small reserve: 1% plus 500 kbit,
-# with a 750 kbit floor and 1500 kbit ceiling. HFSC/HTB priority handles
-# latency; this rate only needs to cover game/voice traffic plus modest overhead.
+# Calculate the realtime/game lane as a fixed small reserve. HFSC/HTB priority
+# handles latency; this rate only needs to cover game/voice traffic plus modest
+# overhead, with a slow-link cap to avoid consuming tiny connections.
 calculate_realtime_rate() {
-    local rate="$1" dir="$2" realtime min_rate max_rate cap
+    local rate="$1" dir="$2" realtime cap
 
     [ "$rate" -gt 0 ] 2>/dev/null || rate=1
 
-    realtime=$((rate / 100 + 500))
-    min_rate=750
-    [ "$realtime" -lt "$min_rate" ] && realtime=$min_rate
-
-    max_rate=1500
-    [ "$realtime" -gt "$max_rate" ] && realtime=$max_rate
+    realtime=1300
 
     # On very slow links, do not let the realtime lane consume the connection.
     cap=$((rate * 25 / 100))

@@ -6,7 +6,7 @@ STOP=99
 
 USE_PROCD=1
 
-VERSION="1.0.9"
+VERSION="1.0.10"
 UPD_CHANNEL="release"
 
 . "${IPKG_INSTROOT}/lib/multiwan-qos/process-lock.sh"
@@ -164,21 +164,11 @@ is_package_script_context() {
 }
 
 calculate_realtime_rate_default() {
-    local rate="$1" dir="$2" realtime min_rate max_rate cap
+    local rate="$1" dir="$2" realtime cap
 
     [ "$rate" -gt 0 ] 2>/dev/null || rate=1
 
-    realtime=$((rate * 2 / 100 + 300))
-    if [ "$dir" = "wan" ]; then
-        min_rate=768
-        max_rate=2000
-    else
-        min_rate=1024
-        max_rate=3000
-    fi
-
-    [ "$realtime" -lt "$min_rate" ] && realtime=$min_rate
-    [ "$realtime" -gt "$max_rate" ] && realtime=$max_rate
+    realtime=1300
 
     cap=$((rate * 25 / 100))
     [ "$cap" -lt 1 ] && cap=1

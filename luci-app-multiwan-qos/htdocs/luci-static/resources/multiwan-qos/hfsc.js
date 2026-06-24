@@ -177,8 +177,8 @@ return view.extend({
         o.value('netem', _('NETEM'));
         o.default = 'pfifo';
 
-        createOption('GAMEUP', _('Game Upload Override (kbps)'), _('Optional realtime upload reserve. Leave empty to calculate automatically.'), _('Auto: 1% of upload + 500, minimum 750, capped at 1500 and 25% of link'), 'uinteger');
-        createOption('GAMEDOWN', _('Game Download Override (kbps)'), _('Optional realtime download reserve. Leave empty to calculate automatically.'), _('Auto: 1% of download + 500, minimum 750, capped at 1500 and 25% of link'), 'uinteger');
+        createOption('GAMEUP', _('Game Upload Override (kbps)'), _('Optional realtime upload reserve. Leave empty to calculate automatically.'), _('Auto: fixed 1300, capped at 25% of link'), 'uinteger');
+        createOption('GAMEDOWN', _('Game Download Override (kbps)'), _('Optional realtime download reserve. Leave empty to calculate automatically.'), _('Auto: fixed 1300, capped at 25% of link'), 'uinteger');
 
         o = s.option(form.ListValue, 'nongameqdisc', _('Non-Game Queue Discipline'), 
             addRelevanceInfo(_('Select the queueing discipline for non-realtime traffic'), 'nongameqdisc', rootQdisc, gameqdisc));

@@ -1,5 +1,14 @@
 # Release Notes
 
+## v1.0.10
+
+QoS refines realtime game queue latency after the low-rate burst-floor regression.
+
+- Makes finite realtime queues delay-budgeted so BFIFO and RED no longer force a fixed 4500 byte floor on low-rate links.
+- Treats MAXDEL as the stale-packet budget for BFIFO, RED, DRR/QFQ RED leaves, PFIFO, and NETEM fallback sizing.
+- Sets the automatic realtime reserve to a fixed 1300 kbit, capped at 25% of link rate for very slow connections.
+- Keeps manual GAMEUP and GAMEDOWN overrides authoritative for users who need a wider realtime lane.
+
 ## v1.0.9
 
 QoS adds managed offload control for accurate shaping across restarts.
