@@ -1,5 +1,13 @@
 # Release Notes
 
+## v1.0.8
+
+QoS adds adaptive realtime game lane sizing for lower-speed links and PC-agent gameplay.
+
+- Changes automatic game/realtime reserves to 1% of rate plus 500 kbit, with a 1000 kbit floor, 3000 kbit ceiling, and 25% slow-link cap.
+- Adds minimum burst floors for finite realtime qdiscs so BFIFO, PFIFO, RED, DRR/QFQ, and NETEM do not create tiny low-rate drop buckets.
+- Keeps manual GAMEUP and GAMEDOWN overrides authoritative.
+
 ## v1.0.7
 
 QoS cleans up first-install behavior and official package integrity checks.
