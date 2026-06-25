@@ -177,8 +177,8 @@ return view.extend({
         o.value('netem', _('NETEM'));
         o.default = 'pfifo';
 
-        createOption('GAMEUP', _('Game Upload Override (kbps)'), _('Optional realtime upload reserve. Leave empty to calculate automatically.'), _('Auto: fixed 1300, capped at 25% of link'), 'uinteger');
-        createOption('GAMEDOWN', _('Game Download Override (kbps)'), _('Optional realtime download reserve. Leave empty to calculate automatically.'), _('Auto: fixed 1300, capped at 25% of link'), 'uinteger');
+        createOption('GAMEUP', _('Game Upload Reserve Override (kbps)'), _('Optional realtime upload bandwidth reserve. Leave empty to use auto 1300 kbit, capped at 25% of very slow links. Tune MAXDEL first when hit registration feels late.'), _('Default: auto'), 'uinteger');
+        createOption('GAMEDOWN', _('Game Download Reserve Override (kbps)'), _('Optional realtime download bandwidth reserve. Leave empty to use auto 1300 kbit, capped at 25% of very slow links. Tune MAXDEL first when hit registration feels late.'), _('Default: auto'), 'uinteger');
 
         o = s.option(form.ListValue, 'nongameqdisc', _('Non-Game Queue Discipline'), 
             addRelevanceInfo(_('Select the queueing discipline for non-realtime traffic'), 'nongameqdisc', rootQdisc, gameqdisc));
@@ -187,7 +187,7 @@ return view.extend({
         o.default = 'fq_codel';
 
         createOption('nongameqdiscoptions', _('Non-Game QDisc Options'), _('Cake options for non-realtime queueing discipline'), _('Default: besteffort ack-filter'));
-        createOption('MAXDEL', _('Max Delay (ms)'), _('Realtime stale-packet budget for finite game qdiscs. Lower values reduce hit-reg delay but may allow drops under bursty marking.'), _('Default: 24'), 'uinteger');
+        createOption('MAXDEL', _('Realtime Stale Packet Budget (ms)'), _('Controls how long finite game queues may hold realtime packets before dropping excess. Lower values feel sharper; try 16 ms for sharp, 20 ms for balanced, or 24 ms for burstier marking.'), _('Default: 24'), 'uinteger');
         createOption('PFIFOMIN', _('PFIFO Min'), _('Minimum packet count for PFIFO queue'), _('Default: 5'), 'uinteger');
         createOption('PACKETSIZE', _('Avg Packet Size (B)'), _('Used with PFIFOMIN to calculate PFIFO limit'), _('Default: 450'), 'uinteger');
         createOption('netemdelayms', _('NETEM Delay (ms)'), _('NETEM delay in milliseconds'), _('Default: 30'), 'uinteger');

@@ -1,5 +1,14 @@
 # Release Notes
 
+## v1.0.11
+
+QoS clarifies HFSC realtime tuning without changing qdisc behavior.
+
+- Updates LuCI HFSC labels and help to distinguish realtime bandwidth reserve overrides from the MAXDEL stale-packet budget.
+- Documents MAXDEL guidance: 16 ms for sharper hit registration, 20 ms for balanced tuning, and 24 ms for burstier marking.
+- Keeps the current 1300 kbit automatic realtime reserve, delay-budgeted finite queues, and manual GAMEUP/GAMEDOWN overrides unchanged.
+- Confirms the shared realtime queue sizing path applies to both HFSC and Hybrid.
+
 ## v1.0.10
 
 QoS refines realtime game queue latency after the low-rate burst-floor regression.
