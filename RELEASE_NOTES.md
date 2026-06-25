@@ -1,5 +1,13 @@
 # Release Notes
 
+## v1.0.12
+
+QoS fixes avoidable Hybrid mode throughput loss.
+
+- Removes the extra 95% CAKE child reduction in Hybrid after subtracting the realtime game reserve.
+- Keeps Hybrid root HFSC shaping at the configured per-interface rate while setting the CAKE child to `RATE - GAMERATE`.
+- Leaves pure CAKE, HFSC, HTB, link-layer overhead, IFB STAB, offload control, and MAXDEL queue behavior unchanged.
+
 ## v1.0.11
 
 QoS clarifies HFSC realtime tuning without changing qdisc behavior.

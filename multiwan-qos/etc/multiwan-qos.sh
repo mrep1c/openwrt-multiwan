@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.11" # will become obsolete in future releases as version string is now in the init script
+VERSION="1.0.12" # will become obsolete in future releases as version string is now in the init script
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1
@@ -1927,7 +1927,6 @@ setup_hybrid() {
 
     # Class 1:13 - CAKE class (most traffic - default)
     local cake_rate=$((RATE - GAMERATE)); [ "$cake_rate" -le 0 ] && cake_rate=1
-    local cake_shaper_rate="$(calculate_cake_shaper_rate "$cake_rate")"
     tc class add dev "$DEV" parent 1:1 classid 1:13 hfsc ls m1 "${cake_rate}kbit" d "${DUR}ms" m2 "${cake_rate}kbit"
 
     # Attach CAKE qdisc - use "hybrid" mode to match HFSC overhead
@@ -1937,13 +1936,13 @@ setup_hybrid() {
     
     # shellcheck disable=SC2086
     if [ "$DIR" = "wan" ]; then
-        CAKE_OPTS="bandwidth ${cake_shaper_rate}kbit besteffort" # Leave headroom under the HFSC child class.
+        CAKE_OPTS="bandwidth ${cake_rate}kbit besteffort"
         append_cake_opt "dual-srchost" "$HOST_ISOLATION" &&
         append_cake_opt "$EXTRA_PARAMETERS_EGRESS" "1" &&
         append_cake_opt "nat" "$NAT_EGRESS" &&
         append_cake_opt "wash" "$WASHDSCPUP"
     else # lan (ingress)
-        CAKE_OPTS="bandwidth ${cake_shaper_rate}kbit besteffort ingress" # Leave headroom under the HFSC child class.
+        CAKE_OPTS="bandwidth ${cake_rate}kbit besteffort ingress"
         append_cake_opt "dual-dsthost" "$HOST_ISOLATION" &&
         append_cake_opt "$EXTRA_PARAMETERS_INGRESS" "1" &&
         append_cake_opt "nat" "$NAT_INGRESS" &&
@@ -2052,14 +2051,6 @@ calculate_realtime_rate() {
     [ "$realtime" -gt "$cap" ] && realtime=$cap
 
     echo "$realtime"
-}
-
-calculate_cake_shaper_rate() {
-    local rate="$1" shaper
-    [ "$rate" -gt 0 ] 2>/dev/null || rate=1
-    shaper=$((rate * 95 / 100))
-    [ "$shaper" -lt 1 ] && shaper=1
-    echo "$shaper"
 }
 
 # Function to setup HTB qdisc (simple.qos style with 3 classes)
