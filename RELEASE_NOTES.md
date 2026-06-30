@@ -1,5 +1,14 @@
 # Release Notes
 
+## v1.0.13
+
+QoS fix for Hybrid CAKE child queueing.
+
+- Removes the nested CAKE bandwidth shaper from Hybrid default classes so HFSC remains the only shaper.
+- Matches QoSmate's working Hybrid pattern: unshaped CAKE child leaves with `besteffort` on upload and `besteffort ingress` on download.
+- Prevents Hybrid download IFB CAKE children from building stale queues during many-flow downloads such as Steam.
+- Keeps pure CAKE, HFSC, HTB, link-layer presets, realtime queue sizing, and lifecycle tests unchanged.
+
 ## v1.0.12
 
 QoS fixes avoidable Hybrid mode throughput loss.

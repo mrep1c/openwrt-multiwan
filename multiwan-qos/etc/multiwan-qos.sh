@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.12" # will become obsolete in future releases as version string is now in the init script
+VERSION="1.0.13" # will become obsolete in future releases as version string is now in the init script
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1
@@ -1929,20 +1929,21 @@ setup_hybrid() {
     local cake_rate=$((RATE - GAMERATE)); [ "$cake_rate" -le 0 ] && cake_rate=1
     tc class add dev "$DEV" parent 1:1 classid 1:13 hfsc ls m1 "${cake_rate}kbit" d "${DUR}ms" m2 "${cake_rate}kbit"
 
-    # Attach CAKE qdisc - use "hybrid" mode to match HFSC overhead
+    # Attach CAKE as a work-conserving leaf. HFSC owns shaping in Hybrid; a
+    # shaped CAKE child can become non-work-conserving and build stale queues.
     local cake_link_params="$(get_cake_link_params "$PRESET" "$OVERHEAD" "$MPU" "hybrid")"
     local CAKE_OPTS=""
     tc qdisc del dev "$DEV" parent 1:13 handle 13: > /dev/null 2>&1
     
     # shellcheck disable=SC2086
     if [ "$DIR" = "wan" ]; then
-        CAKE_OPTS="bandwidth ${cake_rate}kbit besteffort"
+        CAKE_OPTS="besteffort"
         append_cake_opt "dual-srchost" "$HOST_ISOLATION" &&
         append_cake_opt "$EXTRA_PARAMETERS_EGRESS" "1" &&
         append_cake_opt "nat" "$NAT_EGRESS" &&
         append_cake_opt "wash" "$WASHDSCPUP"
     else # lan (ingress)
-        CAKE_OPTS="bandwidth ${cake_rate}kbit besteffort ingress"
+        CAKE_OPTS="besteffort ingress"
         append_cake_opt "dual-dsthost" "$HOST_ISOLATION" &&
         append_cake_opt "$EXTRA_PARAMETERS_INGRESS" "1" &&
         append_cake_opt "nat" "$NAT_INGRESS" &&
