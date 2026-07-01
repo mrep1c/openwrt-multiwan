@@ -1,5 +1,14 @@
 # Release Notes
 
+## v1.0.14
+
+QoS adjusts Hybrid shaping and realtime tuning after Steam/download testing.
+
+- Adds a 98% outer HFSC shaper in Hybrid so the root keeps modest headroom while CAKE children remain work-conserving.
+- Raises the automatic realtime/game reserve from 1300 kbit to 1500 kbit, still capped at 25% on very slow links.
+- Updates LuCI HFSC guidance for realtime reserve overrides and the MAXDEL stale-packet budget.
+- Keeps pure CAKE, pure HFSC, HTB, link-layer presets, offload control, and manual GAMEUP/GAMEDOWN overrides unchanged.
+
 ## v1.0.13
 
 QoS fix for Hybrid CAKE child queueing.

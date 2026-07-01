@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.13" # will become obsolete in future releases as version string is now in the init script
+VERSION="1.0.14" # will become obsolete in future releases as version string is now in the init script
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1
@@ -1896,10 +1896,11 @@ debug_log "INGRESS cake opts: '$CAKE_OPTS'"
 setup_hybrid() {
     local DEV="$1" RATE="$2" GAMERATE="$3" DIR="$4" PRESET="$5" OVERHEAD="$6" MPU="$7"
     local MTU="${8:-1500}"
+    local SHAPER_RATE=$((RATE * 98 / 100)); [ "$SHAPER_RATE" -le 0 ] && SHAPER_RATE=1
 
     # Calculate parameters
-    local DUR=$((5*MTU*8/RATE)); [ "$DUR" -lt 25 ] && DUR=25
-    local gameburst=$((GAMERATE*10)); [ "$gameburst" -gt $((RATE*97/100)) ] && gameburst=$((RATE*97/100));
+    local DUR=$((5*MTU*8/SHAPER_RATE)); [ "$DUR" -lt 25 ] && DUR=25
+    local gameburst=$((GAMERATE*10)); [ "$gameburst" -gt $((SHAPER_RATE*97/100)) ] && gameburst=$((SHAPER_RATE*97/100));
 
     # Setup root HFSC qdisc (default to 1:13 - CAKE class)
     local TC_OH_PARAMS
@@ -1916,7 +1917,7 @@ setup_hybrid() {
     fi
 
     # Main link class
-    tc class add dev "$DEV" parent 1: classid 1:1 hfsc ls m2 "${RATE}kbit" ul m2 "${RATE}kbit"
+    tc class add dev "$DEV" parent 1: classid 1:1 hfsc ls m2 "${SHAPER_RATE}kbit" ul m2 "${SHAPER_RATE}kbit"
 
     # Class 1:11 - High priority realtime (HFSC RT + gameqdisc)
     tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${gameburst}kbit" d "${DUR}ms" m2 "${GAMERATE}kbit"
@@ -1926,7 +1927,7 @@ setup_hybrid() {
                      "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp"
 
     # Class 1:13 - CAKE class (most traffic - default)
-    local cake_rate=$((RATE - GAMERATE)); [ "$cake_rate" -le 0 ] && cake_rate=1
+    local cake_rate=$((SHAPER_RATE - GAMERATE)); [ "$cake_rate" -le 0 ] && cake_rate=1
     tc class add dev "$DEV" parent 1:1 classid 1:13 hfsc ls m1 "${cake_rate}kbit" d "${DUR}ms" m2 "${cake_rate}kbit"
 
     # Attach CAKE as a work-conserving leaf. HFSC owns shaping in Hybrid; a
@@ -1958,14 +1959,14 @@ debug_log "$DIR HYBRID cake opts: '$CAKE_OPTS'"
 
     # Class 1:15 - Bulk traffic (HFSC LS + fq_codel)
     # Use HFSC limits: m1 3%, m2 10%
-    local bulk_rate_m1=$((RATE*3/100)); [ "$bulk_rate_m1" -le 0 ] && bulk_rate_m1=1
-    local bulk_rate_m2=$((RATE*10/100)); [ "$bulk_rate_m2" -le 0 ] && bulk_rate_m2=1
+    local bulk_rate_m1=$((SHAPER_RATE*3/100)); [ "$bulk_rate_m1" -le 0 ] && bulk_rate_m1=1
+    local bulk_rate_m2=$((SHAPER_RATE*10/100)); [ "$bulk_rate_m2" -le 0 ] && bulk_rate_m2=1
     tc class add dev "$DEV" parent 1:1 classid 1:15 hfsc ls m1 "${bulk_rate_m1}kbit" d "${DUR}ms" m2 "${bulk_rate_m2}kbit"
     # Attach fq_codel (using calculations and options from HFSC config)
-    local INTVL=$((100+2*MTU*8/RATE))
-    local TARG=$((540*8/RATE+4))
+    local INTVL=$((100+2*MTU*8/SHAPER_RATE))
+    local TARG=$((540*8/SHAPER_RATE+4))
     tc qdisc del dev "$DEV" parent 1:15 handle 15: > /dev/null 2>&1
-    tc qdisc replace dev "$DEV" parent 1:15 handle 15: fq_codel memory_limit "$(fq_codel_memory_limit "$RATE")" interval "${INTVL}ms" target "${TARG}ms" quantum $((MTU * 2))
+    tc qdisc replace dev "$DEV" parent 1:15 handle 15: fq_codel memory_limit "$(fq_codel_memory_limit "$SHAPER_RATE")" interval "${INTVL}ms" target "${TARG}ms" quantum $((MTU * 2))
 
     # Apply DSCP Filters (on ingress always, on egress only when SFO active)
     if [ "$DIR" = "lan" ] || [ "$SFO_ENABLED" = "1" ]; then
@@ -2044,7 +2045,7 @@ calculate_realtime_rate() {
 
     [ "$rate" -gt 0 ] 2>/dev/null || rate=1
 
-    realtime=1300
+    realtime=1500
 
     # On very slow links, do not let the realtime lane consume the connection.
     cap=$((rate * 25 / 100))
@@ -2568,7 +2569,7 @@ setup_interface() {
             setup_interface_qdisc_direction "$lan_dev" "$download" 0 "lan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu"
             ;;
         hybrid)
-            print_msg "  Applying Hybrid (UL: ${upload}k, DL: ${download}k, game UL/DL: ${game_up}k/${game_down}k, MTU: ${dev_mtu})"
+            print_msg "  Applying Hybrid (UL: ${upload}k -> $((upload * 98 / 100))k, DL: ${download}k -> $((download * 98 / 100))k, game UL/DL: ${game_up}k/${game_down}k, MTU: ${dev_mtu})"
             setup_interface_qdisc_direction "$device" "$upload" "$game_up" "wan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu"
             setup_interface_qdisc_direction "$lan_dev" "$download" "$game_down" "lan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu"
             ;;
