@@ -54,8 +54,7 @@ report_policies() {
 		# Only one interface or special policy (blackhole/default/unreachable)
 		local comment=$(echo "$chain_output" | sed -n 's/.*comment "\([^"]*\)".*/\1/p' | head -1)
 		
-		# If comment is simple (e.g. "default"), do nothing?
-		# Original code seems to loop for interfaces.
+		# Single-interface policy comments have the form "interface weight weight".
 		# If it's a single interface policy, the comment format is "interface weight weight"
 		if [ -n "$comment" ]; then
 			iface=$(echo "$comment" | awk '{print $1}')
@@ -85,24 +84,47 @@ report_policies_v6() {
 	report_policies_v4
 }
 
+track_file_value() {
+	local iface="$1"
+	local name="$2"
+	local default="${3:-}"
+	local value
+
+	value="$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/${name}" 2>/dev/null)"
+	[ -n "$value" ] && printf '%s\n' "$value" || printf '%s\n' "$default"
+}
+
+track_file_int() {
+	local value
+	value="$(track_file_value "$1" "$2" "${3:-0}")"
+	case "$value" in
+		""|*[!0-9]*) value="${3:-0}" ;;
+	esac
+	printf '%s\n' "$value"
+}
+
 get_age() {
-	local time_p time_u
+	local time_p time_n
 	iface="$1"
-	time_p="$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/TIME")"
-	[ -z "${time_p}" ] || {
+	time_p="$(track_file_int "$iface" TIME 0)"
+	if [ "$time_p" -gt 0 ]; then
 		time_n="$(get_uptime)"
 		echo $((time_n-time_p))
-	}
+	else
+		echo 0
+	fi
 }
 
 get_offline_time() {
 	local time_n time_d iface
 	iface="$1"
-	time_d="$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/OFFLINE")"
-	[ -z "${time_d}" ] || [ "${time_d}" = "0" ] || {
+	time_d="$(track_file_int "$iface" OFFLINE 0)"
+	if [ "$time_d" -gt 0 ]; then
 		time_n="$(get_uptime)"
 		echo $((time_n-time_d))
-	}
+	else
+		echo 0
+	fi
 }
 
 get_multiwan_nft_status() {
@@ -145,9 +167,9 @@ get_multiwan_nft_status() {
 	json_add_int online "${online}"
 	json_add_int offline "${offline}"
 	json_add_int uptime "${uptime}"
-	json_add_int "score" "$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/SCORE")"
-	json_add_int "lost" "$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/LOST")"
-	json_add_int "turn" "$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/TURN")"
+	json_add_int "score" "$(track_file_int "$iface" SCORE 0)"
+	json_add_int "lost" "$(track_file_int "$iface" LOST 0)"
+	json_add_int "turn" "$(track_file_int "$iface" TURN 0)"
 	json_add_string "status" "${status}"
 	json_add_boolean "enabled" "${enabled}"
 	json_add_boolean "running" "${running}"
@@ -159,9 +181,9 @@ get_multiwan_nft_status() {
 		track="${file#*/TRACK_}"
 		json_add_object
 		json_add_string ip "${track}"
-		json_add_string status "$(cat "${file}")"
-		json_add_int latency "$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/LATENCY_${track}")"
-		json_add_int packetloss "$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/LOSS_${track}")"
+		json_add_string status "$(track_file_value "$iface" "TRACK_${track}" unknown)"
+		json_add_int latency "$(track_file_int "$iface" "LATENCY_${track}" 0)"
+		json_add_int packetloss "$(track_file_int "$iface" "LOSS_${track}" 0)"
 		json_close_object
 	done
 	json_close_array

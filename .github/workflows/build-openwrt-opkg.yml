@@ -207,15 +207,14 @@ jobs:
           TAG: ${{ matrix.release_tag }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release view "$TAG" --json assets --jq '.assets[].name' |
-              while IFS= read -r asset; do
-                [ -n "$asset" ] || continue
-                gh release delete-asset "$TAG" "$asset" -y || true
-              done
+            gh release edit "$TAG" \
+              --target "$GITHUB_SHA" \
+              --notes-file dist/RELEASE_NOTES.txt
             gh release upload "$TAG" dist/*.ipk dist/Packages dist/Packages.gz dist/Packages.sig dist/mrep1c-openwrt-multiwan-opkg.pub --clobber
             [ -f dist/Packages.manifest ] && gh release upload "$TAG" dist/Packages.manifest --clobber || true
           else
             gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
               --title "OpenWrt ${{ matrix.openwrt_release }} architecture-independent OPKG feed" \
               --notes-file dist/RELEASE_NOTES.txt
             gh release upload "$TAG" dist/*.ipk dist/Packages dist/Packages.gz dist/Packages.sig dist/mrep1c-openwrt-multiwan-opkg.pub --clobber

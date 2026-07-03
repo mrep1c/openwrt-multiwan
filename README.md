@@ -174,7 +174,7 @@ Windows agent:
 apk info -e multiwan-nft multiwan-qos
 /etc/init.d/multiwan-nft status
 /etc/init.d/multiwan-qos health_check
-nft list table inet mwan3
+nft list table inet multiwan_nft
 nft list table inet dscptag
 tc -s qdisc show
 ```
@@ -226,7 +226,7 @@ If MultiWAN NFT does not create rules, run:
 ```sh
 /etc/init.d/multiwan-nft restart
 /etc/init.d/multiwan-nft status
-nft list table inet mwan3
+nft list table inet multiwan_nft
 ```
 
 ## Uninstall
@@ -249,6 +249,7 @@ sh /tmp/setup-multiwan-feed.sh remove
 
 ## Binary Notes
 
-The public router feeds are architecture-independent and do not ship the
-optional MultiWAN NFT sockopt wrapper library. The source file remains in the
-package source for SDK users who want to build target-specific packages.
+The public router feeds are architecture-independent and do not ship
+`libwrap_mwan3_sockopt.so`. The C source remains in the tree for future
+target-specific wrapper work, but the packaged runtime uses native interface
+binding.

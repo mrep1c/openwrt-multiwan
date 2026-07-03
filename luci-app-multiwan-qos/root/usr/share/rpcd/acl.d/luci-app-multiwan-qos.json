@@ -4,21 +4,19 @@
         "read": {
             "ubus": {
                 "luci.multiwan_qos": [ "getConntrackDSCP", "getAgentStatus" ],
-                "luci.multiwan_qos_stats": [ "getStats", "getHistoricalStats", "getRrdData", "getRuleCounters" ],
-                "luci": [ "getInitList", "setInitAction", "getInitActionStatus", "exec" ]
+                "luci.multiwan_qos_stats": [ "getStats", "getRuleCounters" ],
+                "luci": [ "getInitList", "getInitActionStatus" ]
             },
             "uci": [ "multiwan-qos" ],
             "file": {
                 "/etc/multiwan-qos.sh": [ "read" ],         
-                "/etc/init.d/multiwan-qos": [ "read", "exec" ],
+                "/etc/init.d/multiwan-qos": [ "read" ],
                 "/etc/hotplug.d/iface/13-multiwan-qos-hotplug": [ "read" ],
                 "/etc/config/multiwan-qos": [ "read" ],   
                 "/tmp/multiwan_qos_auto_setup_output.txt": [ "read" ],
                 "/etc/multiwan-qos.d/custom_rules.nft": [ "read" ],
                 "/etc/multiwan-qos.d/inline_dscptag.nft": [ "read" ],
-                "/tmp/multiwan_qos_custom_rules_validation.txt": [ "read" ],
-                "/tmp/multiwan_qos_stats_history.json": [ "read" ],
-                "/usr/sbin/nft": [ "exec" ]
+                "/tmp/multiwan_qos_custom_rules_validation.txt": [ "read" ]
             }
         },
         "write": {
@@ -27,9 +25,8 @@
             },
             "uci": [ "multiwan-qos" ],
             "file": {
-                "/etc/multiwan-qos.sh": [ "write" ],
-                "/etc/init.d/multiwan-qos": [ "write" ],                   
-                "/etc/hotplug.d/iface/13-multiwan-qos-hotplug": [ "write" ],
+                "/etc/init.d/multiwan-qos": [ "exec" ],
+                "/usr/sbin/nft": [ "exec" ],
                 "/etc/multiwan-qos.d/custom_rules.nft": [ "write" ],
                 "/etc/multiwan-qos.d/inline_dscptag.nft": [ "write" ]   
             }

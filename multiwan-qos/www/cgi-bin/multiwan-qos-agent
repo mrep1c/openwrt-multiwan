@@ -896,12 +896,6 @@ local function main()
         return
     end
 
-    -- Rate limit
-    if not check_rate_limit() then
-        send_response(429, "Too many requests")
-        return
-    end
-
     -- Read request body
     local content_length = tonumber(os.getenv("CONTENT_LENGTH") or "0")
     if content_length <= 0 or content_length > 8192 then
@@ -931,6 +925,12 @@ local function main()
 
     if not constant_time_compare(data.api_key, expected_key) then
         send_response(401, "Invalid API key")
+        return
+    end
+
+    -- Rate limit only authenticated clients so bad keys cannot starve the agent.
+    if not check_rate_limit() then
+        send_response(429, "Too many requests")
         return
     end
 

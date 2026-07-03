@@ -38,7 +38,6 @@ return view.extend({
                     content = content.replace(/}\s*$/, '');
                     return content.trim();
                 })
-                // FIX: Improved error handling - log errors instead of silently swallowing (Bug #7)
                 .catch(err => {
                     console.error('Failed to read custom rules:', err);
                     return '';
@@ -58,6 +57,25 @@ return view.extend({
 
     render: function([customRules, inlineRules, validationResult]) {
         var m, s, o;
+
+        function renderValidationResult(value) {
+            var wrapper = E('div', {
+                'class': 'cbi-section-node',
+                'style': 'margin-top: 8px; min-width: 700px;'
+            });
+
+            if (!value) {
+                wrapper.appendChild(document.createTextNode(_('No validation performed yet')));
+                return wrapper;
+            }
+
+            var pre = E('pre', {
+                'style': 'background:rgba(255,255,255,0.1); border:1px solid rgba(128,128,128,0.3); padding:6px; margin:4px 0; border-radius:3px; font-size:11px; white-space:pre-wrap; font-family:monospace;'
+            });
+            pre.textContent = value;
+            wrapper.appendChild(pre);
+            return wrapper;
+        }
 
         m = new form.Map('multiwan-qos', _('MultiWAN QoS Custom Rules'),
             _('Define custom nftables rules for advanced traffic control.'));
@@ -201,12 +219,9 @@ ${formvalue.trim()}
         };
 
         o = s.option(form.DummyValue, '_validation_result', _('Validation Result'));
-        o.rawhtml = true;
-        o.default = validationResult
-            ? '<div class="cbi-section-node" style="margin-top: 8px; min-width: 700px;">' +
-                '<pre style="background:rgba(255,255,255,0.1); border:1px solid rgba(128,128,128,0.3); padding:6px; margin:4px 0; border-radius:3px; font-size:11px; white-space:pre-wrap; font-family:monospace;">' +
-                validationResult + '</pre></div>'
-            : _('No validation performed yet');
+        o.renderWidget = function() {
+            return renderValidationResult(validationResult);
+        };
 
         o = s.option(form.Button, '_validate', _('Validate Rules'));
         o.inputstyle = 'apply';
@@ -250,12 +265,9 @@ ${formvalue.trim()}
                     }
                     var validationResultElement = document.getElementById('cbid.multiwan_qos.custom_rules._validation_result');
                     if (validationResultElement) {
-                        // FIX: Use textContent instead of innerHTML to prevent XSS attacks (Bug #1)
-                        validationResultElement.innerHTML = '<div class="cbi-section-node" style="margin-top: 8px; min-width: 700px;"></div>';
-                        var pre = document.createElement('pre');
-                        pre.style.cssText = 'background:rgba(255,255,255,0.1); border:1px solid rgba(128,128,128,0.3); padding:6px; margin:4px 0; border-radius:3px; font-size:11px; white-space:pre-wrap; font-family:monospace;';
-                        pre.textContent = result;
-                        validationResultElement.firstChild.appendChild(pre);
+                        while (validationResultElement.firstChild)
+                            validationResultElement.removeChild(validationResultElement.firstChild);
+                        validationResultElement.appendChild(renderValidationResult(result));
                     }
                     ui.showModal(_('Finalizing Validation'), [
                         E('p', { 'class': 'spinning' }, _('Finalizing validation results, please wait...'))
@@ -286,10 +298,10 @@ ${formvalue.trim()}
                 var button = event.target;
                 if (element.style.display === 'none') {
                     element.style.display = 'block';
-                    button.innerHTML = '▲ ' + button.innerHTML.split(' ').slice(1).join(' ');
+                    button.textContent = '▲ ' + button.textContent.split(' ').slice(1).join(' ');
                 } else {
                     element.style.display = 'none';
-                    button.innerHTML = '▼ ' + button.innerHTML.split(' ').slice(1).join(' ');
+                    button.textContent = '▼ ' + button.textContent.split(' ').slice(1).join(' ');
                 }
             };
         }

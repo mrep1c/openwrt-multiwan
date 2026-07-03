@@ -158,15 +158,14 @@ jobs:
           TAG: ${{ env.RELEASE_TAG }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release view "$TAG" --json assets --jq '.assets[].name' |
-              while IFS= read -r asset; do
-                [ -n "$asset" ] || continue
-                gh release delete-asset "$TAG" "$asset" -y || true
-              done
+            gh release edit "$TAG" \
+              --target "$GITHUB_SHA" \
+              --notes-file dist/RELEASE_NOTES.txt
             gh release upload "$TAG" dist/*.apk dist/mrep1c-openwrt-multiwan-apk.pem --clobber
             gh release upload "$TAG" dist/packages.adb --clobber
           else
             gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
               --title "OpenWrt $OPENWRT_RELEASE architecture-independent APK feed" \
               --notes-file dist/RELEASE_NOTES.txt
             gh release upload "$TAG" dist/*.apk dist/mrep1c-openwrt-multiwan-apk.pem --clobber

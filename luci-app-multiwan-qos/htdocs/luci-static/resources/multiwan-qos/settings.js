@@ -8,7 +8,7 @@
 'require poll';
 'require tools.widgets as widgets';
 
-const UI_VERSION = '1.0.14';
+const UI_VERSION = '1.0.15';
 const UI_UPD_CHANNEL = 'release';
 
 var callInitAction = rpc.declare({
@@ -46,8 +46,6 @@ function createStatusText(status, text) {
 
 var healthCheckData = null;
 var agentStatusData = null;
-// FIX: Removed duplicate versionInfo declaration (Bug #6)
-// versionInfo is no longer used in this version
 
 
 return view.extend({
@@ -81,7 +79,6 @@ return view.extend({
             uci.load('firewall'),
             this.fetchHealthCheck(),
             this.fetchAgentStatus()
-            // FIX: Removed duplicate fetchHealthCheck() call (Bug #4)
         ]).catch(error => {
             console.error('Error in load function:', error);
             ui.addNotification(null, E('p', _('Error loading initial data: %s').format(error.message || error)), 'error');

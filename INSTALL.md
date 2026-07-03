@@ -182,7 +182,7 @@ START_SERVICES=1 sh /tmp/install-multiwan.sh main
 apk info -e multiwan-nft multiwan-qos
 /etc/init.d/multiwan-nft status
 /etc/init.d/multiwan-qos health_check
-nft list table inet mwan3
+nft list table inet multiwan_nft
 nft list table inet dscptag
 tc -s qdisc show
 ```

@@ -2,7 +2,7 @@
 set -eu
 
 usage() {
-	printf 'Usage: %s <version> [release] [notes-file]\n' "$0" >&2
+	printf 'Usage: %s [--component all|nft|qos] <version> [release] [notes-file]\n' "$0" >&2
 	exit 2
 }
 
@@ -11,7 +11,18 @@ die() {
 	exit 1
 }
 
+component="all"
+if [ "${1:-}" = "--component" ]; then
+	[ "$#" -ge 3 ] || usage
+	component="$2"
+	shift 2
+fi
+
 [ "$#" -ge 1 ] && [ "$#" -le 3 ] || usage
+case "$component" in
+	all|nft|qos) ;;
+	*) die "invalid component: $component" ;;
+esac
 
 version="$1"
 release="${2:-1}"
@@ -91,16 +102,32 @@ ensure_release_notes() {
 	mv "$tmp" "$file"
 }
 
-printf '%s\n' "$version" > VERSION
+bump_nft() {
+	bump_package_makefile "multiwan-nft/Makefile" 0
+	bump_package_makefile "luci-app-multiwan-nft/Makefile" 1
+}
 
-bump_package_makefile "multiwan-nft/Makefile" 0
-bump_package_makefile "luci-app-multiwan-nft/Makefile" 1
-bump_package_makefile "multiwan-qos/Makefile" 0
-bump_package_makefile "luci-app-multiwan-qos/Makefile" 1
-replace_unique_line "multiwan-qos/etc/init.d/multiwan-qos" '^VERSION=' "VERSION=\"$version\"" "QoS init VERSION"
-replace_unique_line "multiwan-qos/etc/multiwan-qos.sh" '^VERSION=' "VERSION=\"$version\" # will become obsolete in future releases as version string is now in the init script" "QoS rules script VERSION"
-replace_unique_line "luci-app-multiwan-qos/htdocs/luci-static/resources/multiwan-qos/settings.js" '^const UI_VERSION = ' "const UI_VERSION = '$version';" "QoS LuCI UI_VERSION"
+bump_qos() {
+	bump_package_makefile "multiwan-qos/Makefile" 0
+	bump_package_makefile "luci-app-multiwan-qos/Makefile" 1
+	replace_unique_line "multiwan-qos/etc/init.d/multiwan-qos" '^VERSION=' "VERSION=\"$version\"" "QoS init VERSION"
+	replace_unique_line "multiwan-qos/etc/multiwan-qos.sh" '^VERSION=' "VERSION=\"$version\" # will become obsolete in future releases as version string is now in the init script" "QoS rules script VERSION"
+	replace_unique_line "luci-app-multiwan-qos/htdocs/luci-static/resources/multiwan-qos/settings.js" '^const UI_VERSION = ' "const UI_VERSION = '$version';" "QoS LuCI UI_VERSION"
+}
 
-ensure_release_notes
+case "$component" in
+	all)
+		printf '%s\n' "$version" > VERSION
+		bump_nft
+		bump_qos
+		ensure_release_notes
+		;;
+	nft)
+		bump_nft
+		;;
+	qos)
+		bump_qos
+		;;
+esac
 
-printf 'Updated MultiWAN package versions to %s-r%s\n' "$version" "$release"
+printf 'Updated MultiWAN %s package versions to %s-r%s\n' "$component" "$version" "$release"

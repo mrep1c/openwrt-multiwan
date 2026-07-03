@@ -1,5 +1,16 @@
 # Release Notes
 
+## v1.0.15
+
+Security, routing, and feed-release hardening for the MultiWAN package set.
+
+- Fixes stored-XSS risk in QoS custom-rule validation rendering.
+- Tightens QoS LuCI ACLs so read-only users no longer get restart, shell, nft, or root-script write powers.
+- Validates QoS agent API keys before rate limiting, so invalid keys cannot exhaust authenticated request slots.
+- Makes NFT policy generation metric-aware per address family and adds family guards to prevent cross-family marks.
+- Narrows NFT stop cleanup to owned tables/rules and hardens early status reads.
+- Repairs raw installers, removes placeholder stats RPC/UI calls, updates docs, and improves release asset replacement.
+
 ## v1.0.14
 
 QoS adjusts Hybrid shaping and realtime tuning after Steam/download testing.

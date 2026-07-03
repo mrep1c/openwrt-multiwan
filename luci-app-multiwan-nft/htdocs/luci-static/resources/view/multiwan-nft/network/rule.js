@@ -33,7 +33,7 @@ return view.extend({
 		s.nodescriptions = true;
 		s.sortable = true;
 
-		/* This name length error check can likely be removed when multiwan_nft migrates to nftables */
+		/* Keep names within legacy-compatible lengths used by migrated configs. */
 		s.renderSectionAdd = function (extra_class) {
 			var el = form.GridSection.prototype.renderSectionAdd.apply(this, arguments),
 				nameEl = el.querySelector('.cbi-section-create-name');

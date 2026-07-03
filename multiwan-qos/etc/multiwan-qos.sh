@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.14" # will become obsolete in future releases as version string is now in the init script
+VERSION="1.0.15" # will become obsolete in future releases as version string is now in the init script
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1
@@ -237,9 +237,7 @@ disable_configured_extra_offloads() {
 # Variable checks and dynamic rule generation
 ##############################
 
-# FIX: ACK rates are now calculated per-interface in setup_interface() (Bug #8)
-# Removed deprecated calculate_ack_rates() function call
-# ACK rate limiting is now configured directly in setup_interface() per WAN interface
+# ACK rate limiting is configured directly in setup_interface() per WAN interface.
 
 # Debug function
 debug_log() {
@@ -2642,8 +2640,10 @@ if [ "$1" = "refresh-device" ]; then
     # Per-device cooldown: prevent rapid sequential rebuilds from any caller.
     # The multiwan_nfttrack side has its own 60s cooldown; this 30s guard is
     # defense-in-depth on the multiwan_qos side.
-    local _cd_file="/tmp/multiwan_qos_refresh_${target_device}"
-    local _cd_now _cd_last _cd_secs=30
+    _cd_file="/tmp/multiwan_qos_refresh_${target_device}"
+    _cd_now=
+    _cd_last=
+    _cd_secs=30
     _cd_now="$(date +%s 2>/dev/null)" || _cd_now=0
     _cd_last="$(cat "$_cd_file" 2>/dev/null)"
     case "$_cd_last" in ""|*[!0-9]*) _cd_last=0 ;; esac

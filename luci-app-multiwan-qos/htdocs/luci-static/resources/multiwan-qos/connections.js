@@ -201,7 +201,6 @@ return view.extend({
         limitSelect.value = current_uci_limit;
 
         // Function to apply connection limit directly
-        // FIX: Removed redundant uci.load() call (Bug #4)
         function applyConnectionLimit(newLimit) {
             uci.set('multiwan-qos', 'advanced', 'MAX_CONNECTIONS', newLimit.toString());
             return uci.save()

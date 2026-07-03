@@ -315,33 +315,6 @@ get_stats() {
     echo "$result"
 }
 
-# Function to get historical statistics
-get_historical_stats() {
-    # Note: This is currently a placeholder function for future implementation
-    # In the future, this could provide historical QoS statistics from a database or log files
-    # Currently returns an empty JSON object as no history is being saved
-    local history_file="/tmp/multiwan_qos_stats_history.json"
-    
-    if [ -f "$history_file" ]; then
-        cat "$history_file"
-    else
-        echo "{}"
-    fi
-}
-
-# Function to get RRD data if available
-get_rrd_data() {
-    # Note: This is currently a placeholder function for future implementation
-    # In the future, this could provide Round Robin Database data for generating time-series charts
-    # Currently only checks if the RRD directory exists but doesn't actually process any data
-    # Check if RRD data is available for QoS
-    if [ -d "/tmp/rrd" ]; then
-        echo "{\"rrd_available\": true}"
-    else
-        echo "{\"rrd_available\": false}"
-    fi
-}
-
 # Function to get nftables rule counters for active rules
 get_rule_counters() {
     local nft_output rules_json
@@ -399,12 +372,6 @@ handle_call() {
                 printf '%s\n' "$result"
             }
             ;;
-        getHistoricalStats)
-            get_historical_stats
-            ;;
-        getRrdData)
-            get_rrd_data
-            ;;
         getRuleCounters)
             cache_read "rule_counters" || {
                 result="$(get_rule_counters)"
@@ -422,7 +389,7 @@ handle_call() {
 case "$1" in
     list)
         # List available methods
-        echo '{"getStats": {}, "getHistoricalStats": {}, "getRrdData": {}, "getRuleCounters": {}}'
+        echo '{"getStats": {}, "getRuleCounters": {}}'
         ;;
     call)
         handle_call "$2"

@@ -14,18 +14,6 @@ var callMultiWANQoSStats = rpc.declare({
     expect: { }
 });
 
-var callMultiWANQoSHistoricalStats = rpc.declare({
-    object: 'luci.multiwan_qos_stats',
-    method: 'getHistoricalStats',
-    expect: { }
-});
-
-var callMultiWANQoSRrdData = rpc.declare({
-    object: 'luci.multiwan_qos_stats',
-    method: 'getRrdData',
-    expect: { }
-});
-
 // Utility functions
 var formatSize = function(bytes) {
     var sizes = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
@@ -90,9 +78,7 @@ return view.extend({
 
     load: function() {
         return Promise.all([
-            callMultiWANQoSStats(),
-            callMultiWANQoSHistoricalStats(),
-            callMultiWANQoSRrdData()
+            callMultiWANQoSStats()
         ]);
     },
 
@@ -101,9 +87,7 @@ return view.extend({
         var view = this;
         return function() {
             return Promise.all([
-                callMultiWANQoSStats(),
-                callMultiWANQoSHistoricalStats(),
-                callMultiWANQoSRrdData()
+                callMultiWANQoSStats()
             ]).then(function(data) {
                 view.updateContent(data);
                 return data;
@@ -1074,8 +1058,6 @@ return view.extend({
     render: function(data) {
         var view = this;
         var qosStats = data[0];
-        var historicalStats = data[1];
-        var rrdData = data[2];
         
         view.lastData = qosStats;
         
@@ -1152,8 +1134,6 @@ return view.extend({
     updateContent: function(data) {
         var view = this;
         var qosStats = data[0];
-        var historicalStats = data[1];
-        var rrdData = data[2];
         
         // Save the active tab index before refreshing content
         var activeTab = document.querySelector('.cbi-tab.cbi-tab-active');

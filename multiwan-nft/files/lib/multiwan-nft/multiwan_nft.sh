@@ -763,7 +763,7 @@ multiwan_nft_create_iface_rules()
 
 multiwan_nft_delete_iface_rules()
 {
-	local id family IP rule_id
+	local id family IP device mark_val
 
 	config_get family "$1" family ipv4
 	multiwan_nft_get_iface_id id "$1"
@@ -778,9 +778,15 @@ multiwan_nft_delete_iface_rules()
 		return
 	fi
 
-	for rule_id in $($IP rule list | awk -F : '$1 % 1000 == '$id' && $1 > 1000 && $1 < 4000 {print $1}'); do
-		$IP rule del pref $rule_id
-	done
+	network_get_device device "$1"
+	mark_val="$(multiwan_nft_id2mask id MMX_MASK)"
+
+	if [ -n "$device" ]; then
+		while $IP rule del pref $((id+1000)) iif "$device" lookup "$id" 2>/dev/null; do :; done
+		while $IP rule del pref $((id+1000)) oif "$device" lookup "$id" 2>/dev/null; do :; done
+	fi
+	while $IP rule del pref $((id+2000)) fwmark "$mark_val/$MMX_MASK" lookup "$id" 2>/dev/null; do :; done
+	while $IP rule del pref $((id+3000)) fwmark "$mark_val/$MMX_MASK" unreachable 2>/dev/null; do :; done
 }
 
 multiwan_nft_delete_iface_set_entries()
@@ -814,18 +820,52 @@ multiwan_nft_delete_iface_set_entries()
 }
 
 
+multiwan_nft_scan_policy_member()
+{
+	local iface family metric weight is_offline
+
+	config_get iface "$1" interface
+	config_get metric "$1" metric 1
+	config_get weight "$1" weight 1
+
+	[ -n "$iface" ] || return 0
+	[ "$metric" -gt "$DEFAULT_LOWEST_METRIC" ] && LOG warn "Member interface $iface has >$DEFAULT_LOWEST_METRIC metric. Not appending to policy" && return 0
+
+	[ "$(multiwan_nft_get_iface_hotplug_state "$iface")" = "online" ]
+	is_offline=$?
+	[ "$is_offline" -eq 0 ] || return 0
+
+	config_get family "$iface" family ipv4
+	[ "$family" = "ipv6" ] && [ "$NO_IPV6" -ne 0 ] && return
+
+	if [ "$family" = "ipv4" ]; then
+		if [ "$metric" -lt "$lowest_metric_v4" ]; then
+			total_weight_v4=$weight
+			lowest_metric_v4=$metric
+		elif [ "$metric" -eq "$lowest_metric_v4" ]; then
+			total_weight_v4=$((total_weight_v4+weight))
+		fi
+	elif [ "$family" = "ipv6" ]; then
+		if [ "$metric" -lt "$lowest_metric_v6" ]; then
+			total_weight_v6=$weight
+			lowest_metric_v6=$metric
+		elif [ "$metric" -eq "$lowest_metric_v6" ]; then
+			total_weight_v6=$((total_weight_v6+weight))
+		fi
+	fi
+}
+
 multiwan_nft_set_policy_nft()
 {
-	local id iface family metric weight device is_lowest is_offline
+	local id iface family metric weight device is_offline family_guard total_weight lowest_metric emitted_var emitted
 
-	is_lowest=0
 	config_get iface "$1" interface
 	config_get metric "$1" metric 1
 	config_get weight "$1" weight 1
 
 	[ -n "$iface" ] || return 0
 	network_get_device device "$iface"
-	[ "$metric" -gt "$DEFAULT_LOWEST_METRIC" ] && LOG warn "Member interface $iface has >$DEFAULT_LOWEST_METRIC metric. Not appending to policy" && return 0
+	[ "$metric" -gt "$DEFAULT_LOWEST_METRIC" ] && return 0
 
 	multiwan_nft_get_iface_id id "$iface"
 
@@ -835,52 +875,45 @@ multiwan_nft_set_policy_nft()
 	is_offline=$?
 
 	config_get family "$iface" family ipv4
-	[ "$family" = "ipv6" ] && [ "$NO_IPV6" -ne 0 ] && return
-
-	if [ "$family" = "ipv4" ] && [ "$is_offline" -eq 0 ]; then
-		if [ "$metric" -lt "$lowest_metric_v4" ]; then
-			is_lowest=1
-			total_weight_v4=$weight
-			lowest_metric_v4=$metric
-		elif [ "$metric" -eq "$lowest_metric_v4" ]; then
-			total_weight_v4=$((total_weight_v4+weight))
-		else
-			return
-		fi
-	elif [ "$family" = "ipv6" ] && [ "$is_offline" -eq 0 ]; then
-		if [ "$metric" -lt "$lowest_metric_v6" ]; then
-			is_lowest=1
-			total_weight_v6=$weight
-			lowest_metric_v6=$metric
-		elif [ "$metric" -eq "$lowest_metric_v6" ]; then
-			total_weight_v6=$((total_weight_v6+weight))
-		else
-			return
-		fi
+	if [ "$family" = "ipv4" ]; then
+		family_guard="meta nfproto ipv4"
+		total_weight=$total_weight_v4
+		lowest_metric=$lowest_metric_v4
+		emitted_var=policy_emitted_v4
+	elif [ "$family" = "ipv6" ] && [ "$NO_IPV6" -eq 0 ]; then
+		family_guard="meta nfproto ipv6"
+		total_weight=$total_weight_v6
+		lowest_metric=$lowest_metric_v6
+		emitted_var=policy_emitted_v6
+	else
+		return
 	fi
 
 	local mark_val=$(multiwan_nft_id2mask id MMX_MASK)
 
-	if [ "$is_lowest" -eq 1 ]; then
-		# First/only interface in policy - takes all traffic
-		multiwan_nft_nft_add_rule "multiwan_nft_policy_$policy" \
-			meta mark and $MMX_MASK == 0 meta mark set meta mark and $MMX_INVMASK or $mark_val return \
-			comment "\"$iface $weight $weight\""
-	elif [ "$is_offline" -eq 0 ]; then
+	if [ "$is_offline" -eq 0 ]; then
+		[ "$metric" -eq "$lowest_metric" ] || return 0
+		eval "emitted=\${$emitted_var:-0}"
+		if [ "$emitted" -eq 0 ]; then
+			eval "$emitted_var=1"
+			multiwan_nft_nft_add_rule "multiwan_nft_policy_$policy" \
+				$family_guard meta mark and $MMX_MASK == 0 \
+				meta mark set meta mark and $MMX_INVMASK or $mark_val return \
+				comment "\"$iface $weight $total_weight\""
+			return
+		fi
+
 		# Additional interface - use probability-based load balancing
 		# nft uses numgen random mod total, check < weight
-		local total_weight
-		[ "$family" = "ipv4" ] && total_weight=$total_weight_v4 || total_weight=$total_weight_v6
-		
 		multiwan_nft_nft_insert_rule "multiwan_nft_policy_$policy" \
-			meta mark and $MMX_MASK == 0 \
+			$family_guard meta mark and $MMX_MASK == 0 \
 			numgen random mod $total_weight lt $weight \
 			meta mark set meta mark and $MMX_INVMASK or $mark_val return \
 			comment "\"$iface $weight $total_weight\""
 	elif [ -n "$device" ]; then
 		# Offline but has device - use as fallback for direct output
 		multiwan_nft_nft_insert_rule "multiwan_nft_policy_$policy" \
-			oifname "$device" meta mark and $MMX_MASK == 0 \
+			$family_guard oifname "$device" meta mark and $MMX_MASK == 0 \
 			meta mark set meta mark and $MMX_INVMASK or $MMX_DEFAULT return \
 			comment "\"out $iface $device\""
 	fi
@@ -888,7 +921,7 @@ multiwan_nft_set_policy_nft()
 
 multiwan_nft_create_policies_nft()
 {
-	local last_resort lowest_metric_v4 lowest_metric_v6 total_weight_v4 total_weight_v6 policy
+	local last_resort lowest_metric_v4 lowest_metric_v6 total_weight_v4 total_weight_v6 policy policy_emitted_v4 policy_emitted_v6
 
 	policy="$1"
 
@@ -903,7 +936,12 @@ multiwan_nft_create_policies_nft()
 	lowest_metric_v6=$DEFAULT_LOWEST_METRIC
 	total_weight_v6=0
 
-	# First, add all member interface rules
+	config_list_foreach "$1" use_member multiwan_nft_scan_policy_member
+
+	policy_emitted_v4=0
+	policy_emitted_v6=0
+
+	# Then add only the member rules for the selected metric tier.
 	config_list_foreach "$1" use_member multiwan_nft_set_policy_nft
 
 	# Add last resort rule AFTER interface rules (so it's at the end)
@@ -940,7 +978,11 @@ multiwan_nft_set_sticky_nft()
 	local ipv="$3"
 	local policy="$4"
 
-	local id iface
+	local id iface family
+	config_get family "$interface" family ipv4
+	[ "$family" = "ipv4" ] && [ "$ipv" != "ipv4" ] && return 0
+	[ "$family" = "ipv6" ] && [ "$ipv" != "ipv6" ] && return 0
+
 	# Check if interface is in this policy
 	if $NFT list chain $NFT_FAMILY $NFT_TABLE "$policy" 2>/dev/null | grep -q "\"$interface "; then
 		multiwan_nft_get_iface_id id "$interface"
@@ -1067,7 +1109,9 @@ multiwan_nft_set_user_nft_rule()
 	fi
 
 	# Build match criteria
-	local match=""
+	local family_guard match
+	[ "$ipv" = "ipv4" ] && family_guard="meta nfproto ipv4" || family_guard="meta nfproto ipv6"
+	match="$family_guard"
 	
 	# Protocol
 	[ "$proto" != "all" ] && match="$match meta l4proto $proto"
@@ -1151,7 +1195,7 @@ multiwan_nft_set_user_nft_rule()
 		# This runs regardless of mark state to keep sticky timeout fresh
 		if [ "$sticky" -eq 1 ]; then
 			# Build base match without mark==0 check
-			local sticky_match=""
+			local sticky_match="$family_guard"
 			[ -n "$proto" ] && [ "$proto" != "all" ] && sticky_match="$sticky_match meta l4proto $proto"
 			[ -n "$dest_port" ] && sticky_match="$sticky_match $proto dport $nft_dest_port"
 			# Only update if packet has valid tracking info (removed impossible mark!=0 check)
@@ -1284,6 +1328,10 @@ multiwan_nft_interface_hotplug_shutdown()
 multiwan_nft_interface_shutdown()
 {
 	multiwan_nft_interface_hotplug_shutdown $1
+	multiwan_nft_delete_iface_nft "$1"
+	multiwan_nft_delete_iface_set_entries "$1"
+	multiwan_nft_delete_iface_route "$1"
+	multiwan_nft_delete_iface_rules "$1"
 	multiwan_nft_track_clean $1
 }
 

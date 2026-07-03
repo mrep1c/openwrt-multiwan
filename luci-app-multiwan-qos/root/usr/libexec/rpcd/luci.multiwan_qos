@@ -2,6 +2,7 @@
 
 local jsonc = require "luci.jsonc"
 local AGENT_STATE_FILE = "/tmp/multiwan_qos_agent_state.json"
+local DEFAULT_CONNTRACK_LIMIT = 2000
 
 -- Check if an IP address is private - not needed at the moment
 local function is_private_ip(ip)
@@ -86,17 +87,46 @@ local function get_connections()
         end
     end
     
+    local effective_limit = max_connections
+    local load1 = 0
+    if effective_limit == 0 then
+        local load_file = io.open("/proc/loadavg")
+        if load_file then
+            local load_avg = load_file:read("*a") or ""
+            load_file:close()
+            load1 = tonumber(load_avg:match("^(%d+%.%d+)")) or 0
+        end
+
+        if load1 > 2.0 then
+            effective_limit = 100
+        elseif load1 > 1.5 then
+            effective_limit = 500
+        elseif load1 > 0.8 then
+            effective_limit = 1000
+        else
+            effective_limit = DEFAULT_CONNTRACK_LIMIT
+        end
+    end
+
     local f = io.open("/proc/net/nf_conntrack", "r")
     if not f then
-        return {}, max_connections
+        return {}, max_connections, {
+            effective_max_connections = effective_limit,
+            truncated = false,
+            scanned = 0,
+            load1 = load1
+        }
     end
 
     local count = 0
+    local scanned = 0
+    local truncated = false
     
-    -- Read connections from nf_conntrack (with early exit if limited)
+    -- Read connections from nf_conntrack with a server-side cap.
     for line in f:lines() do
-        -- Early exit if we have a limit and reached it
-        if max_connections > 0 and count >= max_connections then
+        scanned = scanned + 1
+        if effective_limit > 0 and count >= effective_limit then
+            truncated = true
             break
         end
         
@@ -114,25 +144,9 @@ local function get_connections()
         return a.total_bytes > b.total_bytes
     end)
 
-    -- Determine max_entries based on system load (only if no manual limit)
-    local max_entries = #conn_list
-    if max_connections == 0 then
-        local load_avg = io.open("/proc/loadavg"):read("*a")
-        local load1 = tonumber(load_avg:match("^(%d+%.%d+)")) or 0
-        
-        -- Apply load-based limits only if no manual limit
-        if load1 > 2.0 then
-            max_entries = math.min(100, #conn_list)
-        elseif load1 > 1.5 then
-            max_entries = math.min(500, #conn_list)
-        elseif load1 > 0.8 then
-            max_entries = math.min(1000, #conn_list)
-        end
-    end
-
     -- Final connections table
     local connections = {}
-    for i = 1, max_entries do
+    for i = 1, #conn_list do
         local conn = conn_list[i]
         if not conn then break end
         local key = string.format("%s:%s:%s:%s:%s:%s",
@@ -140,7 +154,12 @@ local function get_connections()
         connections[key] = conn
     end
 
-    return connections, max_connections
+    return connections, max_connections, {
+        effective_max_connections = effective_limit,
+        truncated = truncated,
+        scanned = scanned,
+        load1 = load1
+    }
 end
 
 local function trim(value)
@@ -472,8 +491,15 @@ local methods = {
     },
     getConntrackDSCP = {
         call = function()
-            local connections, max_connections = get_connections()
-            return {result = jsonc.stringify({connections = connections, max_connections = max_connections})}
+            local connections, max_connections, meta = get_connections()
+            return {result = jsonc.stringify({
+                connections = connections,
+                max_connections = max_connections,
+                effective_max_connections = meta.effective_max_connections,
+                truncated = meta.truncated,
+                scanned = meta.scanned,
+                load1 = meta.load1
+            })}
         end
     }
 }
