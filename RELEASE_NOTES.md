@@ -1,5 +1,16 @@
 # Release Notes
 
+## v1.0.16
+
+QoSmate audit follow-up and feed release.
+
+- Adds optional pure CAKE multi-queue support through `USE_MQ` and `cake_mq`, with automatic fallback to plain CAKE.
+- Recognizes `cake_mq` in status and LuCI statistics while keeping Hybrid mode on plain CAKE child qdiscs.
+- Cleans the shipped default config around interface sections, supported tuning defaults, and CAKE option clarity.
+- Makes `auto_setup` target a specific OpenWrt network instead of assuming only `wan`.
+- Improves status and health output for multi-WAN interface sections and removes stale single-WAN fallbacks.
+- Removes the unused `multiwan_qos_id2mask` helper.
+
 ## v1.0.15
 
 Security, routing, and feed-release hardening for the MultiWAN package set.

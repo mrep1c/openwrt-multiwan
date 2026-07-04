@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.15" # will become obsolete in future releases as version string is now in the init script
+VERSION="1.0.16" # will become obsolete in future releases as version string is now in the init script
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1
@@ -15,9 +15,11 @@ IFS="$DEFAULT_IFS"
 : "${gameqdisc:=pfifo}" "${nongameqdisc:=fq_codel}" "${ACK_FILTER_EGRESS:=auto}"
 : "${DOWNLOAD_IFB_STAB:=0}"
 : "${DISABLE_QOS_OFFLOADS:=1}"
+: "${USE_MQ:=0}"
 : "${OFFLOAD_EXTRA_DEVICES:=}"
 : "${MULTIWAN_QOS_REFRESH_LOCK_DIR:=/var/run/multiwan_qos-refresh.lock}"
 : "${MULTIWAN_QOS_RESTARTING_FILE:=/tmp/multiwan_qos_restarting}"
+: "${MULTIWAN_QOS_CAKE_TYPE_DIR:=/tmp/multiwan-qos/cake_type}"
 QOS_OFFLOAD_EXTRA_APPLIED=0
 QOS_OFFLOAD_WARNED_MISSING_ETHTOOL=0
 
@@ -1251,28 +1253,6 @@ fi
 #       dscptag.nft
 ##############################
 
-# Replicate multiwan_nft's id2mask() to compute interface marks
-# Spreads the bits of id into the mask positions
-# e.g., id=1 mask=0x3f0000 -> 0x010000; id=2 -> 0x020000
-multiwan_qos_id2mask() {
-    local id="$1" mask="$2"
-    local bit_msk bit_val result
-    bit_msk=0
-    bit_val=0
-    result=0
-    # Use arithmetic loop instead of 'seq' which may not exist on minimal OpenWrt (#6)
-    while [ "$bit_msk" -le 31 ]; do
-        if [ $(((mask>>bit_msk)&1)) = "1" ]; then
-            if [ $(((id>>bit_val)&1)) = "1" ]; then
-                result=$((result|(1<<bit_msk)))
-            fi
-            bit_val=$((bit_val+1))
-        fi
-        bit_msk=$((bit_msk+1))
-    done
-    printf "0x%08x" $result
-}
-
 # Generates a vmap to securely save DSCP into connection tracking.
 # Nftables cannot simultaneously evaluate two dynamic variables (e.g. ct mark | ip dscp).
 # To solve this, we map all 64 possible DSCP values to individual chains that 
@@ -1838,6 +1818,49 @@ append_cake_opt() {
     :
 }
 
+get_tx_queue_count() {
+    local iface="$1"
+
+    set -- /sys/class/net/"$iface"/queues/tx-*
+    [ -e "$1" ] && printf '%s\n' "$#" || printf '%s\n' 0
+}
+
+record_cake_qdisc_type() {
+    local iface="$1" qdisc="$2"
+
+    mkdir -p "$MULTIWAN_QOS_CAKE_TYPE_DIR" 2>/dev/null || return 0
+    printf '%s\n' "$qdisc" > "$MULTIWAN_QOS_CAKE_TYPE_DIR/$iface" 2>/dev/null || true
+}
+
+clear_cake_qdisc_type() {
+    local iface="$1"
+
+    rm -f "$MULTIWAN_QOS_CAKE_TYPE_DIR/$iface" 2>/dev/null
+}
+
+# Select cake or cake_mq for pure CAKE root qdiscs. Hybrid keeps plain CAKE
+# because cake_mq is not usable as the HFSC child qdisc.
+select_cake_qdisc() {
+    local iface="$1" num_queues
+    REPLY="cake"
+
+    [ "$USE_MQ" = "1" ] || return 0
+
+    num_queues="$(get_tx_queue_count "$iface")"
+    if [ "$num_queues" -gt 1 ] 2>/dev/null && tc qdisc replace dev "$iface" root cake_mq 2>/dev/null; then
+        tc qdisc del dev "$iface" root 2>/dev/null
+        log_msg "Using cake_mq for $iface ($num_queues TX queues)."
+        REPLY="cake_mq"
+        return 0
+    fi
+
+    if [ "$num_queues" -le 1 ] 2>/dev/null; then
+        log_msg "cake_mq not used for $iface: only $num_queues TX queue(s), using cake."
+    else
+        log_msg "cake_mq not available in kernel for $iface, using cake."
+    fi
+}
+
 # Function to setup CAKE qdisc
 # Arguments: $1:WAN_DEV, $2:LAN_DEV, $3:UPRATE, $4:DOWNRATE, $5:PRESET, $6:OVERHEAD, $7:MPU
 setup_cake() {
@@ -1848,6 +1871,12 @@ setup_cake() {
     
     # Get CAKE link parameters
     local ack_filter_egress_val cake_link_params="$(get_cake_link_params "$PRESET" "$OVERHEAD" "$MPU")"
+    local CAKE_QDISC_EGR CAKE_QDISC_IGR
+
+    select_cake_qdisc "$WAN"
+    CAKE_QDISC_EGR="$REPLY"
+    select_cake_qdisc "$LAN"
+    CAKE_QDISC_IGR="$REPLY"
 
     # Egress (Upload) CAKE setup
     case "$ACK_FILTER_EGRESS" in
@@ -1868,8 +1897,9 @@ setup_cake() {
     append_cake_opt "wash" "$WASHDSCPUP" &&
     append_cake_opt "ack-filter" "$ack_filter_egress_val" &&
     append_cake_opt "memlimit 16m" "1" &&
-    tc qdisc add dev "$WAN" root handle 1: cake $CAKE_OPTS || qdisc_setup_failed
-debug_log "EGRESS cake opts: '$CAKE_OPTS'"
+    tc qdisc add dev "$WAN" root handle 1: "$CAKE_QDISC_EGR" $CAKE_OPTS || qdisc_setup_failed
+record_cake_qdisc_type "$WAN" "$CAKE_QDISC_EGR"
+debug_log "EGRESS $CAKE_QDISC_EGR opts: '$CAKE_OPTS'"
     
 
     # Ingress (Download) CAKE setup
@@ -1885,8 +1915,9 @@ debug_log "EGRESS cake opts: '$CAKE_OPTS'"
     append_cake_opt "nat" "$NAT_INGRESS" &&
     append_cake_opt "wash" "$WASHDSCPDOWN" &&
     append_cake_opt "memlimit 16m" "1" &&
-    tc qdisc add dev "$LAN" root cake $CAKE_OPTS || qdisc_setup_failed
-debug_log "INGRESS cake opts: '$CAKE_OPTS'"
+    tc qdisc add dev "$LAN" root "$CAKE_QDISC_IGR" $CAKE_OPTS || qdisc_setup_failed
+record_cake_qdisc_type "$LAN" "$CAKE_QDISC_IGR"
+debug_log "INGRESS $CAKE_QDISC_IGR opts: '$CAKE_OPTS'"
 }
 
 # Helper function to set up hybrid qdisc on an interface
@@ -2326,6 +2357,8 @@ cleanup_interface_state() {
     # silently survive a partial restart and blackhole the shaped WAN path.
     tc qdisc del dev "$device" root > /dev/null 2>&1
     tc qdisc del dev "$device" ingress > /dev/null 2>&1
+    clear_cake_qdisc_type "$device"
+    clear_cake_qdisc_type "$lan_dev"
 
     if ip link show "$lan_dev" > /dev/null 2>&1; then
         tc qdisc del dev "$lan_dev" root > /dev/null 2>&1
@@ -2499,7 +2532,7 @@ setup_interface() {
 
     if [ "$qdisc" = "cake" ]; then
         local wan_tx_queues
-        wan_tx_queues=$(find /sys/class/net/"$device"/queues/ -maxdepth 1 -type d -name 'tx-*' 2>/dev/null | wc -l)
+        wan_tx_queues=$(get_tx_queue_count "$device")
         [ "$wan_tx_queues" -gt 1 ] && ifb_mq_args="numtxqueues $wan_tx_queues"
     fi
     tc qdisc add dev "$device" handle ffff: ingress || \

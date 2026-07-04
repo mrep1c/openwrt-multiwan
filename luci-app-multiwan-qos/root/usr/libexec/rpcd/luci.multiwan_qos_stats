@@ -89,13 +89,7 @@ get_active_interface_info() {
         return 0
     fi
 
-    local legacy_qdisc legacy_wan
-    legacy_qdisc="$(uci -q get multiwan-qos.settings.ROOT_QDISC 2>/dev/null)"
-    [ -n "$legacy_qdisc" ] || legacy_qdisc="hfsc"
-    legacy_wan="$(uci -q get multiwan-qos.settings.WAN 2>/dev/null)"
-    [ -n "$legacy_wan" ] || legacy_wan="eth1"
-
-    printf '%s %s ifb-%s\n' "$legacy_qdisc" "$legacy_wan" "$legacy_wan"
+    return 1
 }
 
 # Function to get the statistics based on root qdisc
@@ -108,7 +102,16 @@ get_stats() {
 
     # Get active per-interface qdisc and device names
     local root_qdisc wan_interface ifb_interface active_interface_info
-    active_interface_info=$(get_active_interface_info)
+    if ! active_interface_info=$(get_active_interface_info); then
+        jq -n --argjson fs "$basic_stats" '{
+            root_qdisc: "none",
+            wan_interface: "",
+            ifb_interface: "",
+            qdisc_stats: $fs,
+            error: "no_enabled_interface"
+        }' 2>/dev/null || echo '{"root_qdisc":"none","wan_interface":"","ifb_interface":"","qdisc_stats":[],"error":"no_enabled_interface"}'
+        return 0
+    fi
     set -- $active_interface_info
     root_qdisc="$1"
     wan_interface="$2"
@@ -124,11 +127,11 @@ get_stats() {
     if [ "$root_qdisc" = "cake" ]; then
         # Extract CAKE statistics for both egress and ingress
         local cake_egress_stats
-        cake_egress_stats=$(echo "$filtered_stats" | jq -c "[.[] | select(.kind == \"cake\" and .dev == \"$wan_interface\")]" 2>/dev/null || echo "[]")
+        cake_egress_stats=$(echo "$filtered_stats" | jq -c "[.[] | select((.kind == \"cake\" or .kind == \"cake_mq\") and .dev == \"$wan_interface\")]" 2>/dev/null || echo "[]")
         debug_log "Cake egress stats: $cake_egress_stats"
 
         local cake_ingress_stats
-        cake_ingress_stats=$(echo "$filtered_stats" | jq -c "[.[] | select(.kind == \"cake\" and .dev == \"$ifb_interface\")]" 2>/dev/null || echo "[]")
+        cake_ingress_stats=$(echo "$filtered_stats" | jq -c "[.[] | select((.kind == \"cake\" or .kind == \"cake_mq\") and .dev == \"$ifb_interface\")]" 2>/dev/null || echo "[]")
         debug_log "Cake ingress stats: $cake_ingress_stats"
 
         # Get the priority queue type (diffserv3/4/8)

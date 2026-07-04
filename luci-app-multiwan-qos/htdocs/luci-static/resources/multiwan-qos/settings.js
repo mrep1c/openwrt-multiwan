@@ -8,7 +8,7 @@
 'require poll';
 'require tools.widgets as widgets';
 
-const UI_VERSION = '1.0.15';
+const UI_VERSION = '1.0.16';
 const UI_UPD_CHANNEL = 'release';
 
 var callInitAction = rpc.declare({
@@ -323,8 +323,8 @@ return view.extend({
         o.inputtitle = _('Start Auto Setup');
         o.onclick = ui.createHandlerFn(this, function () {
             ui.showModal(_('Auto Setup'), [
-                E('p', { 'style': 'color: orange; font-weight: bold;' }, _('Auto Setup is currently not supported in Multi-WAN mode.')),
-                E('p', _('Please configure your interfaces manually.')),
+                E('p', { 'style': 'color: orange; font-weight: bold;' }, _('Auto Setup can configure one OpenWrt WAN network at a time.')),
+                E('p', _('Run /etc/init.d/multiwan-qos auto_setup <network> from SSH, or configure multiple interfaces manually here.')),
                 E('div', { 'class': 'right' }, [
                     E('button', {
                         'class': 'btn',

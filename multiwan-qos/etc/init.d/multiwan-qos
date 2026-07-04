@@ -6,7 +6,7 @@ STOP=99
 
 USE_PROCD=1
 
-VERSION="1.0.15"
+VERSION="1.0.16"
 UPD_CHANNEL="release"
 
 . "${IPKG_INSTROOT}/lib/multiwan-qos/process-lock.sh"
@@ -15,8 +15,9 @@ EXTRA_COMMANDS="check_version update auto_setup auto_setup_noninteractive valida
 EXTRA_HELP="
         check_version              Check for updates
         update                     Update multiwan_qos
-        auto_setup                 Automatically configure multiwan_qos
-        auto_setup_noninteractive  Automatically configure multiwan_qos with no interaction
+        auto_setup [network]       Automatically configure one OpenWrt WAN network (default: wan)
+        auto_setup_noninteractive [gaming_ip] [network]
+                                   Automatically configure one WAN network with no interaction
         validate_custom_rules      Validate custom rules
         health_check               Check if MultiWAN QoS is properly configured and running
         refresh <device>           Refresh qdiscs for a specific device without restarting
@@ -1943,6 +1944,7 @@ stop_service_impl() {
 
     stop_legacy_processes /etc/multiwan-qos-agent-watchdog.lua /var/run/multiwan-qos-agent-watchdog.pid
     rm -f /etc/multiwan-qos-agent-watchdog.lua
+    rm -rf /tmp/multiwan-qos/cake_type
 
     ## Delete files
     rm -f "$MULTIWAN_QOS_HOTPLUG_SCRIPT"
@@ -2036,14 +2038,14 @@ status_service() {
         qdiscs="${qdiscs//$'\n'/ }"
         active_qdisc=''
         qdisc_print=''
-        for qdisc in cake hfsc htb; do
+        for qdisc in cake cake_mq hfsc htb; do
             case "${qdiscs}" in "${qdisc}"|"${qdisc} "*|*" ${qdisc}"|*" ${qdisc} "*)
                 active_qdisc="$qdisc"
             esac
         done
 
         case "$active_qdisc" in
-            cake) qdisc_print=CAKE ;;
+            cake|cake_mq) qdisc_print=CAKE ;;
             hfsc) qdisc_print=HFSC ;;
             htb) qdisc_print=HTB ;;
         esac
@@ -2116,31 +2118,32 @@ status_service() {
     config_load 'multiwan-qos'
     config_foreach report_interface_shaping interface
 
-    # Legacy fallback for configurations that only use settings.WAN.
-    # Only fall back when NO interface sections are configured at all.
     if [ "$reported_interfaces" -eq 0 ]; then
-        local has_interface_sections=0
-        count_interfaces() { has_interface_sections=1; }
-        config_foreach count_interfaces interface
-        if [ "$has_interface_sections" -eq 0 ] && [ -n "$WAN" ]; then
-            local IFB="ifb-$WAN"
-            for dir in egress ingress; do
-                case "$dir" in
-                    egress) dev="$WAN" ;;
-                    ingress) dev="$IFB" ;;
-                esac
-                report_shaping_dev "$dir" "$dev"
-            done
-        fi
+        print_msg "No enabled MultiWAN QoS interface sections are configured."
     fi
 
     # Show summary of current settings
-    print_msg "" "==== Current Settings ====" \
-        "Upload rate: $UPRATE kbps" \
-        "Download rate: $DOWNRATE kbps" \
-        "Game traffic reserve: calculated per interface"
+    print_msg "" "==== Configured Interfaces ===="
+    local listed_interfaces=0
+    print_configured_interface() {
+        local config="$1" enabled device qdisc upload download preset
+
+        config_get_bool enabled "$config" enabled 1
+        config_get device "$config" device
+        config_get qdisc "$config" qdisc 'hfsc'
+        config_get upload "$config" upload
+        config_get download "$config" download
+        config_get preset "$config" preset 'ethernet'
+
+        listed_interfaces=$((listed_interfaces + 1))
+        print_msg "Interface $config: enabled=$enabled device=${device:-unset} qdisc=$qdisc upload=${upload:-unset} download=${download:-unset} preset=$preset"
+    }
+    config_foreach print_configured_interface interface
+    [ "$listed_interfaces" -gt 0 ] || print_msg "No interface sections configured."
+    print_msg "Game traffic reserve: calculated per interface"
     case "$active_qdisc" in
         cake) print_msg "Queue discipline: CAKE (single-lane shaper)" ;;
+        cake_mq) print_msg "Queue discipline: CAKE (multi-queue shaper)" ;;
         hfsc) print_msg "Queue discipline: HFSC (realtime/default/low/bulk lanes)" ;;
         hybrid) print_msg "Queue discipline: Hybrid (realtime/default/bulk lanes)" ;;
         htb) print_msg "Queue discipline: HTB (realtime/default/bulk lanes)" ;;
@@ -2191,9 +2194,23 @@ status_service() {
         print_msg "Flow offloading is disabled (compatible with multiwan_qos)."
     fi
 
-    # Display WAN interface information
+    # Display configured WAN device information
     print_msg "" "==== WAN Interface Information ===="
-    ifstatus wan | grep -e device
+    local listed_wan_info=0
+    print_wan_interface_info() {
+        local config="$1" enabled device qdisc
+
+        config_get_bool enabled "$config" enabled 1
+        config_get device "$config" device
+        config_get qdisc "$config" qdisc 'hfsc'
+        [ -n "$device" ] || return 0
+
+        listed_wan_info=$((listed_wan_info + 1))
+        print_msg "Config $config: enabled=$enabled device=$device qdisc=$qdisc"
+        ip -o link show dev "$device" 2>/dev/null || print_msg "  Device is not currently present."
+    }
+    config_foreach print_wan_interface_info interface
+    [ "$listed_wan_info" -gt 0 ] || print_msg "No configured WAN devices."
 
     # Display MultiWAN QoS configuration
     print_msg "" "==== MultiWAN QoS Configuration ===="
@@ -2312,27 +2329,39 @@ try_auto_setup() {
     }
 
     local L3_DEVICE WAN_INTERFACE FINAL_INTERFACE SPEEDTEST_CMD FREE_SPACE SPEED_RESULT DOWNLOAD_SPEED UPLOAD_SPEED
-    local gaming_ip='' noninteractive='' speed_choice response speedtest_req direction
+    local gaming_ip='' noninteractive='' speed_choice response speedtest_req direction target_network
 
     if [ "$1" = "-n" ]; then
         gaming_ip="$2"
+        target_network="${3:-wan}"
         noninteractive=1
     else
+        target_network="${1:-wan}"
         noninteractive=
     fi
-    [ -z "$noninteractive" ] && print_msg "Starting multiwan_qos auto-setup..."
+    case "$target_network" in
+        ''|*[!A-Za-z0-9_]*)
+            error_out "Invalid network '$target_network'. Use an OpenWrt network name such as 'wan' or 'wan2'."
+            return 1
+            ;;
+        global|settings|advanced|hfsc|cake|custom_rules|agent)
+            error_out "Network '$target_network' conflicts with a reserved multiwan-qos config section name."
+            return 1
+            ;;
+    esac
+    [ -z "$noninteractive" ] && print_msg "Starting multiwan_qos auto-setup for network '$target_network'..."
 
     # Detect WAN interface
-    WAN_INTERFACE=$(ifstatus wan | grep -e '"device"' | cut -d'"' -f4)
-    L3_DEVICE=$(ifstatus wan | grep -e '"l3_device"' | cut -d'"' -f4)
+    WAN_INTERFACE=$(ifstatus "$target_network" | grep -e '"device"' | cut -d'"' -f4)
+    L3_DEVICE=$(ifstatus "$target_network" | grep -e '"l3_device"' | cut -d'"' -f4)
 
     if [ -z "$WAN_INTERFACE" ] && [ -z "$L3_DEVICE" ]; then
-        error_out "Unable to detect WAN interface. Please set it manually in the configuration."
+        error_out "Unable to detect a device for network '$target_network'. Please set it manually in the configuration."
         return 1
     fi
 
     FINAL_INTERFACE=${L3_DEVICE:-$WAN_INTERFACE}
-    print_msg "Detected WAN interface: $FINAL_INTERFACE"
+    print_msg "Detected WAN network '$target_network' interface: $FINAL_INTERFACE"
 
     # Stop multiwan_qos if it's running
     if is_multiwan_qos_active "$FINAL_INTERFACE"; then
@@ -2484,11 +2513,7 @@ try_auto_setup() {
 
     config_load 'multiwan-qos'
 
-    local wan_section
-    config_get wan_section settings wan 2>/dev/null
-    if [ -z "$wan_section" ]; then
-        wan_section="wan"
-    fi
+    local wan_section="$target_network"
 
     uci set multiwan-qos.${wan_section}=interface
     uci set multiwan-qos.${wan_section}.name="${wan_section}"
@@ -2553,10 +2578,10 @@ try_auto_setup() {
     uci commit multiwan-qos || return 1
 
     print_msg "Configuration updated. New settings:"
-    grep -E "option (WAN|DOWNRATE|UPRATE)" "$MULTIWAN_QOS_CFG_FILE"
+    uci show multiwan-qos.${wan_section}
 
 
-    print_msg "Auto-setup complete. multiwan_qos has been configured with detected settings." \
+    print_msg "Auto-setup complete. multiwan_qos has configured interface section '$wan_section'." \
         "To apply these changes, please restart multiwan_qos by running: $MULTIWAN_QOS_SERVICE_PATH restart"
     :
 }
@@ -2565,7 +2590,7 @@ auto_setup_noninteractive() {
     local output_file="/tmp/multiwan_qos_auto_setup_output.txt" auto_setup_rv
     {
         echo "Starting multiwan_qos non-interactive auto-setup..."
-        auto_setup -n "$1" 2>&1
+        auto_setup -n "$1" "$2" 2>&1
     } > "$output_file"
     auto_setup_rv=$?
     echo "$output_file"
@@ -2602,24 +2627,32 @@ health_check() {
     fi
 
     # Check tc configuration on configured interfaces
-    local tc_ok=0
+    local tc_ok=0 enabled_interfaces=0 configured_interfaces=0
     check_interface_tc() {
         local config="$1"
-        local device
+        local device enabled
+        config_get_bool enabled "$config" enabled 1
         config_get device "$config" device
+        [ -n "$device" ] && configured_interfaces=$((configured_interfaces + 1))
+        [ "$enabled" -eq 1 ] || return
         [ -z "$device" ] && return
-        if tc qdisc show dev "$device" 2>/dev/null | grep -E -q "hfsc|cake|htb"; then
+        enabled_interfaces=$((enabled_interfaces + 1))
+        if tc qdisc show dev "$device" 2>/dev/null | grep -E -q "hfsc|cake|cake_mq|htb"; then
             tc_ok=1
         fi
     }
     config_load 'multiwan-qos'
     config_foreach check_interface_tc interface
-    
-    # Fallback to legacy $WAN check
-    if [ "$tc_ok" -eq 0 ] && [ -n "$WAN" ]; then
-        tc qdisc show dev "$WAN" 2>/dev/null | grep -E -q "hfsc|cake|htb" && tc_ok=1
+
+    if [ "$global_enabled" = "1" ] && [ "$enabled_interfaces" -eq 0 ]; then
+        status="${status}interfaces:missing;"
+        errors=$((errors + 1))
+    elif [ "$configured_interfaces" -eq 0 ]; then
+        status="${status}interfaces:missing;"
+    else
+        status="${status}interfaces:ok;"
     fi
-    
+
     if [ "$tc_ok" -eq 1 ]; then
         status="${status}tc:ok;"
     else

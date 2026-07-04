@@ -38,6 +38,9 @@ function addRelevanceInfo(description, settingName, rootQdisc) {
             } else if (settingName === 'AUTORATE_INGRESS') {
                 isRelevant = false;
                 note = ' [hybrid default lane uses besteffort, no autorate]';
+            } else if (settingName === 'USE_MQ') {
+                isRelevant = false;
+                note = ' [hybrid default lane uses plain CAKE child qdisc]';
             }
         }
         
@@ -161,10 +164,15 @@ return view.extend({
         o.value('0', _('Disable'));
         o.default = 'auto';
 
+        o = s.option(form.Flag, 'USE_MQ', _('Multi-Queue CAKE (cake_mq)'),
+            addRelevanceInfo(_('Use cake_mq for pure CAKE on multi-queue devices when kernel support is available'), 'USE_MQ', rootQdisc));
+        o.rmempty = false;
+        o.default = '0';
+
         createOption('RTT', _('RTT'), _('Set the Round Trip Time'), _('Default: auto'), 'uinteger');
 
-        o = s.option(form.Flag, 'AUTORATE_INGRESS', _('Autorate (Ingress)'), 
-            addRelevanceInfo(_('Enable autorate for ingress'), 'AUTORATE_INGRESS', rootQdisc));
+        o = s.option(form.Flag, 'AUTORATE_INGRESS', _('CAKE Ingress Autorate'),
+            addRelevanceInfo(_('Enable CAKE built-in autorate-ingress for the download qdisc'), 'AUTORATE_INGRESS', rootQdisc));
         o.rmempty = false;
         o.default = '0';
 
