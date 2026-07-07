@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.18" # will become obsolete in future releases as version string is now in the init script
+VERSION="1.0.19" # will become obsolete in future releases as version string is now in the init script
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1
@@ -1152,6 +1152,8 @@ fi
 # Generate ingress netdev rules (pre-DNAT, port-based only â€” drives IFB classification)
 # INGRESS_NFT_CHAINS is accumulated per WAN device inside setup_interface()
 INGRESS_NFT_CHAINS=""
+QDISC_SETUP_WAN_DEVICES=""
+QDISC_SETUP_LAN_DEVICES=""
 
 # ACK rate limiting is now per-interface (configured in setup_interface)
 # NFT_ACK_RULES is populated during interface setup with per-WAN rates
@@ -1591,11 +1593,10 @@ add_tc_filter() {
 attach_classful_game_default_filter() {
     local DEV="$1" PARENT="$2" CLASSID="$3"
 
-    tc filter del dev "$DEV" parent "$PARENT" prio 99 > /dev/null 2>&1
-    tc filter add dev "$DEV" parent "$PARENT" protocol ip prio 99 \
-        u32 match u32 0 0 at 0 classid "$CLASSID" &&
-    tc filter add dev "$DEV" parent "$PARENT" protocol ipv6 prio 99 \
-        u32 match u32 0 0 at 0 classid "$CLASSID"
+    tc filter replace dev "$DEV" parent "$PARENT" protocol ip prio 99 \
+        u32 match u32 0 0 at 0 flowid "$CLASSID" &&
+    tc filter replace dev "$DEV" parent "$PARENT" protocol ipv6 prio 99 \
+        u32 match u32 0 0 at 0 flowid "$CLASSID"
 }
 
 attach_classful_game_child_qdisc() {
@@ -1678,30 +1679,32 @@ setup_game_qdisc() {
 
     case $QDISC_TYPE in
         "drr")
-            tc qdisc add dev "$DEV" parent 1:11 handle 10: drr &&
-            tc class add dev "$DEV" parent 10: classid 10:1 drr quantum 8000 &&
-            # Keep child handles away from HFSC/Hybrid leaf handles 13: and 15:.
-            attach_classful_game_child_qdisc "$DEV" 10:1 101: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
-            tc class add dev "$DEV" parent 10: classid 10:2 drr quantum 4000 &&
-            attach_classful_game_child_qdisc "$DEV" 10:2 102: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
-            tc class add dev "$DEV" parent 10: classid 10:3 drr quantum 1000 &&
-            attach_classful_game_child_qdisc "$DEV" 10:3 103: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" ||
-                qdisc_setup_failed "Failed to attach DRR $gameqdisc_child child qdisc on $DEV."
-            attach_classful_game_default_filter "$DEV" 10: 10:1 ||
-                qdisc_setup_failed "Failed to attach DRR default class filter on $DEV."
+            if ! {
+                tc qdisc add dev "$DEV" parent 1:11 handle 10: drr &&
+                tc class add dev "$DEV" parent 10: classid 10:1 drr quantum 8000 &&
+                attach_classful_game_child_qdisc "$DEV" 10:1 101: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
+                tc class add dev "$DEV" parent 10: classid 10:2 drr quantum 4000 &&
+                attach_classful_game_child_qdisc "$DEV" 10:2 102: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
+                tc class add dev "$DEV" parent 10: classid 10:3 drr quantum 1000 &&
+                attach_classful_game_child_qdisc "$DEV" 10:3 103: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
+                attach_classful_game_default_filter "$DEV" 10: 10:1
+            }; then
+                qdisc_setup_failed "Failed to set up DRR $gameqdisc_child child qdisc on $DEV."
+            fi
         ;;
         "qfq")
-            tc qdisc add dev "$DEV" parent 1:11 handle 10: qfq &&
-            tc class add dev "$DEV" parent 10: classid 10:1 qfq weight 8000 &&
-            # Keep child handles away from HFSC/Hybrid leaf handles 13: and 15:.
-            attach_classful_game_child_qdisc "$DEV" 10:1 101: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
-            tc class add dev "$DEV" parent 10: classid 10:2 qfq weight 4000 &&
-            attach_classful_game_child_qdisc "$DEV" 10:2 102: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
-            tc class add dev "$DEV" parent 10: classid 10:3 qfq weight 1000 &&
-            attach_classful_game_child_qdisc "$DEV" 10:3 103: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" ||
-                qdisc_setup_failed "Failed to attach QFQ $gameqdisc_child child qdisc on $DEV."
-            attach_classful_game_default_filter "$DEV" 10: 10:1 ||
-                qdisc_setup_failed "Failed to attach QFQ default class filter on $DEV."
+            if ! {
+                tc qdisc add dev "$DEV" parent 1:11 handle 10: qfq &&
+                tc class add dev "$DEV" parent 10: classid 10:1 qfq weight 8000 &&
+                attach_classful_game_child_qdisc "$DEV" 10:1 101: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
+                tc class add dev "$DEV" parent 10: classid 10:2 qfq weight 4000 &&
+                attach_classful_game_child_qdisc "$DEV" 10:2 102: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
+                tc class add dev "$DEV" parent 10: classid 10:3 qfq weight 1000 &&
+                attach_classful_game_child_qdisc "$DEV" 10:3 103: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
+                attach_classful_game_default_filter "$DEV" 10: 10:1
+            }; then
+                qdisc_setup_failed "Failed to set up QFQ $gameqdisc_child child qdisc on $DEV."
+            fi
         ;;
         "pfifo")
             tc qdisc add dev "$DEV" parent 1:11 handle 10: pfifo limit "$pfifo_limit"
@@ -1755,9 +1758,8 @@ setup_game_qdisc() {
             fi
         ;;
         *)
-            print_msg -err "Unsupported game qdisc type '$QDISC_TYPE'. Using pfifo fallback."
-            # pfifo fallback limit calculation
-            tc qdisc add dev "$DEV" parent 1:11 handle 10: pfifo limit "$pfifo_limit"
+            print_msg -err "Unsupported game qdisc type '$QDISC_TYPE'."
+            return 1
         ;;
     esac
 }
@@ -1778,9 +1780,11 @@ setup_hfsc() {
     # Apply STAB on upload roots, and on download IFB roots only when enabled.
     if should_apply_root_stab "$DIR"; then
         # shellcheck disable=SC2086
-        tc qdisc replace dev "$DEV" handle 1: root ${TC_OH_PARAMS} hfsc default 13
+        tc qdisc replace dev "$DEV" handle 1: root ${TC_OH_PARAMS} hfsc default 13 ||
+            qdisc_setup_failed "Failed to create HFSC root qdisc on $DEV."
     else
-        tc qdisc replace dev "$DEV" handle 1: root hfsc default 13
+        tc qdisc replace dev "$DEV" handle 1: root hfsc default 13 ||
+            qdisc_setup_failed "Failed to create HFSC root qdisc on $DEV."
     fi
 
     # DUR calculation
@@ -1801,19 +1805,22 @@ setup_hfsc() {
     # Attach Qdiscs
     setup_game_qdisc "$DEV" "$RATE" "$GAMERATE" "$GAME_QDISC_TYPE" "$DIR" \
                      "$MTU" "$MAXDEL" "$PFIFOMIN" "$PACKETSIZE" \
-                     "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp"
+                     "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp" ||
+        qdisc_setup_failed "Failed to set up $GAME_QDISC_TYPE game qdisc on $DEV."
 
     # Attach non-game qdiscs
     local INTVL=$((100+2*MTU*8/RATE))
     local TARG=$((540*8/RATE+4))
     for i in 12 13 14 15; do 
         if [ "$nongameqdisc" = "cake" ]; then
-            tc qdisc add dev "$DEV" parent "1:$i" cake $nongameqdiscoptions
+            tc qdisc add dev "$DEV" parent "1:$i" cake $nongameqdiscoptions ||
+                qdisc_setup_failed "Failed to attach CAKE non-game qdisc to 1:$i on $DEV."
         elif [ "$nongameqdisc" = "fq_codel" ]; then
-            tc qdisc add dev "$DEV" parent "1:$i" fq_codel memory_limit "$(fq_codel_memory_limit "$RATE")" interval "${INTVL}ms" target "${TARG}ms" quantum $((MTU * 2))
+            tc qdisc add dev "$DEV" parent "1:$i" fq_codel memory_limit "$(fq_codel_memory_limit "$RATE")" interval "${INTVL}ms" target "${TARG}ms" quantum $((MTU * 2)) ||
+                qdisc_setup_failed "Failed to attach fq_codel non-game qdisc to 1:$i on $DEV."
         else
             print_msg -err "Unsupported qdisc for non-game traffic: $nongameqdisc"
-            exit 1
+            qdisc_setup_failed "Unsupported non-game qdisc '$nongameqdisc' on $DEV."
         fi
     done
 
@@ -1840,8 +1847,25 @@ setup_hfsc() {
 qdisc_setup_failed() {
     [ -n "$1" ] && error_out "$1"
     error_out "Failed to set up $ROOT_QDISC."
-    # *** Any additional error handling needed? ***
+    rollback_qdisc_setup
     exit 1
+}
+
+rollback_qdisc_setup() {
+    local dev
+
+    for dev in $QDISC_SETUP_WAN_DEVICES; do
+        tc qdisc del dev "$dev" ingress > /dev/null 2>&1
+        tc qdisc del dev "$dev" root > /dev/null 2>&1
+    done
+
+    for dev in $QDISC_SETUP_LAN_DEVICES; do
+        if ip link show "$dev" > /dev/null 2>&1; then
+            tc qdisc del dev "$dev" root > /dev/null 2>&1
+            ip link set "$dev" down > /dev/null 2>&1
+            ip link del "$dev" > /dev/null 2>&1
+        fi
+    done
 }
 
 # Appends option to ${CAKE_OPTS}
@@ -1986,9 +2010,11 @@ setup_hybrid() {
     # Apply STAB on upload roots, and on download IFB roots only when enabled.
     if should_apply_root_stab "$DIR"; then
         # shellcheck disable=SC2086
-        tc qdisc replace dev "$DEV" handle 1: root ${TC_OH_PARAMS} hfsc default 13
+        tc qdisc replace dev "$DEV" handle 1: root ${TC_OH_PARAMS} hfsc default 13 ||
+            qdisc_setup_failed "Failed to create Hybrid HFSC root qdisc on $DEV."
     else
-        tc qdisc replace dev "$DEV" handle 1: root hfsc default 13
+        tc qdisc replace dev "$DEV" handle 1: root hfsc default 13 ||
+            qdisc_setup_failed "Failed to create Hybrid HFSC root qdisc on $DEV."
     fi
 
     # Main link class
@@ -1999,7 +2025,8 @@ setup_hybrid() {
     # Attach game qdisc (using $gameqdisc from HFSC config)
     setup_game_qdisc "$DEV" "$RATE" "$GAMERATE" "$gameqdisc" "$DIR" \
                      "$MTU" "$MAXDEL" "$PFIFOMIN" "$PACKETSIZE" \
-                     "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp"
+                     "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp" ||
+        qdisc_setup_failed "Failed to set up $gameqdisc game qdisc on $DEV."
 
     # Class 1:13 - CAKE class (most traffic - default)
     local cake_rate=$((SHAPER_RATE - GAMERATE)); [ "$cake_rate" -le 0 ] && cake_rate=1
@@ -2041,7 +2068,8 @@ debug_log "$DIR HYBRID cake opts: '$CAKE_OPTS'"
     local INTVL=$((100+2*MTU*8/SHAPER_RATE))
     local TARG=$((540*8/SHAPER_RATE+4))
     tc qdisc del dev "$DEV" parent 1:15 handle 15: > /dev/null 2>&1
-    tc qdisc replace dev "$DEV" parent 1:15 handle 15: fq_codel memory_limit "$(fq_codel_memory_limit "$SHAPER_RATE")" interval "${INTVL}ms" target "${TARG}ms" quantum $((MTU * 2))
+    tc qdisc replace dev "$DEV" parent 1:15 handle 15: fq_codel memory_limit "$(fq_codel_memory_limit "$SHAPER_RATE")" interval "${INTVL}ms" target "${TARG}ms" quantum $((MTU * 2)) ||
+        qdisc_setup_failed "Failed to attach Hybrid bulk fq_codel qdisc on $DEV."
 
     # Apply DSCP Filters (on ingress always, on egress only when SFO active)
     if [ "$DIR" = "lan" ] || [ "$SFO_ENABLED" = "1" ]; then
@@ -2150,9 +2178,11 @@ setup_htb() {
     # Apply STAB on upload roots, and on download IFB roots only when enabled.
     if should_apply_root_stab "$DIR"; then
         # shellcheck disable=SC2086
-        tc qdisc add dev "$DEV" root handle 1: $TC_OH_PARAMS htb default 13
+        tc qdisc add dev "$DEV" root handle 1: $TC_OH_PARAMS htb default 13 ||
+            qdisc_setup_failed "Failed to create HTB root qdisc on $DEV."
     else
-        tc qdisc add dev "$DEV" root handle 1: htb default 13
+        tc qdisc add dev "$DEV" root handle 1: htb default 13 ||
+            qdisc_setup_failed "Failed to create HTB root qdisc on $DEV."
     fi
 
     # Calculate HTB quantum for root (all use same quantum)
@@ -2237,17 +2267,20 @@ setup_htb() {
     # Priority class gets fq_codel with aggressive settings
     tc qdisc add dev "$DEV" parent 1:11 handle 110: fq_codel \
         interval "${INTVL}ms" target "${TARG}ms" \
-        quantum 300
+        quantum 300 ||
+        qdisc_setup_failed "Failed to attach HTB realtime fq_codel qdisc on $DEV."
 
     # Best effort with standard settings
     tc qdisc add dev "$DEV" parent 1:13 handle 130: fq_codel \
         interval "${INTVL}ms" target "${TARG}ms" \
-        quantum 1500
+        quantum 1500 ||
+        qdisc_setup_failed "Failed to attach HTB default fq_codel qdisc on $DEV."
 
     # Background with larger target
     tc qdisc add dev "$DEV" parent 1:15 handle 150: fq_codel \
         interval "$((INTVL*2))ms" target "$((TARG*2))ms" \
-        quantum 300
+        quantum 300 ||
+        qdisc_setup_failed "Failed to attach HTB bulk fq_codel qdisc on $DEV."
 
     # Apply DSCP filters (on ingress always, on egress only when SFO active)
     if [ "$DIR" = "lan" ] || [ "$SFO_ENABLED" = "1" ]; then
@@ -2572,6 +2605,9 @@ setup_interface() {
     # Setup IFB with matching MTU and optional multi-queue for CAKE
     local lan_dev="ifb-$device"
     local ifb_mq_args=""
+    QDISC_SETUP_WAN_DEVICES="${QDISC_SETUP_WAN_DEVICES:+$QDISC_SETUP_WAN_DEVICES }$device"
+    QDISC_SETUP_LAN_DEVICES="${QDISC_SETUP_LAN_DEVICES:+$QDISC_SETUP_LAN_DEVICES }$lan_dev"
+
     cleanup_interface_state "$device" "$lan_dev"
     disable_qos_offloads "$device" "wan"
     disable_configured_extra_offloads
@@ -2633,28 +2669,32 @@ setup_interface() {
     case "$qdisc" in
         hfsc)
             print_msg "  Applying HFSC (UL: ${upload}k, DL: ${download}k, game UL/DL: ${game_up}k/${game_down}k, MTU: ${dev_mtu})"
-            setup_interface_qdisc_direction "$device" "$upload" "$game_up" "wan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu"
-            setup_interface_qdisc_direction "$lan_dev" "$download" "$game_down" "lan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu"
+            setup_interface_qdisc_direction "$device" "$upload" "$game_up" "wan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu" ||
+                qdisc_setup_failed "Failed to set up HFSC egress on $device."
+            setup_interface_qdisc_direction "$lan_dev" "$download" "$game_down" "lan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu" ||
+                qdisc_setup_failed "Failed to set up HFSC ingress on $lan_dev."
             ;;
         cake)
             print_msg "  Applying CAKE (UL: ${upload}k, DL: ${download}k, MTU: ${dev_mtu})"
-            setup_cake "$device" "$lan_dev" "$upload" "$download" "$preset" "$overhead" "$mpu"
+            setup_cake "$device" "$lan_dev" "$upload" "$download" "$preset" "$overhead" "$mpu" ||
+                qdisc_setup_failed "Failed to set up CAKE on $device/$lan_dev."
             ;;
         htb)
             print_msg "  Applying HTB (UL: ${upload}k, DL: ${download}k, MTU: ${dev_mtu})"
-            setup_interface_qdisc_direction "$device" "$upload" 0 "wan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu"
-            setup_interface_qdisc_direction "$lan_dev" "$download" 0 "lan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu"
+            setup_interface_qdisc_direction "$device" "$upload" 0 "wan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu" ||
+                qdisc_setup_failed "Failed to set up HTB egress on $device."
+            setup_interface_qdisc_direction "$lan_dev" "$download" 0 "lan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu" ||
+                qdisc_setup_failed "Failed to set up HTB ingress on $lan_dev."
             ;;
         hybrid)
             print_msg "  Applying Hybrid (UL: ${upload}k -> $((upload * 98 / 100))k, DL: ${download}k -> $((download * 98 / 100))k, game UL/DL: ${game_up}k/${game_down}k, MTU: ${dev_mtu})"
-            setup_interface_qdisc_direction "$device" "$upload" "$game_up" "wan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu"
-            setup_interface_qdisc_direction "$lan_dev" "$download" "$game_down" "lan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu"
+            setup_interface_qdisc_direction "$device" "$upload" "$game_up" "wan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu" ||
+                qdisc_setup_failed "Failed to set up Hybrid egress on $device."
+            setup_interface_qdisc_direction "$lan_dev" "$download" "$game_down" "lan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu" ||
+                qdisc_setup_failed "Failed to set up Hybrid ingress on $lan_dev."
             ;;
         *)
-            print_msg -err "Unsupported qdisc '$qdisc' for interface $config"
-            # Fallback to HFSC?
-            setup_interface_qdisc_direction "$device" "$upload" "$game_up" "wan" "hfsc" "$preset" "$overhead" "$dev_mtu" "$mpu"
-            setup_interface_qdisc_direction "$lan_dev" "$download" "$game_down" "lan" "hfsc" "$preset" "$overhead" "$dev_mtu" "$mpu"
+            qdisc_setup_failed "Unsupported qdisc '$qdisc' for interface $config."
             ;;
     esac
 
@@ -2845,7 +2885,7 @@ if [ -z "$WAN_INTERFACES" ]; then
 fi
 
 # Generate and apply NFT rules
-generate_main_nft_file || exit 1
+generate_main_nft_file || { rollback_qdisc_setup; exit 1; }
 print_msg "NFTables rules generated."
 
 # Setup multicast policing on LAN to prevent IPTV floods on unmanaged switches
