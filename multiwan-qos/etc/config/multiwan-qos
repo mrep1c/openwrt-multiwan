@@ -48,7 +48,6 @@ config advanced 'advanced'
 
 config hfsc 'hfsc'
 	option gameqdisc 'pfifo'
-	option gameqdisc_child 'red'
 	option GAMEUP ''
 	option GAMEDOWN ''
 	option nongameqdisc 'fq_codel'

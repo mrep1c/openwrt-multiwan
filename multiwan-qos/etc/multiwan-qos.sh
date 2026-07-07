@@ -1681,14 +1681,9 @@ setup_game_qdisc() {
         "drr")
             if ! {
                 tc qdisc add dev "$DEV" parent 1:11 handle 10: drr &&
-                tc class add dev "$DEV" parent 10: classid 10:1 drr quantum 8000 &&
-                attach_classful_game_child_qdisc "$DEV" 10:1 101: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
-                tc class add dev "$DEV" parent 10: classid 10:2 drr quantum 4000 &&
-                attach_classful_game_child_qdisc "$DEV" 10:2 102: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
-                tc class add dev "$DEV" parent 10: classid 10:3 drr quantum 1000 &&
-                attach_classful_game_child_qdisc "$DEV" 10:3 103: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG"
+                tc class add dev "$DEV" parent 10: classid 10:1 drr quantum 8000
             }; then
-                qdisc_setup_failed "Failed to set up DRR $gameqdisc_child child qdisc on $DEV."
+                qdisc_setup_failed "Failed to set up DRR qdisc on $DEV."
             fi
             attach_classful_game_default_filter "$DEV" 10: 10:1 ||
                 qdisc_setup_failed "Failed to attach DRR default class filter on $DEV."
@@ -2752,13 +2747,15 @@ case "$gameqdisc" in
         ;;
 esac
 
-case "$gameqdisc_child" in
-    red|pfifo|bfifo|fq_codel) ;; # Supported DRR/QFQ child qdiscs
-    *)
-        error_out "Unsupported gameqdisc_child '$gameqdisc_child' selected in config."
-        exit 1
-        ;;
-esac
+if [ "$gameqdisc" = "qfq" ]; then
+    case "$gameqdisc_child" in
+        red|pfifo|bfifo|fq_codel) ;; # Supported QFQ child qdiscs
+        *)
+            error_out "Unsupported gameqdisc_child '$gameqdisc_child' selected for QFQ in config."
+            exit 1
+            ;;
+    esac
+fi
 
 # Handle refresh-device mode: rebuild qdiscs for one device only, then exit.
 # Usage: /bin/sh /etc/multiwan-qos.sh refresh-device <device-name>
