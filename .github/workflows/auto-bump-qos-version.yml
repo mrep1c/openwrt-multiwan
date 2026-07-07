@@ -1,0 +1,101 @@
+name: Auto Bump QoS Version
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump QoS component version when QoS changes
+        shell: pwsh
+        run: |
+          function Replace-Line {
+            param(
+              [string]$Path,
+              [string]$Pattern,
+              [string]$Replacement
+            )
+
+            $lines = @(Get-Content -LiteralPath $Path)
+            $matchCount = 0
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match $Pattern) {
+                $lines[$i] = $Replacement
+                $matchCount++
+              }
+            }
+
+            if ($matchCount -ne 1) {
+              throw "Expected one match for '$Pattern' in $Path, found $matchCount"
+            }
+
+            Set-Content -LiteralPath $Path -Value $lines
+          }
+
+          $before = "${{ github.event.before }}"
+          $head = "${{ github.sha }}"
+          if ($before -match '^0+$') {
+            $before = "HEAD^"
+          }
+
+          $changed = @(git diff --name-only $before $head | Where-Object { $_ })
+          $versionFiles = @(
+            "multiwan-qos/Makefile",
+            "luci-app-multiwan-qos/Makefile"
+          )
+
+          if ($changed | Where-Object { $versionFiles -contains $_ }) {
+            Write-Host "QoS version files changed in this push; skipping auto bump."
+            exit 0
+          }
+
+          $relevant = @($changed | Where-Object {
+            $_ -like "multiwan-qos/*" -or
+            $_ -like "luci-app-multiwan-qos/*" -or
+            $_ -eq "install.sh"
+          })
+
+          if ($relevant.Count -eq 0) {
+            Write-Host "No QoS component changes require a version bump."
+            exit 0
+          }
+
+          $makefile = "multiwan-qos/Makefile"
+          $versionLine = Select-String -Path $makefile -Pattern '^PKG_VERSION:=' | Select-Object -First 1
+          if (-not $versionLine -or $versionLine.Line -notmatch '^PKG_VERSION:=([0-9]+)\.([0-9]+)\.([0-9]+)$') {
+            throw "Could not parse PKG_VERSION from $makefile"
+          }
+
+          $newVersion = "$($Matches[1]).$($Matches[2]).$([int]$Matches[3] + 1)"
+          Replace-Line "multiwan-qos/Makefile" '^PKG_VERSION:=' "PKG_VERSION:=$newVersion"
+          Replace-Line "multiwan-qos/Makefile" '^PKG_RELEASE:=' "PKG_RELEASE:=1"
+          Replace-Line "luci-app-multiwan-qos/Makefile" '^PKG_VERSION:=' "PKG_VERSION:=$newVersion"
+          Replace-Line "luci-app-multiwan-qos/Makefile" '^PKG_RELEASE:=' "PKG_RELEASE:=1"
+          Replace-Line "luci-app-multiwan-qos/Makefile" '^PKG_PO_VERSION:=' "PKG_PO_VERSION:=${newVersion}-r1"
+          Replace-Line "multiwan-qos/etc/init.d/multiwan-qos" '^VERSION=' "VERSION=`"$newVersion`""
+          Replace-Line "multiwan-qos/etc/multiwan-qos.sh" '^VERSION=' "VERSION=`"$newVersion`"  # Official OpenWrt package version"
+          Replace-Line "luci-app-multiwan-qos/htdocs/luci-static/resources/multiwan-qos/settings.js" '^const UI_VERSION = ' "const UI_VERSION = '$newVersion';"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add multiwan-qos/Makefile luci-app-multiwan-qos/Makefile multiwan-qos/etc/init.d/multiwan-qos multiwan-qos/etc/multiwan-qos.sh luci-app-multiwan-qos/htdocs/luci-static/resources/multiwan-qos/settings.js
+
+          if (-not (git status --porcelain)) {
+            Write-Host "No version change to commit."
+            exit 0
+          }
+
+          git commit -m "Bump QoS version to $newVersion"
+          git push
