@@ -1014,6 +1014,8 @@ parse_config() {
         if (section == "interface") next
 
         ser_opt = section ":" $2
+        # Ignore obsolete defaults left in preserved conffiles from older DRR builds.
+        if (ser_opt == "hfsc:gameqdisc_child") next
         if (ser_opt in def_prim_arr) def_prim_arr[ser_opt] = val
             else def_secondary_arr[ser_opt] = val
         if (! val) next     # do not check user opts vs def opts without value
@@ -1185,6 +1187,14 @@ try_load_and_fix_config() {
             agent_commit_req=1
         }
         [ -z "$agent_commit_req" ] || uci commit multiwan-qos || return 1
+
+        if uci -q get multiwan-qos.hfsc.gameqdisc_child >/dev/null 2>&1; then
+            if [ "$(uci -q get multiwan-qos.hfsc.gameqdisc)" != "qfq" ]; then
+                log_msg "Removing obsolete option 'gameqdisc_child' from section 'hfsc'."
+                uci -q delete multiwan-qos.hfsc.gameqdisc_child || return 1
+                uci commit multiwan-qos || return 1
+            fi
+        fi
     fi
 
     config_load 'multiwan-qos' || return 1

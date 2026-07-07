@@ -5,6 +5,14 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "multiwan-nft/**"
+      - "luci-app-multiwan-nft/**"
+      - "multiwan-qos/Makefile"
+      - "luci-app-multiwan-qos/Makefile"
+      - "VERSION"
+      - "keys/**"
+      - ".github/workflows/build-openwrt-opkg.yml"
   workflow_run:
     workflows: ["Auto Bump QoS Version"]
     types: [completed]
@@ -15,12 +23,89 @@ permissions:
   contents: write
 
 jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      reason: ${{ steps.decide.outputs.reason }}
+    steps:
+      - name: Checkout package feed
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Decide whether to build feed
+        id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          build=false
+          reason="unsupported event"
+
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              build=true
+              reason="manual dispatch"
+              ;;
+            push)
+              before="$BEFORE_SHA"
+              if printf '%s' "$before" | grep -Eq '^0+$'; then
+                before="HEAD^"
+              fi
+
+              changed_files="$(git diff --name-only "$before" "$HEAD_SHA")"
+              qos_changed=false
+              qos_version_changed=false
+              for path in $changed_files; do
+                [ -n "$path" ] || continue
+                case "$path" in
+                  multiwan-qos/*|luci-app-multiwan-qos/*|install.sh)
+                    qos_changed=true
+                    ;;
+                esac
+                case "$path" in
+                  multiwan-qos/Makefile|luci-app-multiwan-qos/Makefile)
+                    qos_version_changed=true
+                    ;;
+                esac
+              done
+
+              if [ "$qos_changed" = true ] && [ "$qos_version_changed" != true ]; then
+                reason="waiting for auto-bump QoS version commit"
+              else
+                build=true
+                reason="push paths matched"
+              fi
+              ;;
+            workflow_run)
+              if [ "$WORKFLOW_RUN_CONCLUSION" != "success" ]; then
+                reason="auto-bump workflow did not succeed"
+              else
+                subject="$(git log -1 --pretty=%s)"
+                author_email="$(git log -1 --pretty=%ae)"
+                if [ "$author_email" = "41898282+github-actions[bot]@users.noreply.github.com" ] &&
+                   case "$subject" in "Bump QoS version to "*) true ;; *) false ;; esac; then
+                  build=true
+                  reason="auto-bump produced a QoS version commit"
+                else
+                  reason="auto-bump made no QoS version commit"
+                fi
+              fi
+              ;;
+          esac
+
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "$reason"
+
   build:
     name: OpenWrt ${{ matrix.release_tag }}
-    if: >-
-      (github.event_name == 'push' && github.actor != 'github-actions[bot]') ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
-      github.event_name == 'workflow_dispatch'
+    needs: preflight
+    if: needs.preflight.outputs.build == 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
