@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.19" # will become obsolete in future releases as version string is now in the init script
+VERSION="1.0.20" # will become obsolete in future releases as version string is now in the init script
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1
@@ -1593,9 +1593,12 @@ add_tc_filter() {
 attach_classful_game_default_filter() {
     local DEV="$1" PARENT="$2" CLASSID="$3"
 
-    tc filter replace dev "$DEV" parent "$PARENT" protocol ip prio 99 \
+    tc filter del dev "$DEV" parent "$PARENT" protocol ip prio 99 > /dev/null 2>&1
+    tc filter del dev "$DEV" parent "$PARENT" protocol ipv6 prio 99 > /dev/null 2>&1
+
+    tc filter add dev "$DEV" parent "$PARENT" protocol ip prio 99 \
         u32 match u32 0 0 at 0 flowid "$CLASSID" &&
-    tc filter replace dev "$DEV" parent "$PARENT" protocol ipv6 prio 99 \
+    tc filter add dev "$DEV" parent "$PARENT" protocol ipv6 prio 99 \
         u32 match u32 0 0 at 0 flowid "$CLASSID"
 }
 
@@ -1686,11 +1689,12 @@ setup_game_qdisc() {
                 tc class add dev "$DEV" parent 10: classid 10:2 drr quantum 4000 &&
                 attach_classful_game_child_qdisc "$DEV" 10:2 102: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
                 tc class add dev "$DEV" parent 10: classid 10:3 drr quantum 1000 &&
-                attach_classful_game_child_qdisc "$DEV" 10:3 103: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
-                attach_classful_game_default_filter "$DEV" 10: 10:1
+                attach_classful_game_child_qdisc "$DEV" 10:3 103: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG"
             }; then
                 qdisc_setup_failed "Failed to set up DRR $gameqdisc_child child qdisc on $DEV."
             fi
+            attach_classful_game_default_filter "$DEV" 10: 10:1 ||
+                qdisc_setup_failed "Failed to attach DRR default class filter on $DEV."
         ;;
         "qfq")
             if ! {
@@ -1700,11 +1704,12 @@ setup_game_qdisc() {
                 tc class add dev "$DEV" parent 10: classid 10:2 qfq weight 4000 &&
                 attach_classful_game_child_qdisc "$DEV" 10:2 102: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
                 tc class add dev "$DEV" parent 10: classid 10:3 qfq weight 1000 &&
-                attach_classful_game_child_qdisc "$DEV" 10:3 103: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
-                attach_classful_game_default_filter "$DEV" 10: 10:1
+                attach_classful_game_child_qdisc "$DEV" 10:3 103: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG"
             }; then
                 qdisc_setup_failed "Failed to set up QFQ $gameqdisc_child child qdisc on $DEV."
             fi
+            attach_classful_game_default_filter "$DEV" 10: 10:1 ||
+                qdisc_setup_failed "Failed to attach QFQ default class filter on $DEV."
         ;;
         "pfifo")
             tc qdisc add dev "$DEV" parent 1:11 handle 10: pfifo limit "$pfifo_limit"
@@ -2424,7 +2429,7 @@ setup_interface_qdisc_direction() {
             setup_hybrid "$DEV" "$RATE" "$GAMERATE" "$DIR" "$PRESET" "$OVERHEAD" "$MPU" "$MTU"
             ;;
         *)
-            setup_hfsc "$DEV" "$RATE" "$GAMERATE" "pfifo" "$DIR" "$PRESET" "$OVERHEAD" "$MTU" "$MPU"
+            qdisc_setup_failed "Unsupported root qdisc '$ROOT_QDISC' on $DEV."
             ;;
     esac
 }
@@ -2717,16 +2722,16 @@ setup_interface() {
 case "$gameqdisc" in
     drr|qfq|pfifo|bfifo|red|fq_codel|netem) ;; # Supported qdiscs
     *)
-        print_msg -warn "Unsupported gameqdisc '$gameqdisc' selected in config. Reverting to 'pfifo'."
-        gameqdisc="pfifo"
+        error_out "Unsupported gameqdisc '$gameqdisc' selected in config."
+        exit 1
         ;;
 esac
 
 case "$gameqdisc_child" in
     red|pfifo|bfifo|fq_codel) ;; # Supported DRR/QFQ child qdiscs
     *)
-        print_msg -warn "Unsupported gameqdisc_child '$gameqdisc_child' selected in config. Reverting to 'red'."
-        gameqdisc_child="red"
+        error_out "Unsupported gameqdisc_child '$gameqdisc_child' selected in config."
+        exit 1
         ;;
 esac
 
