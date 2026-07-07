@@ -6,7 +6,7 @@ STOP=99
 
 USE_PROCD=1
 
-VERSION="1.0.20"
+VERSION="1.0.21"
 UPD_CHANNEL="release"
 
 . "${IPKG_INSTROOT}/lib/multiwan-qos/process-lock.sh"
@@ -1728,12 +1728,16 @@ create_hotplug_script() {
     log_msg "" "Creating the hotplug script."
     # The actual hotplug logic lives in $MULTIWAN_QOS_HOTPLUG_COMMON (single source
     # of truth). The script we generate here is a thin wrapper that sources it.
-    cat > "$MULTIWAN_QOS_HOTPLUG_SCRIPT" << 'EOF'
+    if ! cat > "$MULTIWAN_QOS_HOTPLUG_SCRIPT" << 'EOF'
 #!/bin/sh
 # MultiWAN QoS hotplug handler — sources shared logic from a single file
 # to avoid drift between the packaged and init.d-generated copies.
 . /lib/multiwan-qos/hotplug-common.sh
 EOF
+    then
+        error_out "Failed to create hotplug script '$MULTIWAN_QOS_HOTPLUG_SCRIPT'."
+        return 1
+    fi
 }
 
 manage_custom_rules_file() {
@@ -1742,11 +1746,17 @@ manage_custom_rules_file() {
     case "$action" in
         create)
             # Ensure the directory exists
-            try_mkdir -p "${MULTIWAN_QOS_D}"
+            try_mkdir -p "${MULTIWAN_QOS_D}" || return 1
             
             # Create the files if they don't exist
-            [ ! -f "$MULTIWAN_QOS_CUSTOM_RULES_FILE" ] && touch "$MULTIWAN_QOS_CUSTOM_RULES_FILE"
-            [ ! -f "$MULTIWAN_QOS_INLINE_RULES_FILE" ] && touch "$MULTIWAN_QOS_INLINE_RULES_FILE"
+            [ -f "$MULTIWAN_QOS_CUSTOM_RULES_FILE" ] || touch "$MULTIWAN_QOS_CUSTOM_RULES_FILE" || {
+                error_out "Failed to create custom rules file '$MULTIWAN_QOS_CUSTOM_RULES_FILE'."
+                return 1
+            }
+            [ -f "$MULTIWAN_QOS_INLINE_RULES_FILE" ] || touch "$MULTIWAN_QOS_INLINE_RULES_FILE" || {
+                error_out "Failed to create inline rules file '$MULTIWAN_QOS_INLINE_RULES_FILE'."
+                return 1
+            }
 
             ;;
         delete)
@@ -1801,19 +1811,22 @@ start_service_impl() {
         error_out "Missing required packages. Install MultiWAN QoS through the OpenWrt feed, or run '/etc/init.d/multiwan-qos install_deps' to attempt repair."
         return 1
     }
-    create_hotplug_script
+    create_hotplug_script || return 1
 
     load_and_fix_config || return 1
 
     # Enable the global option
-    uci set multiwan-qos.global.enabled='1'
-    uci commit multiwan-qos
+    uci set multiwan-qos.global.enabled='1' &&
+    uci commit multiwan-qos || {
+        error_out "Failed to enable MultiWAN QoS in UCI."
+        return 1
+    }
     export global_enabled=1
 
     # Create custom rules file if it doesn't exist
-    manage_custom_rules_file create
+    manage_custom_rules_file create || return 1
     if validate_custom_rules; then
-        nft destroy table inet multiwan_qos_custom
+        nft destroy table inet multiwan_qos_custom 2>/dev/null
         nft -f "$MULTIWAN_QOS_CUSTOM_RULES_FILE" || { error_out "Failed to load custom nftables rules."; return 1; }
     else
         error_out "Custom rules validation failed. Not applying custom nftables rules."
@@ -1823,8 +1836,17 @@ start_service_impl() {
 
     run_with_timeout 90 /bin/sh "$MULTIWAN_QOS_MAIN_SCRIPT" || { error_out "Failed to start multiwan_qos."; return 1; }
 
-    run_with_timeout 30 /etc/init.d/firewall reload &&
-    enable || return 1
+    if ! run_with_timeout 30 /etc/init.d/firewall reload; then
+        error_out "Firewall reload failed after MultiWAN QoS setup; rolling back qdisc/nft state."
+        DISABLE_ON_STOP=0 stop_service_impl
+        return 1
+    fi
+
+    enable || {
+        error_out "Failed to enable MultiWAN QoS init service; rolling back qdisc/nft state."
+        DISABLE_ON_STOP=0 stop_service_impl
+        return 1
+    }
 
     log_msg "Service started"
 }

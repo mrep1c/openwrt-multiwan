@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.20" # will become obsolete in future releases as version string is now in the init script
+VERSION="1.0.21" # will become obsolete in future releases as version string is now in the init script
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1
@@ -1289,7 +1289,10 @@ generate_dscp_ct_save() {
 generate_main_nft_file() {
     ## Check if the folder does not exist
     if [ ! -d "/usr/share/nftables.d/ruleset-post" ]; then
-        mkdir -p "/usr/share/nftables.d/ruleset-post"
+        mkdir -p "/usr/share/nftables.d/ruleset-post" || {
+            error_out "Failed to create nftables ruleset-post directory."
+            return 1
+        }
     fi
 
     local priomap_elements
@@ -1299,8 +1302,7 @@ generate_main_nft_file() {
     # Generate independent DSCP safe-save chains to preserve upper bits (Mwan3 marks)
     generate_dscp_ct_save
 
-cat << DSCPEOF > /tmp/multiwan_qos_dscptag.nft.tmp
-
+if ! cat << DSCPEOF > /tmp/multiwan_qos_dscptag.nft.tmp
 define udpbulkport = {$UDPBULKPORT}
 define tcpbulkport = {$TCPBULKPORT}
 define vidconfports = {$VIDCONFPORTS}
@@ -1491,10 +1493,18 @@ $(generate_ratelimit_rules)
 $CT_SAVE_CHAINS
 }
 DSCPEOF
+then
+    error_out "Failed to write temporary nftables rules file."
+    return 1
+fi
 
     local validate_log="/tmp/multiwan_qos_dscptag_validate.log"
     if nft -c -f /tmp/multiwan_qos_dscptag.nft.tmp >"$validate_log" 2>&1; then
-        mv /tmp/multiwan_qos_dscptag.nft.tmp /usr/share/nftables.d/ruleset-post/dscptag.nft
+        mv /tmp/multiwan_qos_dscptag.nft.tmp /usr/share/nftables.d/ruleset-post/dscptag.nft || {
+            error_out "Failed to install generated nftables rules file."
+            rm -f /tmp/multiwan_qos_dscptag.nft.tmp "$validate_log"
+            return 1
+        }
         rm -f "$validate_log"
         return 0
     fi
@@ -1593,13 +1603,9 @@ add_tc_filter() {
 attach_classful_game_default_filter() {
     local DEV="$1" PARENT="$2" CLASSID="$3"
 
-    tc filter del dev "$DEV" parent "$PARENT" protocol ip prio 99 > /dev/null 2>&1
-    tc filter del dev "$DEV" parent "$PARENT" protocol ipv6 prio 99 > /dev/null 2>&1
-
-    tc filter add dev "$DEV" parent "$PARENT" protocol ip prio 99 \
-        u32 match u32 0 0 at 0 flowid "$CLASSID" &&
-    tc filter add dev "$DEV" parent "$PARENT" protocol ipv6 prio 99 \
-        u32 match u32 0 0 at 0 flowid "$CLASSID"
+    tc filter del dev "$DEV" parent "$PARENT" protocol all prio 99 > /dev/null 2>&1
+    tc filter add dev "$DEV" parent "$PARENT" protocol all prio 99 \
+        matchall classid "$CLASSID"
 }
 
 attach_classful_game_child_qdisc() {
@@ -1758,7 +1764,7 @@ setup_game_qdisc() {
                 # shellcheck disable=SC2086
                 tc qdisc add dev "$DEV" parent 1:11 handle 10: netem $netem_args
             else
-                # Use pfifo as fallback when NETEM is not applied in this direction
+                # NETEM is intentionally direction-scoped; keep the game class attached in the other direction.
                 tc qdisc add dev "$DEV" parent 1:11 handle 10: pfifo limit "$pfifo_limit"
             fi
         ;;
@@ -1796,16 +1802,22 @@ setup_hfsc() {
     local DUR=$((5*MTU*8/RATE)); [ "$DUR" -lt 25 ] && DUR=25
 
     # Main link class
-    tc class add dev "$DEV" parent 1: classid 1:1 hfsc ls m2 "${RATE}kbit" ul m2 "${RATE}kbit"
+    tc class add dev "$DEV" parent 1: classid 1:1 hfsc ls m2 "${RATE}kbit" ul m2 "${RATE}kbit" ||
+        qdisc_setup_failed "Failed to create HFSC root class 1:1 on $DEV."
     # gameburst calculation
     local gameburst=$((GAMERATE*10)); [ "$gameburst" -gt $((RATE*97/100)) ] && gameburst=$((RATE*97/100));
 
     # Define HFSC Classes
-    tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${gameburst}kbit" d "${DUR}ms" m2 "${GAMERATE}kbit" # Realtime
-    tc class add dev "$DEV" parent 1:1 classid 1:12 hfsc ls m1 "$((RATE*70/100))kbit" d "${DUR}ms" m2 "$((RATE*30/100))kbit" # Fast
-    tc class add dev "$DEV" parent 1:1 classid 1:13 hfsc ls m1 "$((RATE*20/100))kbit" d "${DUR}ms" m2 "$((RATE*45/100))kbit" # Normal (Default)
-    tc class add dev "$DEV" parent 1:1 classid 1:14 hfsc ls m1 "$((RATE*7/100))kbit" d "${DUR}ms" m2 "$((RATE*15/100))kbit"  # Low Prio
-    tc class add dev "$DEV" parent 1:1 classid 1:15 hfsc ls m1 "$((RATE*3/100))kbit" d "${DUR}ms" m2 "$((RATE*10/100))kbit"  # Bulk
+    tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${gameburst}kbit" d "${DUR}ms" m2 "${GAMERATE}kbit" ||
+        qdisc_setup_failed "Failed to create HFSC realtime class 1:11 on $DEV."
+    tc class add dev "$DEV" parent 1:1 classid 1:12 hfsc ls m1 "$((RATE*70/100))kbit" d "${DUR}ms" m2 "$((RATE*30/100))kbit" ||
+        qdisc_setup_failed "Failed to create HFSC fast class 1:12 on $DEV."
+    tc class add dev "$DEV" parent 1:1 classid 1:13 hfsc ls m1 "$((RATE*20/100))kbit" d "${DUR}ms" m2 "$((RATE*45/100))kbit" ||
+        qdisc_setup_failed "Failed to create HFSC default class 1:13 on $DEV."
+    tc class add dev "$DEV" parent 1:1 classid 1:14 hfsc ls m1 "$((RATE*7/100))kbit" d "${DUR}ms" m2 "$((RATE*15/100))kbit" ||
+        qdisc_setup_failed "Failed to create HFSC low-priority class 1:14 on $DEV."
+    tc class add dev "$DEV" parent 1:1 classid 1:15 hfsc ls m1 "$((RATE*3/100))kbit" d "${DUR}ms" m2 "$((RATE*10/100))kbit" ||
+        qdisc_setup_failed "Failed to create HFSC bulk class 1:15 on $DEV."
 
     # Attach Qdiscs
     setup_game_qdisc "$DEV" "$RATE" "$GAMERATE" "$GAME_QDISC_TYPE" "$DIR" \
@@ -1841,7 +1853,8 @@ setup_hfsc() {
         local family class_enum
         for family in ipv4 ipv6; do
             for class_enum in ef cs5 cs6 cs7 cs4 af41 af42 cs2 af11 cs1 cs0; do
-                add_tc_filter "$DEV" "$class_enum" "$family"
+                add_tc_filter "$DEV" "$class_enum" "$family" ||
+                    qdisc_setup_failed "Failed to install $family DSCP $class_enum filter on $DEV."
             done
         done
     fi
@@ -1922,18 +1935,20 @@ select_cake_qdisc() {
     [ "$USE_MQ" = "1" ] || return 0
 
     num_queues="$(get_tx_queue_count "$iface")"
-    if [ "$num_queues" -gt 1 ] 2>/dev/null && tc qdisc replace dev "$iface" root cake_mq 2>/dev/null; then
+    if [ "$num_queues" -le 1 ] 2>/dev/null; then
+        log_msg "cake_mq not enabled for $iface: only $num_queues TX queue(s)."
+        return 0
+    fi
+
+    if tc qdisc replace dev "$iface" root cake_mq 2>/dev/null; then
         tc qdisc del dev "$iface" root 2>/dev/null
         log_msg "Using cake_mq for $iface ($num_queues TX queues)."
         REPLY="cake_mq"
         return 0
     fi
 
-    if [ "$num_queues" -le 1 ] 2>/dev/null; then
-        log_msg "cake_mq not used for $iface: only $num_queues TX queue(s), using cake."
-    else
-        log_msg "cake_mq not available in kernel for $iface, using cake."
-    fi
+    error_out "cake_mq requested for $iface ($num_queues TX queues), but the kernel rejected it."
+    return 1
 }
 
 # Function to setup CAKE qdisc
@@ -1948,9 +1963,11 @@ setup_cake() {
     local ack_filter_egress_val cake_link_params="$(get_cake_link_params "$PRESET" "$OVERHEAD" "$MPU")"
     local CAKE_QDISC_EGR CAKE_QDISC_IGR
 
-    select_cake_qdisc "$WAN"
+    select_cake_qdisc "$WAN" ||
+        qdisc_setup_failed "Failed to select CAKE qdisc for $WAN."
     CAKE_QDISC_EGR="$REPLY"
-    select_cake_qdisc "$LAN"
+    select_cake_qdisc "$LAN" ||
+        qdisc_setup_failed "Failed to select CAKE qdisc for $LAN."
     CAKE_QDISC_IGR="$REPLY"
 
     # Egress (Upload) CAKE setup
@@ -2023,10 +2040,12 @@ setup_hybrid() {
     fi
 
     # Main link class
-    tc class add dev "$DEV" parent 1: classid 1:1 hfsc ls m2 "${SHAPER_RATE}kbit" ul m2 "${SHAPER_RATE}kbit"
+    tc class add dev "$DEV" parent 1: classid 1:1 hfsc ls m2 "${SHAPER_RATE}kbit" ul m2 "${SHAPER_RATE}kbit" ||
+        qdisc_setup_failed "Failed to create Hybrid root class 1:1 on $DEV."
 
     # Class 1:11 - High priority realtime (HFSC RT + gameqdisc)
-    tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${gameburst}kbit" d "${DUR}ms" m2 "${GAMERATE}kbit"
+    tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${gameburst}kbit" d "${DUR}ms" m2 "${GAMERATE}kbit" ||
+        qdisc_setup_failed "Failed to create Hybrid realtime class 1:11 on $DEV."
     # Attach game qdisc (using $gameqdisc from HFSC config)
     setup_game_qdisc "$DEV" "$RATE" "$GAMERATE" "$gameqdisc" "$DIR" \
                      "$MTU" "$MAXDEL" "$PFIFOMIN" "$PACKETSIZE" \
@@ -2035,7 +2054,8 @@ setup_hybrid() {
 
     # Class 1:13 - CAKE class (most traffic - default)
     local cake_rate=$((SHAPER_RATE - GAMERATE)); [ "$cake_rate" -le 0 ] && cake_rate=1
-    tc class add dev "$DEV" parent 1:1 classid 1:13 hfsc ls m1 "${cake_rate}kbit" d "${DUR}ms" m2 "${cake_rate}kbit"
+    tc class add dev "$DEV" parent 1:1 classid 1:13 hfsc ls m1 "${cake_rate}kbit" d "${DUR}ms" m2 "${cake_rate}kbit" ||
+        qdisc_setup_failed "Failed to create Hybrid default class 1:13 on $DEV."
 
     # Attach CAKE as a work-conserving leaf. HFSC owns shaping in Hybrid; a
     # shaped CAKE child can become non-work-conserving and build stale queues.
@@ -2068,7 +2088,8 @@ debug_log "$DIR HYBRID cake opts: '$CAKE_OPTS'"
     # Use HFSC limits: m1 3%, m2 10%
     local bulk_rate_m1=$((SHAPER_RATE*3/100)); [ "$bulk_rate_m1" -le 0 ] && bulk_rate_m1=1
     local bulk_rate_m2=$((SHAPER_RATE*10/100)); [ "$bulk_rate_m2" -le 0 ] && bulk_rate_m2=1
-    tc class add dev "$DEV" parent 1:1 classid 1:15 hfsc ls m1 "${bulk_rate_m1}kbit" d "${DUR}ms" m2 "${bulk_rate_m2}kbit"
+    tc class add dev "$DEV" parent 1:1 classid 1:15 hfsc ls m1 "${bulk_rate_m1}kbit" d "${DUR}ms" m2 "${bulk_rate_m2}kbit" ||
+        qdisc_setup_failed "Failed to create Hybrid bulk class 1:15 on $DEV."
     # Attach fq_codel (using calculations and options from HFSC config)
     local INTVL=$((100+2*MTU*8/SHAPER_RATE))
     local TARG=$((540*8/SHAPER_RATE+4))
@@ -2088,13 +2109,15 @@ debug_log "$DIR HYBRID cake opts: '$CAKE_OPTS'"
         # EF, CS5, CS6, CS7 -> Realtime
         # CS1 -> Bulk
         for class_enum in ef cs5 cs6 cs7 cs1; do
-            add_tc_filter "$DEV" "$class_enum" "ipv4"
+            add_tc_filter "$DEV" "$class_enum" "ipv4" ||
+                qdisc_setup_failed "Failed to install IPv4 DSCP $class_enum filter on $DEV."
         done
         # Default rule sends to 1:13 (CAKE)
 
         # IPv6 Filters (prio 11)
         for class_enum in ef cs5 cs6 cs7 cs1 cs0; do
-            add_tc_filter "$DEV" "$class_enum" "ipv6"
+            add_tc_filter "$DEV" "$class_enum" "ipv6" ||
+                qdisc_setup_failed "Failed to install IPv6 DSCP $class_enum filter on $DEV."
         done
     fi
 }
@@ -2202,7 +2225,8 @@ setup_htb() {
     tc class add dev "$DEV" parent 1: classid 1:1 htb \
         quantum "$HTB_QUANTUM" \
         rate "${RATE}kbit" ceil "${RATE}kbit" \
-        burst "$ROOT_BURST" cburst "$ROOT_CBURST"
+        burst "$ROOT_BURST" cburst "$ROOT_CBURST" ||
+        qdisc_setup_failed "Failed to create HTB root class 1:1 on $DEV."
 
     # Realtime/gaming traffic needs a small latency lane, not a large fixed
     # share of the link. Keep this aligned with HFSC/Hybrid.
@@ -2240,7 +2264,8 @@ setup_htb() {
     tc class add dev "$DEV" parent 1:1 classid 1:11 htb \
         quantum "$HTB_QUANTUM" \
         rate "${PRIO_RATE_MIN}kbit" ceil "${PRIO_CEIL}kbit" \
-        burst "$PRIO_BURST" cburst "$PRIO_CBURST" prio 1
+        burst "$PRIO_BURST" cburst "$PRIO_CBURST" prio 1 ||
+        qdisc_setup_failed "Failed to create HTB realtime class 1:11 on $DEV."
 
     # Calculate BE burst values - based on its own guaranteed rate
     local BE_BURST="$(calculate_htb_burst $BE_MIN_RATE 10000 "$MTU")"  # 10ms burst for rate
@@ -2251,7 +2276,8 @@ setup_htb() {
     tc class add dev "$DEV" parent 1:1 classid 1:13 htb \
         quantum "$HTB_QUANTUM" \
         rate "${BE_MIN_RATE}kbit" ceil "${BE_CEIL}kbit" \
-        burst "$BE_BURST" cburst "$BE_CBURST" prio 2
+        burst "$BE_BURST" cburst "$BE_CBURST" prio 2 ||
+        qdisc_setup_failed "Failed to create HTB default class 1:13 on $DEV."
 
     # Calculate BK burst values - based on its own guaranteed rate
     local BK_BURST="$(calculate_htb_burst $BK_MIN_RATE 10000 "$MTU")"  # 10ms burst for rate
@@ -2262,7 +2288,8 @@ setup_htb() {
     tc class add dev "$DEV" parent 1:1 classid 1:15 htb \
         quantum "$HTB_QUANTUM" \
         rate "${BK_MIN_RATE}kbit" ceil "${BE_CEIL}kbit" \
-        burst "$BK_BURST" cburst "$BK_CBURST" prio 3
+        burst "$BK_BURST" cburst "$BK_CBURST" prio 3 ||
+        qdisc_setup_failed "Failed to create HTB bulk class 1:15 on $DEV."
 
     # Attach leaf qdiscs
     # Calculate fq_codel parameters
@@ -2297,12 +2324,14 @@ setup_htb() {
         # Priority class: EF, CS5, CS6, CS7 -> 1:11
         # Background class: CS1 -> 1:15
         for class_enum in ef cs5 cs6 cs7 cs1; do
-            add_tc_filter "$DEV" "$class_enum" "ipv4"
+            add_tc_filter "$DEV" "$class_enum" "ipv4" ||
+                qdisc_setup_failed "Failed to install IPv4 DSCP $class_enum filter on $DEV."
         done
 
         # IPv6 filters (prio 11)
         for class_enum in ef cs5 cs6 cs7 cs1 cs0; do
-            add_tc_filter "$DEV" "$class_enum" "ipv6"
+            add_tc_filter "$DEV" "$class_enum" "ipv6" ||
+                qdisc_setup_failed "Failed to install IPv6 DSCP $class_enum filter on $DEV."
         done
     fi
 }
@@ -2324,6 +2353,7 @@ apply_tc_custom_ingress_rules() {
     process_tc_ingress_rule() {
         local config="$1"
         local enabled name proto class src_port_raw src_ip_raw dest_port_raw dest_ip_raw class_id
+        local rule_label
 
         config_get_bool enabled "$config" enabled 1
         [ "$enabled" -eq 0 ] && return 0
@@ -2335,6 +2365,7 @@ apply_tc_custom_ingress_rules() {
         config_get dest_port_raw "$config" dest_port ""
         config_get src_ip_raw    "$config" src_ip    ""
         config_get dest_ip_raw   "$config" dest_ip   ""
+        rule_label="${name:-$config}"
 
         [ -z "$class" ] && return 0
         class_id="$(get_dscp_classid_for_qdisc "$class" "$qdisc")"
@@ -2396,13 +2427,15 @@ apply_tc_custom_ingress_rules() {
                                     [ "$p_dst" != "__SKIP__" ] && p_match="$p_match src_port $p_dst"
                                 fi
                                 
-                                tc filter add dev "$lan_dev" parent 1: prio 1 protocol "$ip_fam" flower $p_match $ip_match classid "$class_id"
+                                tc filter add dev "$lan_dev" parent 1: prio 1 protocol "$ip_fam" flower $p_match $ip_match classid "$class_id" ||
+                                    qdisc_setup_failed "Failed to install custom ingress rule '$rule_label' on $lan_dev."
                             done
                         done
                     done
                 else
                     # No ports, just match IP and/or L4 protocol
-                    tc filter add dev "$lan_dev" parent 1: prio 1 protocol "$ip_fam" flower $tc_l4proto $ip_match classid "$class_id"
+                    tc filter add dev "$lan_dev" parent 1: prio 1 protocol "$ip_fam" flower $tc_l4proto $ip_match classid "$class_id" ||
+                        qdisc_setup_failed "Failed to install custom ingress rule '$rule_label' on $lan_dev."
                 fi
             done
         done
@@ -2703,13 +2736,14 @@ setup_interface() {
             ;;
     esac
 
-    # Instead of relying strictly on DSCP tags carrying into the IFB, map specific ports statelessly via tc flower rules ahead of the fallback matchers.
+    # Instead of relying strictly on DSCP tags carrying into the IFB, map specific ports statelessly via tc flower rules ahead of the default matchers.
     apply_tc_custom_ingress_rules "$lan_dev" "$qdisc"
 
     # SFO compatibility
     if [ "$SFO_ENABLED" = "1" ]; then
         print_msg "  Enabling SFO compatibility"
-        tc filter add dev "$device" parent 1: protocol all matchall action ctinfo dscp 63 128 continue
+        tc filter add dev "$device" parent 1: protocol all matchall action ctinfo dscp 63 128 continue ||
+            qdisc_setup_failed "Failed to install SFO ctinfo filter on $device."
     fi
 }
 
