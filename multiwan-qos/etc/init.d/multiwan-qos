@@ -6,7 +6,7 @@ STOP=99
 
 USE_PROCD=1
 
-VERSION="1.0.16"
+VERSION="1.0.17"
 UPD_CHANNEL="release"
 
 . "${IPKG_INSTROOT}/lib/multiwan-qos/process-lock.sh"
@@ -24,7 +24,7 @@ EXTRA_HELP="
         check_deps                 Check required runtime packages
         install_deps               Install missing runtime packages with apk/opkg"
 
-REQUIRED_PACKAGES="kmod-sched ip-full nftables kmod-veth tc-full kmod-netem kmod-sched-ctinfo kmod-ifb kmod-sched-cake kmod-sched-red kmod-sched-flower luci-lib-jsonc lua jsonfilter uclient-fetch ethtool"
+REQUIRED_PACKAGES="kmod-sched ip-full nftables kmod-veth tc-full kmod-netem kmod-sched-ctinfo kmod-ifb kmod-sched-cake kmod-sched-red kmod-sched-drr kmod-sched-flower luci-lib-jsonc lua jsonfilter uclient-fetch ethtool"
 
 ### Utility vars
 _NL_='

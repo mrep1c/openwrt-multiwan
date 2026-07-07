@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=multiwan-qos
-PKG_VERSION:=1.0.16
+PKG_VERSION:=1.0.17
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=Markus Hütter <mh@hudra.net>
@@ -15,7 +15,7 @@ define Package/multiwan-qos
   CATEGORY:=Base system
   PKGARCH:=all
   TITLE:=MultiWAN QoS - Quality of Service management tool
-  DEPENDS:=+kmod-sched +ip-full +nftables +kmod-veth +tc-full +kmod-netem +kmod-sched-ctinfo +kmod-ifb +kmod-sched-cake +kmod-sched-red +kmod-sched-flower +lua +luci-lib-jsonc +jsonfilter +uclient-fetch +ethtool
+  DEPENDS:=+kmod-sched +ip-full +nftables +kmod-veth +tc-full +kmod-netem +kmod-sched-ctinfo +kmod-ifb +kmod-sched-cake +kmod-sched-red +kmod-sched-drr +kmod-sched-flower +lua +luci-lib-jsonc +jsonfilter +uclient-fetch +ethtool
   PROVIDES:=qosmate
   CONFLICTS:=qosmate
   REPLACES:=qosmate

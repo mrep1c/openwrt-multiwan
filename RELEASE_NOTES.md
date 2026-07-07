@@ -1,5 +1,13 @@
 # Release Notes
 
+## v1.0.17
+
+QoS DRR game queue feed release.
+
+- Exposes DRR as a selectable HFSC/Hybrid game queue discipline in LuCI.
+- Adds `kmod-sched-drr` to QoS package and runtime dependency checks.
+- Leaves QFQ hidden because OpenWrt does not package it as a normal scheduler module.
+
 ## v1.0.16
 
 QoSmate audit follow-up and feed release.

@@ -174,6 +174,7 @@ return view.extend({
         o.value('fq_codel', _('FQ_CODEL'));
         o.value('bfifo', _('BFIFO'));
         o.value('red', _('RED'));
+        o.value('drr', _('DRR'));
         o.value('netem', _('NETEM'));
         o.default = 'pfifo';
 
