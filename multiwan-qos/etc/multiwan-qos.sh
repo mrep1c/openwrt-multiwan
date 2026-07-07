@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.17" # will become obsolete in future releases as version string is now in the init script
+VERSION="1.0.18" # will become obsolete in future releases as version string is now in the init script
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1
@@ -12,7 +12,7 @@ DEFAULT_IFS=" 	${_NL_}"
 IFS="$DEFAULT_IFS"
 
 : "${VERSION}" "${global_enabled:=}" "${nongameqdisc:=}" "${nongameqdiscoptions:=}" "${OVERHEAD:=}"
-: "${gameqdisc:=pfifo}" "${nongameqdisc:=fq_codel}" "${ACK_FILTER_EGRESS:=auto}"
+: "${gameqdisc:=pfifo}" "${gameqdisc_child:=red}" "${nongameqdisc:=fq_codel}" "${ACK_FILTER_EGRESS:=auto}"
 : "${DOWNLOAD_IFB_STAB:=0}"
 : "${DISABLE_QOS_OFFLOADS:=1}"
 : "${USE_MQ:=0}"
@@ -1588,6 +1588,44 @@ add_tc_filter() {
     tc filter add dev "$dev" parent 1: protocol "$proto" prio "$prio" u32 match $match_str classid "$class_id"
 }
 
+attach_classful_game_default_filter() {
+    local DEV="$1" PARENT="$2" CLASSID="$3"
+
+    tc filter del dev "$DEV" parent "$PARENT" prio 99 > /dev/null 2>&1
+    tc filter add dev "$DEV" parent "$PARENT" protocol ip prio 99 \
+        u32 match u32 0 0 at 0 classid "$CLASSID" &&
+    tc filter add dev "$DEV" parent "$PARENT" protocol ipv6 prio 99 \
+        u32 match u32 0 0 at 0 classid "$CLASSID"
+}
+
+attach_classful_game_child_qdisc() {
+    local DEV="$1" PARENT="$2" HANDLE="$3" CHILD_QDISC="$4" GAMERATE="$5" MTU="$6"
+    local pfifo_limit="$7" bfifo_limit="$8" REDMIN="$9" REDMAX="${10}"
+    local BURST="${11}" INTVL="${12}" TARG="${13}"
+
+    case "$CHILD_QDISC" in
+        "pfifo")
+            tc qdisc add dev "$DEV" parent "$PARENT" handle "$HANDLE" pfifo limit "$pfifo_limit"
+            ;;
+        "bfifo")
+            tc qdisc add dev "$DEV" parent "$PARENT" handle "$HANDLE" bfifo limit "$bfifo_limit"
+            ;;
+        "fq_codel")
+            tc qdisc add dev "$DEV" parent "$PARENT" handle "$HANDLE" fq_codel \
+                memory_limit "$(fq_codel_memory_limit "$GAMERATE")" \
+                interval "${INTVL}ms" target "${TARG}ms" quantum $((MTU * 2))
+            ;;
+        "red")
+            tc qdisc add dev "$DEV" parent "$PARENT" handle "$HANDLE" red \
+                limit 150000 min "$REDMIN" max "$REDMAX" avpkt 500 \
+                bandwidth "${GAMERATE}kbit" probability 1.0 burst "$BURST"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # Function to setup the specific game qdisc (pfifo, red, fq_codel, netem, etc.)
 # Arguments: $1:DEV, $2:RATE, $3:GAMERATE, $4:QDISC_TYPE, $5:DIR, $6:MTU, ... HFSC params ...
 setup_game_qdisc() {
@@ -1640,22 +1678,30 @@ setup_game_qdisc() {
 
     case $QDISC_TYPE in
         "drr")
-            tc qdisc add dev "$DEV" parent 1:11 handle 10: drr
-            tc class add dev "$DEV" parent 10: classid 10:1 drr quantum 8000
-            tc qdisc add dev "$DEV" parent 10:1 handle 11: red limit 150000 min $REDMIN max $REDMAX avpkt 500 bandwidth "${GAMERATE}kbit" probability 1.0 burst $BURST
-            tc class add dev "$DEV" parent 10: classid 10:2 drr quantum 4000
-            tc qdisc add dev "$DEV" parent 10:2 handle 12: red limit 150000 min $REDMIN max $REDMAX avpkt 500 bandwidth "${GAMERATE}kbit" probability 1.0 burst $BURST
-            tc class add dev "$DEV" parent 10: classid 10:3 drr quantum 1000
-            tc qdisc add dev "$DEV" parent 10:3 handle 13: red limit 150000 min $REDMIN max $REDMAX avpkt 500 bandwidth "${GAMERATE}kbit" probability 1.0 burst $BURST
+            tc qdisc add dev "$DEV" parent 1:11 handle 10: drr &&
+            tc class add dev "$DEV" parent 10: classid 10:1 drr quantum 8000 &&
+            # Keep child handles away from HFSC/Hybrid leaf handles 13: and 15:.
+            attach_classful_game_child_qdisc "$DEV" 10:1 101: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
+            tc class add dev "$DEV" parent 10: classid 10:2 drr quantum 4000 &&
+            attach_classful_game_child_qdisc "$DEV" 10:2 102: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
+            tc class add dev "$DEV" parent 10: classid 10:3 drr quantum 1000 &&
+            attach_classful_game_child_qdisc "$DEV" 10:3 103: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" ||
+                qdisc_setup_failed "Failed to attach DRR $gameqdisc_child child qdisc on $DEV."
+            attach_classful_game_default_filter "$DEV" 10: 10:1 ||
+                qdisc_setup_failed "Failed to attach DRR default class filter on $DEV."
         ;;
         "qfq")
-            tc qdisc add dev "$DEV" parent 1:11 handle 10: qfq
-            tc class add dev "$DEV" parent 10: classid 10:1 qfq weight 8000
-            tc qdisc add dev "$DEV" parent 10:1 handle 11: red limit 150000 min $REDMIN max $REDMAX avpkt 500 bandwidth "${GAMERATE}kbit" probability 1.0 burst $BURST
-            tc class add dev "$DEV" parent 10: classid 10:2 qfq weight 4000
-            tc qdisc add dev "$DEV" parent 10:2 handle 12: red limit 150000 min $REDMIN max $REDMAX avpkt 500 bandwidth "${GAMERATE}kbit" probability 1.0 burst $BURST
-            tc class add dev "$DEV" parent 10: classid 10:3 qfq weight 1000
-            tc qdisc add dev "$DEV" parent 10:3 handle 13: red limit 150000 min $REDMIN max $REDMAX avpkt 500 bandwidth "${GAMERATE}kbit" probability 1.0 burst $BURST
+            tc qdisc add dev "$DEV" parent 1:11 handle 10: qfq &&
+            tc class add dev "$DEV" parent 10: classid 10:1 qfq weight 8000 &&
+            # Keep child handles away from HFSC/Hybrid leaf handles 13: and 15:.
+            attach_classful_game_child_qdisc "$DEV" 10:1 101: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
+            tc class add dev "$DEV" parent 10: classid 10:2 qfq weight 4000 &&
+            attach_classful_game_child_qdisc "$DEV" 10:2 102: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
+            tc class add dev "$DEV" parent 10: classid 10:3 qfq weight 1000 &&
+            attach_classful_game_child_qdisc "$DEV" 10:3 103: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" ||
+                qdisc_setup_failed "Failed to attach QFQ $gameqdisc_child child qdisc on $DEV."
+            attach_classful_game_default_filter "$DEV" 10: 10:1 ||
+                qdisc_setup_failed "Failed to attach QFQ default class filter on $DEV."
         ;;
         "pfifo")
             tc qdisc add dev "$DEV" parent 1:11 handle 10: pfifo limit "$pfifo_limit"
@@ -2633,6 +2679,14 @@ case "$gameqdisc" in
     *)
         print_msg -warn "Unsupported gameqdisc '$gameqdisc' selected in config. Reverting to 'pfifo'."
         gameqdisc="pfifo"
+        ;;
+esac
+
+case "$gameqdisc_child" in
+    red|pfifo|bfifo|fq_codel) ;; # Supported DRR/QFQ child qdiscs
+    *)
+        print_msg -warn "Unsupported gameqdisc_child '$gameqdisc_child' selected in config. Reverting to 'red'."
+        gameqdisc_child="red"
         ;;
 esac
 

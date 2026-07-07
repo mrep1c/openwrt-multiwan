@@ -33,6 +33,7 @@ function addRelevanceInfo(description, settingName, rootQdisc, gameqdisc) {
         // Check gameqdisc-specific dependencies
         var gameqdiscDependencies = {
             'netem': ['netemdelayms', 'netemjitterms', 'netemdist', 'netem_direction', 'pktlossp'],
+            'drr': ['gameqdisc_child'],
             'pfifo': ['PFIFOMIN', 'PACKETSIZE'], // PFIFO-specific settings
             // MAXDEL is used by multiple qdiscs, so handle separately
         };
@@ -177,6 +178,16 @@ return view.extend({
         o.value('drr', _('DRR'));
         o.value('netem', _('NETEM'));
         o.default = 'pfifo';
+
+        o = s.option(form.ListValue, 'gameqdisc_child', _('DRR Child Queue Discipline'),
+            addRelevanceInfo(_('Leaf queueing discipline attached below DRR child classes. RED preserves the existing behavior.'), 'gameqdisc_child', rootQdisc, gameqdisc));
+        o.value('red', _('RED'));
+        o.value('pfifo', _('PFIFO'));
+        o.value('bfifo', _('BFIFO'));
+        o.value('fq_codel', _('FQ_CODEL'));
+        o.default = 'red';
+        o.rmempty = false;
+        o.depends('gameqdisc', 'drr');
 
         createOption('GAMEUP', _('Realtime Upload Reserve Override (kbit/s)'), _('Optional bandwidth override for the realtime/game upload lane. Leave empty for auto 1500 kbit/s, capped at 25% of very slow links. Increase only if realtime drops persist; use the stale-packet budget for freshness.'), _('Default: auto'), 'uinteger');
         createOption('GAMEDOWN', _('Realtime Download Reserve Override (kbit/s)'), _('Optional bandwidth override for the realtime/game download lane. Leave empty for auto 1500 kbit/s, capped at 25% of very slow links. Increase only if realtime drops persist; use the stale-packet budget for freshness.'), _('Default: auto'), 'uinteger');
