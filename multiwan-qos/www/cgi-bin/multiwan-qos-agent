@@ -844,18 +844,6 @@ local function apply_connection_rules(pc_ip, connections, dscp_class, dscp_value
         end
     end
 
-    if rules_added == 0 and ignored_connections > 0 then
-        local previous_rule_count = tonumber(existing_state and existing_state.rule_count or 0) or 0
-        local previous_dscp = tonumber(existing_state and existing_state.dscp or -1) or -1
-        if previous_rule_count > 0 and previous_dscp == dscp_value then
-            local verification = verify_agent_rules(previous_rule_count, existing_state.dscp_class, tonumber(existing_state.dscp))
-            if verification and verification.ok then
-                return previous_rule_count, nil, verification, existing_state.rules or {},
-                    ignored_connections, conntrack_resolved, conntrack_unmatched, true
-            end
-        end
-    end
-
     local tmp_file = "/tmp/multiwan_qos_agent_rules.nft"
     local f = io.open(tmp_file, "w")
     if not f then

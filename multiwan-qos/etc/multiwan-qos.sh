@@ -1509,15 +1509,6 @@ fi
         return 0
     fi
 
-    if [ "$AGENT_ENABLED" = "1" ] && [ -z "$MULTIWAN_QOS_AGENT_NFT_FALLBACK" ]; then
-        log_msg -warn "Agent-enabled nftables validation failed. Retrying without PC Agent chain for this run."
-        MULTIWAN_QOS_AGENT_NFT_FALLBACK=1
-        AGENT_CHAIN=""
-        AGENT_JUMP=""
-        generate_main_nft_file
-        return $?
-    fi
-
     error_out "Generated nftables rules failed validation. Existing active rules were not overwritten."
     if [ -s "$validate_log" ]; then
         while IFS= read -r line; do
