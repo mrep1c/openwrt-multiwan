@@ -13,6 +13,8 @@ IFS="$DEFAULT_IFS"
 
 : "${VERSION}" "${global_enabled:=}" "${nongameqdisc:=}" "${nongameqdiscoptions:=}" "${OVERHEAD:=}"
 : "${gameqdisc:=pfifo}" "${gameqdisc_child:=red}" "${nongameqdisc:=fq_codel}" "${ACK_FILTER_EGRESS:=auto}"
+: "${freshness_mode:=auto}" "${freshness_target_ms:=18}" "${packet_size_mode:=auto}"
+: "${MAXDEL:=24}" "${PFIFOMIN:=5}" "${PACKETSIZE:=450}"
 : "${DOWNLOAD_IFB_STAB:=0}"
 : "${DISABLE_QOS_OFFLOADS:=1}"
 : "${USE_MQ:=0}"
@@ -1627,23 +1629,88 @@ attach_classful_game_child_qdisc() {
     esac
 }
 
+realtime_freshness_target_ms() {
+    local mode="${1:-auto}" custom="$2" legacy="$3" target
+
+    case "$legacy" in
+        ''|*[!0-9]*) legacy=24 ;;
+    esac
+    [ "$legacy" -gt 0 ] 2>/dev/null || legacy=24
+
+    case "$mode" in
+        tight)
+            target=14
+            ;;
+        balanced|auto|'')
+            target=18
+            ;;
+        relaxed)
+            target=24
+            ;;
+        custom)
+            case "$custom" in
+                ''|*[!0-9]*) target="$legacy" ;;
+                *) target="$custom" ;;
+            esac
+            ;;
+        *)
+            target="$legacy"
+            ;;
+    esac
+
+    [ "$target" -gt 0 ] 2>/dev/null || target="$legacy"
+    [ "$target" -gt 0 ] 2>/dev/null || target=18
+    printf '%s' "$target"
+}
+
+realtime_packet_size_bytes() {
+    local mode="${1:-auto}" manual="$2" mtu="$3" packet_size
+
+    if [ "$mode" = "manual" ]; then
+        case "$manual" in
+            ''|*[!0-9]*) packet_size= ;;
+            *) packet_size="$manual" ;;
+        esac
+    fi
+
+    [ -n "$packet_size" ] || packet_size=450
+    case "$mtu" in
+        ''|*[!0-9]*) mtu=1500 ;;
+    esac
+    [ "$mtu" -gt 0 ] 2>/dev/null || mtu=1500
+
+    [ "$packet_size" -gt "$mtu" ] 2>/dev/null && packet_size="$mtu"
+    [ "$packet_size" -lt 64 ] 2>/dev/null && packet_size=64
+    printf '%s' "$packet_size"
+}
+
 # Function to setup the specific game qdisc (pfifo, red, fq_codel, netem, etc.)
 # Arguments: $1:DEV, $2:RATE, $3:GAMERATE, $4:QDISC_TYPE, $5:DIR, $6:MTU, ... HFSC params ...
 setup_game_qdisc() {
     local DEV="$1" RATE="$2" GAMERATE="$3" QDISC_TYPE="$4" DIR="$5" MTU="$6"
     local MAXDEL="$7" PFIFOMIN="$8" PACKETSIZE="$9"
-    local netemdelayms="${10}" netemjitterms="${11}" netemdist="${12}" NETEM_DIRECTION="${13}" pktlossp="${14}"
+    local FRESHNESS_MODE="${10:-auto}" FRESHNESS_TARGET_MS="${11:-18}" PACKETSIZE_MODE="${12:-auto}"
+    local netemdelayms="${13}" netemjitterms="${14}" netemdist="${15}" NETEM_DIRECTION="${16}" pktlossp="${17}"
 
-    # Ensure rates/packetsize are non-zero to avoid errors in calculations
+    # Ensure numeric inputs are non-zero to avoid errors in calculations.
+    case "$RATE" in ''|*[!0-9]*) RATE=1 ;; esac
+    case "$GAMERATE" in ''|*[!0-9]*) GAMERATE=1 ;; esac
+    case "$MAXDEL" in ''|*[!0-9]*) MAXDEL=24 ;; esac
+    case "$PFIFOMIN" in ''|*[!0-9]*) PFIFOMIN=5 ;; esac
     [ "$RATE" -le 0 ] && RATE=1
     [ "$GAMERATE" -le 0 ] && GAMERATE=1
-    [ "$PACKETSIZE" -le 0 ] && PACKETSIZE=1
+    [ "$MAXDEL" -le 0 ] && MAXDEL=24
+    [ "$PFIFOMIN" -lt 0 ] && PFIFOMIN=5
+
+    local realtime_target_ms
+    realtime_target_ms="$(realtime_freshness_target_ms "$FRESHNESS_MODE" "$FRESHNESS_TARGET_MS" "$MAXDEL")"
+    PACKETSIZE="$(realtime_packet_size_bytes "$PACKETSIZE_MODE" "$PACKETSIZE" "$MTU")"
 
     local BFIFO_BURST_CAP_BYTES=3000
     local PFIFO_MIN_PACKETS=12
     local NETEM_MIN_PACKETS=12
 
-    local target_bytes=$((MAXDEL * GAMERATE / 8))
+    local target_bytes=$((realtime_target_ms * GAMERATE / 8))
     [ "$target_bytes" -lt 1 ] && target_bytes=1
 
     local burst_floor_bytes="$target_bytes"
@@ -1652,7 +1719,7 @@ setup_game_qdisc() {
     local bfifo_limit="$target_bytes"
     [ "$bfifo_limit" -lt "$burst_floor_bytes" ] && bfifo_limit="$burst_floor_bytes"
 
-    local pfifo_limit=$((PFIFOMIN + MAXDEL * GAMERATE / 8 / PACKETSIZE))
+    local pfifo_limit=$((PFIFOMIN + target_bytes / PACKETSIZE))
     local pfifo_delay_cap="$pfifo_limit"
     [ "$pfifo_limit" -lt "$PFIFO_MIN_PACKETS" ] && pfifo_limit=$PFIFO_MIN_PACKETS
     [ "$pfifo_limit" -gt "$pfifo_delay_cap" ] && pfifo_limit="$pfifo_delay_cap"
@@ -1673,6 +1740,8 @@ setup_game_qdisc() {
     # for fq_codel
     local INTVL=$((100+2*1500*8/GAMERATE))
     local TARG=$((540*8/GAMERATE+4))
+    [ "$TARG" -gt "$realtime_target_ms" ] && TARG="$realtime_target_ms"
+    [ "$TARG" -lt 4 ] && TARG=4
 
     # Delete previous qdisc on this handle if it exists (optional, but good practice)
     tc qdisc del dev "$DEV" parent 1:11 handle 10: > /dev/null 2>&1
@@ -1708,7 +1777,6 @@ setup_game_qdisc() {
         ;;
         "bfifo")
             tc qdisc add dev "$DEV" parent 1:11 handle 10: bfifo limit "$bfifo_limit"
-            #tc qdisc add dev "$DEV" parent 1:11 handle 10: bfifo limit $((MAXDEL * RATE / 8))
         ;;
         "red")
             tc qdisc add dev "$DEV" parent 1:11 handle 10: red limit 150000 min $REDMIN max $REDMAX avpkt 500 bandwidth "${GAMERATE}kbit" burst $BURST probability 1.0
@@ -1808,6 +1876,7 @@ setup_hfsc() {
     # Attach Qdiscs
     setup_game_qdisc "$DEV" "$RATE" "$GAMERATE" "$GAME_QDISC_TYPE" "$DIR" \
                      "$MTU" "$MAXDEL" "$PFIFOMIN" "$PACKETSIZE" \
+                     "$freshness_mode" "$freshness_target_ms" "$packet_size_mode" \
                      "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp" ||
         qdisc_setup_failed "Failed to set up $GAME_QDISC_TYPE game qdisc on $DEV."
 
@@ -2035,6 +2104,7 @@ setup_hybrid() {
     # Attach game qdisc (using $gameqdisc from HFSC config)
     setup_game_qdisc "$DEV" "$RATE" "$GAMERATE" "$gameqdisc" "$DIR" \
                      "$MTU" "$MAXDEL" "$PFIFOMIN" "$PACKETSIZE" \
+                     "$freshness_mode" "$freshness_target_ms" "$packet_size_mode" \
                      "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp" ||
         qdisc_setup_failed "Failed to set up $gameqdisc game qdisc on $DEV."
 

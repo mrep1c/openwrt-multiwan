@@ -1014,8 +1014,8 @@ parse_config() {
         if (section == "interface") next
 
         ser_opt = section ":" $2
-        # Ignore obsolete defaults left in preserved conffiles from older DRR builds.
-        if (ser_opt == "hfsc:gameqdisc_child") next
+        # Ignore obsolete defaults left in preserved conffiles from older builds.
+        if (ser_opt == "hfsc:gameqdisc_child" || ser_opt == "hfsc:MAXDEL") next
         if (ser_opt in def_prim_arr) def_prim_arr[ser_opt] = val
             else def_secondary_arr[ser_opt] = val
         if (! val) next     # do not check user opts vs def opts without value
@@ -1194,6 +1194,26 @@ try_load_and_fix_config() {
                 uci -q delete multiwan-qos.hfsc.gameqdisc_child || return 1
                 uci commit multiwan-qos || return 1
             fi
+        fi
+
+        if uci -q get multiwan-qos.hfsc.MAXDEL >/dev/null 2>&1; then
+            local legacy_maxdel freshness_mode_current freshness_target_current
+            legacy_maxdel="$(uci -q get multiwan-qos.hfsc.MAXDEL)"
+            freshness_mode_current="$(uci -q get multiwan-qos.hfsc.freshness_mode)"
+            freshness_target_current="$(uci -q get multiwan-qos.hfsc.freshness_target_ms)"
+            case "$legacy_maxdel" in
+                ''|*[!0-9]*) legacy_maxdel= ;;
+            esac
+            if [ -n "$legacy_maxdel" ] && [ "$legacy_maxdel" -gt 0 ] 2>/dev/null; then
+                if [ "${freshness_mode_current:-auto}" = "auto" ] && { [ -z "$freshness_target_current" ] || [ "$freshness_target_current" = "18" ]; }; then
+                    log_msg "Migrating obsolete option 'MAXDEL' to hfsc.freshness_target_ms."
+                    uci set multiwan-qos.hfsc.freshness_mode='custom' || return 1
+                    uci set "multiwan-qos.hfsc.freshness_target_ms=$legacy_maxdel" || return 1
+                fi
+            fi
+            log_msg "Removing obsolete option 'MAXDEL' from section 'hfsc'."
+            uci -q delete multiwan-qos.hfsc.MAXDEL || return 1
+            uci commit multiwan-qos || return 1
         fi
     fi
 
