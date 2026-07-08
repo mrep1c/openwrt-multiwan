@@ -1015,7 +1015,7 @@ parse_config() {
 
         ser_opt = section ":" $2
         # Ignore obsolete defaults left in preserved conffiles from older builds.
-        if (ser_opt == "hfsc:gameqdisc_child" || ser_opt == "hfsc:MAXDEL") next
+        if (ser_opt == "hfsc:gameqdisc_child" || ser_opt == "hfsc:MAXDEL" || ser_opt == "hfsc:packet_size_mode") next
         if (ser_opt in def_prim_arr) def_prim_arr[ser_opt] = val
             else def_secondary_arr[ser_opt] = val
         if (! val) next     # do not check user opts vs def opts without value
@@ -1213,6 +1213,12 @@ try_load_and_fix_config() {
             fi
             log_msg "Removing obsolete option 'MAXDEL' from section 'hfsc'."
             uci -q delete multiwan-qos.hfsc.MAXDEL || return 1
+            uci commit multiwan-qos || return 1
+        fi
+
+        if uci -q get multiwan-qos.hfsc.packet_size_mode >/dev/null 2>&1; then
+            log_msg "Removing obsolete option 'packet_size_mode' from section 'hfsc'."
+            uci -q delete multiwan-qos.hfsc.packet_size_mode || return 1
             uci commit multiwan-qos || return 1
         fi
     fi

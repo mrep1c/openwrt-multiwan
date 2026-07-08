@@ -13,7 +13,7 @@ IFS="$DEFAULT_IFS"
 
 : "${VERSION}" "${global_enabled:=}" "${nongameqdisc:=}" "${nongameqdiscoptions:=}" "${OVERHEAD:=}"
 : "${gameqdisc:=pfifo}" "${gameqdisc_child:=red}" "${nongameqdisc:=fq_codel}" "${ACK_FILTER_EGRESS:=auto}"
-: "${freshness_mode:=auto}" "${freshness_target_ms:=18}" "${packet_size_mode:=auto}"
+: "${freshness_mode:=auto}" "${freshness_target_ms:=18}"
 : "${MAXDEL:=24}" "${PFIFOMIN:=5}" "${PACKETSIZE:=450}"
 : "${DOWNLOAD_IFB_STAB:=0}"
 : "${DISABLE_QOS_OFFLOADS:=1}"
@@ -1664,16 +1664,11 @@ realtime_freshness_target_ms() {
 }
 
 realtime_packet_size_bytes() {
-    local mode="${1:-auto}" manual="$2" mtu="$3" packet_size
+    local packet_size="$1" mtu="$2"
 
-    if [ "$mode" = "manual" ]; then
-        case "$manual" in
-            ''|*[!0-9]*) packet_size= ;;
-            *) packet_size="$manual" ;;
-        esac
-    fi
-
-    [ -n "$packet_size" ] || packet_size=450
+    case "$packet_size" in
+        ''|*[!0-9]*) packet_size=450 ;;
+    esac
     case "$mtu" in
         ''|*[!0-9]*) mtu=1500 ;;
     esac
@@ -1689,8 +1684,8 @@ realtime_packet_size_bytes() {
 setup_game_qdisc() {
     local DEV="$1" RATE="$2" GAMERATE="$3" QDISC_TYPE="$4" DIR="$5" MTU="$6"
     local MAXDEL="$7" PFIFOMIN="$8" PACKETSIZE="$9"
-    local FRESHNESS_MODE="${10:-auto}" FRESHNESS_TARGET_MS="${11:-18}" PACKETSIZE_MODE="${12:-auto}"
-    local netemdelayms="${13}" netemjitterms="${14}" netemdist="${15}" NETEM_DIRECTION="${16}" pktlossp="${17}"
+    local FRESHNESS_MODE="${10:-auto}" FRESHNESS_TARGET_MS="${11:-18}"
+    local netemdelayms="${12}" netemjitterms="${13}" netemdist="${14}" NETEM_DIRECTION="${15}" pktlossp="${16}"
 
     # Ensure numeric inputs are non-zero to avoid errors in calculations.
     case "$RATE" in ''|*[!0-9]*) RATE=1 ;; esac
@@ -1704,7 +1699,7 @@ setup_game_qdisc() {
 
     local realtime_target_ms
     realtime_target_ms="$(realtime_freshness_target_ms "$FRESHNESS_MODE" "$FRESHNESS_TARGET_MS" "$MAXDEL")"
-    PACKETSIZE="$(realtime_packet_size_bytes "$PACKETSIZE_MODE" "$PACKETSIZE" "$MTU")"
+    PACKETSIZE="$(realtime_packet_size_bytes "$PACKETSIZE" "$MTU")"
 
     local BFIFO_BURST_CAP_BYTES=3000
     local PFIFO_MIN_PACKETS=12
@@ -1876,7 +1871,7 @@ setup_hfsc() {
     # Attach Qdiscs
     setup_game_qdisc "$DEV" "$RATE" "$GAMERATE" "$GAME_QDISC_TYPE" "$DIR" \
                      "$MTU" "$MAXDEL" "$PFIFOMIN" "$PACKETSIZE" \
-                     "$freshness_mode" "$freshness_target_ms" "$packet_size_mode" \
+                     "$freshness_mode" "$freshness_target_ms" \
                      "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp" ||
         qdisc_setup_failed "Failed to set up $GAME_QDISC_TYPE game qdisc on $DEV."
 
@@ -2104,7 +2099,7 @@ setup_hybrid() {
     # Attach game qdisc (using $gameqdisc from HFSC config)
     setup_game_qdisc "$DEV" "$RATE" "$GAMERATE" "$gameqdisc" "$DIR" \
                      "$MTU" "$MAXDEL" "$PFIFOMIN" "$PACKETSIZE" \
-                     "$freshness_mode" "$freshness_target_ms" "$packet_size_mode" \
+                     "$freshness_mode" "$freshness_target_ms" \
                      "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp" ||
         qdisc_setup_failed "Failed to set up $gameqdisc game qdisc on $DEV."
 

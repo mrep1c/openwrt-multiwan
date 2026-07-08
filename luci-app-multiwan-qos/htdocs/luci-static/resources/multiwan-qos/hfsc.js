@@ -33,7 +33,7 @@ function addRelevanceInfo(description, settingName, rootQdisc, gameqdisc) {
         // Check gameqdisc-specific dependencies
         var gameqdiscDependencies = {
             'netem': ['netemdelayms', 'netemjitterms', 'netemdist', 'netem_direction', 'pktlossp'],
-            'pfifo': ['PFIFOMIN', 'packet_size_mode', 'PACKETSIZE']
+            'pfifo': ['PFIFOMIN', 'PACKETSIZE']
         };
         
         // Settings that are used by multiple gameqdiscs
@@ -190,7 +190,7 @@ return view.extend({
         createOption('nongameqdiscoptions', _('Non-Game QDisc Options'), _('Cake options for non-realtime queueing discipline'), _('Default: besteffort ack-filter'));
 
         o = s.option(form.ListValue, 'freshness_mode', _('Realtime Freshness'),
-            addRelevanceInfo(_('Queue freshness preset for realtime traffic'), 'freshness_mode', rootQdisc, gameqdisc));
+            addRelevanceInfo(_('Queue freshness target for realtime traffic. Auto/Balanced: 18 ms, Tight: 14 ms, Relaxed: 24 ms, Custom: use the custom target below.'), 'freshness_mode', rootQdisc, gameqdisc));
         o.value('auto', _('Auto (Balanced)'));
         o.value('tight', _('Tight'));
         o.value('balanced', _('Balanced'));
@@ -202,15 +202,7 @@ return view.extend({
         o.depends('freshness_mode', 'custom');
 
         createOption('PFIFOMIN', _('PFIFO Min'), _('Minimum packet count for PFIFO queue'), _('Default: 5'), 'uinteger');
-
-        o = s.option(form.ListValue, 'packet_size_mode', _('Packet Size Model'),
-            addRelevanceInfo(_('Packet size source for PFIFO limit calculation'), 'packet_size_mode', rootQdisc, gameqdisc));
-        o.value('auto', _('Auto'));
-        o.value('manual', _('Manual'));
-        o.default = 'auto';
-
-        o = createOption('PACKETSIZE', _('Manual Avg Packet Size (B)'), _('Used with PFIFOMIN when Packet Size Model is Manual'), _('Default: 450'), 'uinteger');
-        o.depends('packet_size_mode', 'manual');
+        createOption('PACKETSIZE', _('Avg Packet Size (B)'), _('Used with PFIFOMIN to calculate the PFIFO packet limit. Default: 450 bytes.'), _('Default: 450'), 'uinteger');
         createOption('netemdelayms', _('NETEM Delay (ms)'), _('NETEM delay in milliseconds'), _('Default: 30'), 'uinteger');
         createOption('netemjitterms', _('NETEM Jitter (ms)'), _('NETEM jitter in milliseconds'), _('Default: 7'), 'uinteger');
 

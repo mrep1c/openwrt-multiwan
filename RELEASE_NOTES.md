@@ -6,6 +6,7 @@ QoS realtime freshness tuning.
 
 - Replaces the visible `MAXDEL` control with `Realtime Freshness` presets plus a custom target.
 - Adds qdisc-aware sizing so PFIFO, BFIFO, RED, QFQ children, NETEM fallback, and slow-link fq_codel target capping derive from the freshness target.
+- Keeps `PACKETSIZE` as the manual PFIFO average packet size input and removes the unused packet-size selector.
 - Migrates existing `hfsc.MAXDEL` values to `hfsc.freshness_mode='custom'` and `hfsc.freshness_target_ms` to preserve current router behavior on upgrade.
 - Keeps standalone DRR independent of freshness because it no longer has child qdisc queues.
 
