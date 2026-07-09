@@ -11,6 +11,7 @@ DEVICE=""
 
 IFDOWN_EVENT=0
 IFUP_EVENT=0
+READY_RECHECK_INTERVAL=1
 SLEEP_PID=""
 SLEEP_START=""
 TRACK_PID=""
@@ -248,9 +249,15 @@ connecting() {
 	fi
 }
 
-disabled() {
-	STATUS='disabled'
-	echo "disabled" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/STATUS
+waiting() {
+	local true_iface="$1"
+
+	if [ "$STATUS" != "waiting" ]; then
+		LOG notice "Waiting for interface $INTERFACE ($true_iface) to become ready"
+	fi
+
+	STATUS='waiting'
+	echo "waiting" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/STATUS
 	STARTED=0
 }
 
@@ -259,15 +266,16 @@ firstconnect() {
 	network_flush_cache
 
 	multiwan_nft_get_true_iface true_iface $INTERFACE
+	DEVICE=""
 	network_get_device DEVICE $true_iface
+
+	if ! network_is_up "$true_iface" || [ -z "$DEVICE" ]; then
+		waiting "$true_iface"
+		return
+	fi
 
 	if [ "$STATUS" != "online" ]; then
 		config_get STATUS $INTERFACE initial_state "online"
-	fi
-
-	if ! network_is_up $true_iface || [ -z "$DEVICE" ]; then
-		disabled
-		return
 	fi
 
 	multiwan_nft_get_src_ip SRC_IP $INTERFACE
@@ -370,16 +378,31 @@ main() {
 	local multiwan_qos_refresh_attempted=0
 	local multiwan_qos_refresh_pending=0
 
-	firstconnect
 	while true; do
-		if [ "$STARTED" -eq 0 ]; then
-			sleep "$MAX_SLEEP" &
-			SLEEP_PID=$!
-			SLEEP_START="$(mw_process_start_time "$SLEEP_PID")"
-			wait "$SLEEP_PID"
+		if [ "${IFDOWN_EVENT}" -eq 1 ]; then
+			LOG debug "Register ifdown event on interface ${INTERFACE} (${DEVICE})"
+			disconnected
+			waiting "$INTERFACE"
+			IFDOWN_EVENT=0
 		fi
-		SLEEP_PID=""
-		SLEEP_START=""
+		if [ "${IFUP_EVENT}" -eq 1 ]; then
+			LOG debug "Register ifup event on interface ${INTERFACE} (${DEVICE})"
+			firstconnect
+			IFUP_EVENT=0
+		fi
+
+		if [ "$STARTED" -eq 0 ]; then
+			firstconnect
+			if [ "$STARTED" -eq 0 ]; then
+				sleep "$READY_RECHECK_INTERVAL" &
+				SLEEP_PID=$!
+				SLEEP_START="$(mw_process_start_time "$SLEEP_PID")"
+				wait "$SLEEP_PID"
+			fi
+			SLEEP_PID=""
+			SLEEP_START=""
+			continue
+		fi
 		sleep_time=$interval
 		last_failed_target=
 		for track_ip in $track_ips; do
@@ -551,17 +574,6 @@ main() {
 			SLEEP_START=""
 		fi
 
-		if [ "${IFDOWN_EVENT}" -eq 1 ]; then
-			LOG debug "Register ifdown event on interface ${INTERFACE} (${DEVICE})"
-			disconnected
-			disabled
-			IFDOWN_EVENT=0
-		fi
-		if [ "${IFUP_EVENT}" -eq 1 ]; then
-			LOG debug "Register ifup event on interface ${INTERFACE} (${DEVICE})"
-			firstconnect
-			IFUP_EVENT=0
-		fi
 	done
 }
 

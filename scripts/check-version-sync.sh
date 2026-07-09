@@ -50,6 +50,20 @@ check_exact() {
 	fi
 }
 
+check_assignment() {
+	file="$1"
+	pattern="$2"
+	expected="$3"
+	label="$4"
+	local line assignment
+
+	line="$(unique_line "$file" "$pattern" "$label")" || return 0
+	assignment="$(printf '%s\n' "$line" | sed 's/[[:space:]]*#.*$//;s/[[:space:]]*$//')"
+	if [ "$assignment" != "$expected" ]; then
+		fail "$label mismatch in $file: expected '$expected', found '$line'"
+	fi
+}
+
 package_version() {
 	file="$1"
 	label="$2"
@@ -89,7 +103,7 @@ if [ -n "$qos_version" ] && [ -n "$qos_release" ]; then
 	check_exact "luci-app-multiwan-qos/Makefile" '^PKG_PO_VERSION:=' "PKG_PO_VERSION:=$qos_version-r$qos_release" "luci-app-multiwan-qos/Makefile PKG_PO_VERSION"
 fi
 check_exact "multiwan-qos/etc/init.d/multiwan-qos" '^VERSION=' "VERSION=\"$qos_version\"" "QoS init VERSION"
-check_exact "multiwan-qos/etc/multiwan-qos.sh" '^VERSION=' "VERSION=\"$qos_version\" # will become obsolete in future releases as version string is now in the init script" "QoS rules script VERSION"
+check_assignment "multiwan-qos/etc/multiwan-qos.sh" '^VERSION=' "VERSION=\"$qos_version\"" "QoS rules script VERSION"
 check_exact "luci-app-multiwan-qos/htdocs/luci-static/resources/multiwan-qos/settings.js" '^const UI_VERSION = ' "const UI_VERSION = '$qos_version';" "QoS LuCI UI_VERSION"
 
 grep -Fqx "## v$version" RELEASE_NOTES.md ||

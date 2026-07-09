@@ -40,6 +40,10 @@ function renderMwan3Status(status) {
 				time = '%t'.format(status.interfaces[iface].offline);
 				tname = _('Downtime');
 				break;
+			case 'waiting':
+				state = _('Waiting for interface');
+				css = 'warning';
+				break;
 			case 'notracking':
 				state = _('No Tracking');
 				if ((status.interfaces[iface].uptime) > 0) {
