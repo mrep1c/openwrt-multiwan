@@ -1,0 +1,155 @@
+name: Auto Bump Component Versions
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump changed package component versions
+        shell: pwsh
+        run: |
+          function Replace-Line {
+            param(
+              [string]$Path,
+              [string]$Pattern,
+              [string]$Replacement
+            )
+
+            $lines = @(Get-Content -LiteralPath $Path)
+            $matchCount = 0
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match $Pattern) {
+                $lines[$i] = $Replacement
+                $matchCount++
+              }
+            }
+
+            if ($matchCount -ne 1) {
+              throw "Expected one match for '$Pattern' in $Path, found $matchCount"
+            }
+
+            Set-Content -LiteralPath $Path -Value $lines
+          }
+
+          function Get-NextPatchVersion {
+            param([string]$Makefile)
+
+            $versionLine = Select-String -Path $Makefile -Pattern '^PKG_VERSION:=' | Select-Object -First 1
+            $versionMatch = if ($versionLine) {
+              [regex]::Match($versionLine.Line, '^PKG_VERSION:=([0-9]+)\.([0-9]+)\.([0-9]+)$')
+            }
+            if (-not $versionMatch -or -not $versionMatch.Success) {
+              throw "Could not parse PKG_VERSION from $Makefile"
+            }
+
+            return "$($versionMatch.Groups[1].Value).$($versionMatch.Groups[2].Value).$([int]$versionMatch.Groups[3].Value + 1)"
+          }
+
+          function Bump-NftVersion {
+            $newVersion = Get-NextPatchVersion "multiwan-nft/Makefile"
+            Replace-Line "multiwan-nft/Makefile" '^PKG_VERSION:=' "PKG_VERSION:=$newVersion"
+            Replace-Line "multiwan-nft/Makefile" '^PKG_RELEASE:=' "PKG_RELEASE:=1"
+            Replace-Line "luci-app-multiwan-nft/Makefile" '^PKG_VERSION:=' "PKG_VERSION:=$newVersion"
+            Replace-Line "luci-app-multiwan-nft/Makefile" '^PKG_RELEASE:=' "PKG_RELEASE:=1"
+            Replace-Line "luci-app-multiwan-nft/Makefile" '^PKG_PO_VERSION:=' "PKG_PO_VERSION:=${newVersion}-r1"
+            return $newVersion
+          }
+
+          function Bump-QosVersion {
+            $newVersion = Get-NextPatchVersion "multiwan-qos/Makefile"
+            Replace-Line "multiwan-qos/Makefile" '^PKG_VERSION:=' "PKG_VERSION:=$newVersion"
+            Replace-Line "multiwan-qos/Makefile" '^PKG_RELEASE:=' "PKG_RELEASE:=1"
+            Replace-Line "luci-app-multiwan-qos/Makefile" '^PKG_VERSION:=' "PKG_VERSION:=$newVersion"
+            Replace-Line "luci-app-multiwan-qos/Makefile" '^PKG_RELEASE:=' "PKG_RELEASE:=1"
+            Replace-Line "luci-app-multiwan-qos/Makefile" '^PKG_PO_VERSION:=' "PKG_PO_VERSION:=${newVersion}-r1"
+            Replace-Line "multiwan-qos/etc/init.d/multiwan-qos" '^VERSION=' "VERSION=`"$newVersion`""
+            Replace-Line "multiwan-qos/etc/multiwan-qos.sh" '^VERSION=' "VERSION=`"$newVersion`"  # Official OpenWrt package version"
+            Replace-Line "luci-app-multiwan-qos/htdocs/luci-static/resources/multiwan-qos/settings.js" '^const UI_VERSION = ' "const UI_VERSION = '$newVersion';"
+            return $newVersion
+          }
+
+          $before = "${{ github.event.before }}"
+          $head = "${{ github.sha }}"
+          if ($before -match '^0+$') {
+            $before = "HEAD^"
+          }
+
+          $changed = @(git diff --name-only $before $head | Where-Object { $_ })
+          $nftRelevant = @($changed | Where-Object {
+            $_ -like "multiwan-nft/*" -or
+            $_ -like "luci-app-multiwan-nft/*" -or
+            $_ -eq "install.sh"
+          })
+          $qosRelevant = @($changed | Where-Object {
+            $_ -like "multiwan-qos/*" -or
+            $_ -like "luci-app-multiwan-qos/*" -or
+            $_ -eq "install.sh"
+          })
+          $nftVersionFiles = @(
+            "multiwan-nft/Makefile",
+            "luci-app-multiwan-nft/Makefile"
+          )
+          $qosVersionFiles = @(
+            "multiwan-qos/Makefile",
+            "luci-app-multiwan-qos/Makefile"
+          )
+          $nftVersionChanged = [bool]($changed | Where-Object { $nftVersionFiles -contains $_ })
+          $qosVersionChanged = [bool]($changed | Where-Object { $qosVersionFiles -contains $_ })
+
+          $bumped = @()
+          if ($nftRelevant.Count -gt 0 -and -not $nftVersionChanged) {
+            $newVersion = Bump-NftVersion
+            $bumped += [PSCustomObject]@{ Component = "NFT"; Version = $newVersion }
+          }
+          if ($qosRelevant.Count -gt 0 -and -not $qosVersionChanged) {
+            $newVersion = Bump-QosVersion
+            $bumped += [PSCustomObject]@{ Component = "QoS"; Version = $newVersion }
+          }
+
+          if ($bumped.Count -eq 0) {
+            Write-Host "No package component version bump is required."
+            exit 0
+          }
+
+          $paths = @()
+          foreach ($component in $bumped.Component) {
+            if ($component -eq "NFT") {
+              $paths += @(
+                "multiwan-nft/Makefile",
+                "luci-app-multiwan-nft/Makefile"
+              )
+            } else {
+              $paths += @(
+                "multiwan-qos/Makefile",
+                "luci-app-multiwan-qos/Makefile",
+                "multiwan-qos/etc/init.d/multiwan-qos",
+                "multiwan-qos/etc/multiwan-qos.sh",
+                "luci-app-multiwan-qos/htdocs/luci-static/resources/multiwan-qos/settings.js"
+              )
+            }
+          }
+
+          if ($bumped.Count -eq 1) {
+            $message = "Bump $($bumped[0].Component) version to $($bumped[0].Version)"
+          } else {
+            $message = "Bump package versions: " + (($bumped | ForEach-Object { "$($_.Component) $($_.Version)" }) -join ", ")
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- $paths
+          git commit -m $message
+          git push

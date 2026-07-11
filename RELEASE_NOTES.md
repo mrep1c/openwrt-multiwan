@@ -4,6 +4,8 @@
 
 QoS realtime freshness tuning.
 
+- Corrects Hybrid HFSC default/bulk link-sharing curves so both service-curve segments exactly match their parent rate, preventing saturated IFB queues from becoming stuck.
+- Rejects Hybrid realtime rates that reach or exceed the internally shaped parent instead of creating an invalid class tree.
 - Replaces the visible `MAXDEL` control with `Realtime Freshness` presets plus a custom target.
 - Adds qdisc-aware sizing so PFIFO, BFIFO, RED, QFQ children, NETEM fallback, and slow-link fq_codel target capping derive from the freshness target.
 - Keeps `PACKETSIZE` as the manual PFIFO average packet size input and removes the unused packet-size selector.

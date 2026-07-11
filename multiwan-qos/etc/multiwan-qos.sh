@@ -2069,6 +2069,16 @@ setup_hybrid() {
     local MTU="${8:-1500}"
     local SHAPER_RATE=$((RATE * 98 / 100)); [ "$SHAPER_RATE" -le 0 ] && SHAPER_RATE=1
 
+    [ "$GAMERATE" -lt "$SHAPER_RATE" ] 2>/dev/null ||
+        qdisc_setup_failed "Hybrid realtime rate ${GAMERATE}kbit must be lower than the ${SHAPER_RATE}kbit shaped rate on $DEV."
+
+    # Keep both link-sharing curve segments within the parent. The realtime
+    # class has its own RT curve and must not be subtracted from LS weights.
+    local bulk_rate_m1=$((SHAPER_RATE * 3 / 100)); [ "$bulk_rate_m1" -le 0 ] && bulk_rate_m1=1
+    local bulk_rate_m2=$((SHAPER_RATE * 10 / 100)); [ "$bulk_rate_m2" -le 0 ] && bulk_rate_m2=1
+    local default_rate_m1=$((SHAPER_RATE - bulk_rate_m1))
+    local default_rate_m2=$((SHAPER_RATE - bulk_rate_m2))
+
     # Calculate parameters
     local DUR=$((5*MTU*8/SHAPER_RATE)); [ "$DUR" -lt 25 ] && DUR=25
     local gameburst=$((GAMERATE*10)); [ "$gameburst" -gt $((SHAPER_RATE*97/100)) ] && gameburst=$((SHAPER_RATE*97/100));
@@ -2103,9 +2113,9 @@ setup_hybrid() {
                      "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp" ||
         qdisc_setup_failed "Failed to set up $gameqdisc game qdisc on $DEV."
 
-    # Class 1:13 - CAKE class (most traffic - default)
-    local cake_rate=$((SHAPER_RATE - GAMERATE)); [ "$cake_rate" -le 0 ] && cake_rate=1
-    tc class add dev "$DEV" parent 1:1 classid 1:13 hfsc ls m1 "${cake_rate}kbit" d "${DUR}ms" m2 "${cake_rate}kbit" ||
+    # Class 1:13 - CAKE class (most traffic - default). These rates are the
+    # exact complements of the bulk class so each LS segment totals SHAPER_RATE.
+    tc class add dev "$DEV" parent 1:1 classid 1:13 hfsc ls m1 "${default_rate_m1}kbit" d "${DUR}ms" m2 "${default_rate_m2}kbit" ||
         qdisc_setup_failed "Failed to create Hybrid default class 1:13 on $DEV."
 
     # Attach CAKE as a work-conserving leaf. HFSC owns shaping in Hybrid; a
@@ -2136,9 +2146,7 @@ setup_hybrid() {
 debug_log "$DIR HYBRID cake opts: '$CAKE_OPTS'"
 
     # Class 1:15 - Bulk traffic (HFSC LS + fq_codel)
-    # Use HFSC limits: m1 3%, m2 10%
-    local bulk_rate_m1=$((SHAPER_RATE*3/100)); [ "$bulk_rate_m1" -le 0 ] && bulk_rate_m1=1
-    local bulk_rate_m2=$((SHAPER_RATE*10/100)); [ "$bulk_rate_m2" -le 0 ] && bulk_rate_m2=1
+    # Use complementary HFSC shares: m1 3%, m2 10%.
     tc class add dev "$DEV" parent 1:1 classid 1:15 hfsc ls m1 "${bulk_rate_m1}kbit" d "${DUR}ms" m2 "${bulk_rate_m2}kbit" ||
         qdisc_setup_failed "Failed to create Hybrid bulk class 1:15 on $DEV."
     # Attach fq_codel (using calculations and options from HFSC config)
