@@ -2,19 +2,6 @@ name: Build OpenWrt OPKG feed
 run-name: OpenWrt opkg-24.10-noarch + opkg-23.05-noarch
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "multiwan-nft/**"
-      - "luci-app-multiwan-nft/**"
-      - "multiwan-qos/**"
-      - "luci-app-multiwan-qos/**"
-      - "install.sh"
-      - "VERSION"
-      - "keys/**"
-      - ".github/workflows/build-openwrt-opkg.yml"
-      - ".github/workflows/auto-bump-component-versions.yml"
   workflow_run:
     workflows: ["Auto Bump Component Versions"]
     types: [completed]
@@ -41,8 +28,6 @@ jobs:
         id: decide
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BEFORE_SHA: ${{ github.event.before }}
-          HEAD_SHA: ${{ github.sha }}
           WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
         run: |
           build=false
@@ -53,74 +38,59 @@ jobs:
               build=true
               reason="manual dispatch"
               ;;
-            push)
-              before="$BEFORE_SHA"
-              if printf '%s' "$before" | grep -Eq '^0+$'; then
-                before="HEAD^"
-              fi
-
-              changed_files="$(git diff --name-only "$before" "$HEAD_SHA")"
-              feed_input_changed=false
-              nft_changed=false
-              nft_version_changed=false
-              qos_changed=false
-              qos_version_changed=false
-              for path in $changed_files; do
-                [ -n "$path" ] || continue
-                case "$path" in
-                  multiwan-nft/*|luci-app-multiwan-nft/*|multiwan-qos/*|luci-app-multiwan-qos/*|install.sh|VERSION|keys/*)
-                    feed_input_changed=true
-                    ;;
-                esac
-                case "$path" in
-                  multiwan-nft/*|luci-app-multiwan-nft/*|install.sh)
-                    nft_changed=true
-                    ;;
-                esac
-                case "$path" in
-                  multiwan-nft/Makefile|luci-app-multiwan-nft/Makefile)
-                    nft_version_changed=true
-                    ;;
-                esac
-                case "$path" in
-                  multiwan-qos/*|luci-app-multiwan-qos/*|install.sh)
-                    qos_changed=true
-                    ;;
-                esac
-                case "$path" in
-                  multiwan-qos/Makefile|luci-app-multiwan-qos/Makefile)
-                    qos_version_changed=true
-                    ;;
-                esac
-              done
-
-              subject="$(git log -1 --pretty=%s)"
-              author_email="$(git log -1 --pretty=%ae)"
-              if [ "$feed_input_changed" != true ]; then
-                reason="workflow-only push"
-              elif [ "$author_email" = "41898282+github-actions[bot]@users.noreply.github.com" ] &&
-                 case "$subject" in "Bump NFT version to "*|"Bump QoS version to "*|"Bump package versions: "*) true ;; *) false ;; esac; then
-                reason="auto-bump bot commit is handled by workflow_run"
-              elif { [ "$nft_changed" = true ] && [ "$nft_version_changed" != true ]; } ||
-                   { [ "$qos_changed" = true ] && [ "$qos_version_changed" != true ]; }; then
-                reason="waiting for changed component version bump"
-              else
-                build=true
-                reason="push paths matched"
-              fi
-              ;;
             workflow_run)
               if [ "$WORKFLOW_RUN_CONCLUSION" != "success" ]; then
                 reason="auto-bump workflow did not succeed"
               else
+                changed_files="$(git diff --name-only HEAD^ HEAD)"
+                feed_input_changed=false
+                nft_changed=false
+                nft_version_changed=false
+                qos_changed=false
+                qos_version_changed=false
+                for path in $changed_files; do
+                  [ -n "$path" ] || continue
+                  case "$path" in
+                    multiwan-nft/*|luci-app-multiwan-nft/*|multiwan-qos/*|luci-app-multiwan-qos/*|install.sh|VERSION|keys/*)
+                      feed_input_changed=true
+                      ;;
+                  esac
+                  case "$path" in
+                    multiwan-nft/*|luci-app-multiwan-nft/*|install.sh)
+                      nft_changed=true
+                      ;;
+                  esac
+                  case "$path" in
+                    multiwan-nft/Makefile|luci-app-multiwan-nft/Makefile)
+                      nft_version_changed=true
+                      ;;
+                  esac
+                  case "$path" in
+                    multiwan-qos/*|luci-app-multiwan-qos/*|install.sh)
+                      qos_changed=true
+                      ;;
+                  esac
+                  case "$path" in
+                    multiwan-qos/Makefile|luci-app-multiwan-qos/Makefile)
+                      qos_version_changed=true
+                      ;;
+                  esac
+                done
+
                 subject="$(git log -1 --pretty=%s)"
                 author_email="$(git log -1 --pretty=%ae)"
                 if [ "$author_email" = "41898282+github-actions[bot]@users.noreply.github.com" ] &&
                    case "$subject" in "Bump NFT version to "*|"Bump QoS version to "*|"Bump package versions: "*) true ;; *) false ;; esac; then
                   build=true
                   reason="auto-bump produced a component version commit"
+                elif [ "$feed_input_changed" != true ]; then
+                  reason="auto-bump completed after a non-feed push"
+                elif { [ "$nft_changed" = true ] && [ "$nft_version_changed" != true ]; } ||
+                     { [ "$qos_changed" = true ] && [ "$qos_version_changed" != true ]; }; then
+                  reason="changed component is still missing a version bump"
                 else
-                  reason="auto-bump made no component version commit"
+                  build=true
+                  reason="feed inputs already include their component version changes"
                 fi
               fi
               ;;
