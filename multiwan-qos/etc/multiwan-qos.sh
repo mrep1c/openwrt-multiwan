@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.25"  # Official OpenWrt package version
+VERSION="1.0.26"  # Official OpenWrt package version
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1
