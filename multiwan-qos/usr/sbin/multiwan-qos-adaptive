@@ -26,7 +26,7 @@ change_child_leaf() {
         bfifo) tc qdisc change dev "$dev" parent "$parent" handle "$handle" bfifo limit "$MW_RT_QUEUE_BYTES" ;;
         red) tc qdisc change dev "$dev" parent "$parent" handle "$handle" red limit "$MW_RT_RED_LIMIT" min "$MW_RT_RED_MIN" max "$MW_RT_RED_MAX" avpkt "$MW_RT_PACKET_SIZE" bandwidth "${rate}kbit" burst "$MW_RT_RED_BURST" probability 1.0 ;;
         fq_codel)
-            local interval=$((100 + 2 * 1500 * 8 / rate)) target=$((540 * 8 / rate + 4))
+            local interval=$((100 + 2 * mtu * 8 / rate)) target=$((540 * 8 / rate + 4))
             [ "$target" -gt "$freshness" ] && target="$freshness"
             [ "$target" -lt 4 ] && target=4
             tc qdisc change dev "$dev" parent "$parent" handle "$handle" fq_codel memory_limit "$(fq_memory_limit "$rate")" interval "${interval}ms" target "${target}ms" quantum $((mtu * 2))
@@ -48,7 +48,7 @@ change_leaf() {
         bfifo) tc qdisc change dev "$dev" parent 1:11 handle 10: bfifo limit "$MW_RT_QUEUE_BYTES" ;;
         red) tc qdisc change dev "$dev" parent 1:11 handle 10: red limit "$MW_RT_RED_LIMIT" min "$MW_RT_RED_MIN" max "$MW_RT_RED_MAX" avpkt "$MW_RT_PACKET_SIZE" bandwidth "${rate}kbit" burst "$MW_RT_RED_BURST" probability 1.0 ;;
         fq_codel)
-            interval=$((100 + 2 * 1500 * 8 / rate)); target=$((540 * 8 / rate + 4))
+            interval=$((100 + 2 * mtu * 8 / rate)); target=$((540 * 8 / rate + 4))
             [ "$target" -gt "$freshness" ] && target="$freshness"; [ "$target" -lt 4 ] && target=4
             tc qdisc change dev "$dev" parent 1:11 handle 10: fq_codel memory_limit "$(fq_memory_limit "$rate")" interval "${interval}ms" target "${target}ms" quantum $((mtu * 2))
             ;;
@@ -83,10 +83,12 @@ change_class() {
 apply_rate() {
     local dev="$1" old="$2" new="$3" shaper="$4" qdisc="$5" child="$6" mtu="$7" freshness="$8"
     local packet_size="$9" pfifo_min="${10}" direction="${11}" netem_direction="${12}"
-    local netem_delay="${13}" netem_jitter="${14}" netem_dist="${15}" packet_loss="${16}"
+    local netem_delay="${13}" netem_jitter="${14}" netem_dist="${15}" packet_loss="${16}" strict="${17}"
 
     mw_lock_acquire "$LOCK_DIR" || return 2
-    if [ "$new" -gt "$old" ]; then
+    if [ "$strict" = 1 ]; then
+        change_leaf "$dev" "$qdisc" "$child" "$new" "$mtu" "$freshness" "$packet_size" "$pfifo_min" "$direction" "$netem_direction" "$netem_delay" "$netem_jitter" "$netem_dist" "$packet_loss"
+    elif [ "$new" -gt "$old" ]; then
         change_leaf "$dev" "$qdisc" "$child" "$new" "$mtu" "$freshness" "$packet_size" "$pfifo_min" "$direction" "$netem_direction" "$netem_delay" "$netem_jitter" "$netem_dist" "$packet_loss" &&
         change_class "$dev" "$new" "$shaper" "$mtu"
     else
@@ -96,6 +98,19 @@ apply_rate() {
     local rv=$?
     mw_lock_release_for "$LOCK_DIR" "$MW_LOCK_TOKEN"
     return "$rv"
+}
+
+write_status() {
+    local state_dir="$1" direction="$2" dev="$3" current="$4" shaper="$5" state="$6"
+    local priority_mode=bounded scheduler_rate="$current"
+
+    if [ "$STRICT_REALTIME_PRIORITY" = 1 ]; then
+        priority_mode=strict
+        scheduler_rate="$shaper"
+    fi
+    printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s queue_budget_rate=%s floor=%s start=%s ceiling=%s state=%s\n' \
+        "$priority_mode" "$direction" "$dev" "$scheduler_rate" "$current" \
+        "$MW_RT_FLOOR" "$MW_RT_START" "$MW_RT_CEILING" "$state" > "$state_dir/status"
 }
 
 process_direction() {
@@ -108,10 +123,20 @@ process_direction() {
     state_dir="$STATE_ROOT/$key"; mkdir -p "$state_dir"
     [ -f "$state_dir/error" ] && return 0
 
-    mw_realtime_adaptive_ceiling "$line_rate"
-    current="$(cat "$state_dir/rate" 2>/dev/null)"; : "${current:=$MW_RT_BASELINE}"
+    mw_realtime_adaptive_range "$line_rate"
+    current="$(cat "$state_dir/rate" 2>/dev/null)"
+    case "$current" in ''|*[!0-9]*) current="$MW_RT_START" ;; esac
+    [ "$current" -lt "$MW_RT_FLOOR" ] && current="$MW_RT_FLOOR"
+    [ "$current" -gt "$MW_RT_CEILING" ] && current="$MW_RT_CEILING"
+    printf '%s\n' "$current" > "$state_dir/rate"
     previous_bytes="$(cat "$state_dir/bytes" 2>/dev/null)"; previous_drops="$(cat "$state_dir/drops" 2>/dev/null)"
     high="$(cat "$state_dir/high" 2>/dev/null)"; low="$(cat "$state_dir/low" 2>/dev/null)"; : "${high:=0}" "${low:=0}"
+
+    if [ "$STRICT_REALTIME_PRIORITY" = 1 ] && [ "$qdisc" = drr ]; then
+        printf '%s\n' "$current" > "$state_dir/rate"
+        write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" "strict-fixed/no-adjustable-leaf"
+        return 0
+    fi
 
     stats="$(tc -s class show dev "$dev" classid 1:11 2>/dev/null)" || return 0
     bytes="$(printf '%s\n' "$stats" | awk '/ Sent / {print $2; exit}')"
@@ -120,7 +145,7 @@ process_direction() {
     printf '%s\n' "$bytes" > "$state_dir/bytes"; printf '%s\n' "$drops" > "$state_dir/drops"
     [ -n "$previous_bytes" ] && [ -n "$previous_drops" ] || {
         printf '%s\n' "$current" > "$state_dir/rate"
-        printf 'mode=adaptive direction=%s device=%s rate=%s baseline=%s ceiling=%s state=active\n' "$direction" "$dev" "$current" "$MW_RT_BASELINE" "$MW_RT_CEILING" > "$state_dir/status"
+        write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" active
         return 0
     }
     [ "$bytes" -ge "$previous_bytes" ] && [ "$drops" -ge "$previous_drops" ] || return 0
@@ -139,13 +164,13 @@ process_direction() {
         [ "$candidate" -lt $((current + 250)) ] && candidate=$((current + 250))
         [ "$candidate" -gt "$MW_RT_CEILING" ] && candidate="$MW_RT_CEILING"
         new="$candidate"; high=0
-    elif [ "$low" -ge 60 ] && [ "$current" -gt "$MW_RT_BASELINE" ]; then
-        new=$((current - 250)); [ "$new" -lt "$MW_RT_BASELINE" ] && new="$MW_RT_BASELINE"; low=0
+    elif [ "$low" -ge 60 ] && [ "$current" -gt "$MW_RT_FLOOR" ]; then
+        new=$((current - 250)); [ "$new" -lt "$MW_RT_FLOOR" ] && new="$MW_RT_FLOOR"; low=0
     fi
     printf '%s\n' "$high" > "$state_dir/high"; printf '%s\n' "$low" > "$state_dir/low"
     [ "$new" -ne "$current" ] || return 0
 
-    apply_rate "$dev" "$current" "$new" "$shaper" "$qdisc" "$child" "$mtu" "$FRESHNESS" "$PACKETSIZE" "$PFIFOMIN" "$direction" "$NETEM_DIRECTION" "$NETEM_DELAY" "$NETEM_JITTER" "$NETEM_DIST" "$PACKET_LOSS"
+    apply_rate "$dev" "$current" "$new" "$shaper" "$qdisc" "$child" "$mtu" "$FRESHNESS" "$PACKETSIZE" "$PFIFOMIN" "$direction" "$NETEM_DIRECTION" "$NETEM_DELAY" "$NETEM_JITTER" "$NETEM_DIST" "$PACKET_LOSS" "$STRICT_REALTIME_PRIORITY"
     rv=$?
     [ "$rv" -eq 2 ] && return 0
     if [ "$rv" -ne 0 ]; then
@@ -154,8 +179,8 @@ process_direction() {
         return 0
     fi
     printf '%s\n' "$new" > "$state_dir/rate"
-    printf 'mode=adaptive direction=%s device=%s rate=%s baseline=%s ceiling=%s state=active\n' "$direction" "$dev" "$new" "$MW_RT_BASELINE" "$MW_RT_CEILING" > "$state_dir/status"
-    log "Adjusted $direction realtime reserve on $dev: ${current}kbit -> ${new}kbit"
+    write_status "$state_dir" "$direction" "$dev" "$new" "$shaper" active
+    log "Adjusted $direction realtime queue budget on $dev: ${current}kbit -> ${new}kbit"
 }
 
 process_interface() {
@@ -178,6 +203,11 @@ while true; do
     config_load multiwan-qos
     config_get RATE_MODE hfsc realtime_rate_mode auto
     [ "$RATE_MODE" = adaptive ] || exit 0
+    config_get STRICT_REALTIME_PRIORITY hfsc strict_realtime_priority 0
+    case "$STRICT_REALTIME_PRIORITY" in
+        0|1) ;;
+        *) log "ERROR: invalid strict_realtime_priority '$STRICT_REALTIME_PRIORITY'"; exit 1 ;;
+    esac
     config_get GAMEQDISC hfsc gameqdisc pfifo; config_get GAMEQDISC_CHILD hfsc gameqdisc_child red
     config_get FRESHNESS_MODE hfsc freshness_mode auto; config_get FRESHNESS hfsc freshness_target_ms 18
     case "$FRESHNESS_MODE" in tight) FRESHNESS=14 ;; balanced|auto|'') FRESHNESS=18 ;; relaxed) FRESHNESS=24 ;; esac

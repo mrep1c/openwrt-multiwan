@@ -15,6 +15,7 @@ IFS="$DEFAULT_IFS"
 : "${gameqdisc:=pfifo}" "${gameqdisc_child:=red}" "${nongameqdisc:=fq_codel}" "${ACK_FILTER_EGRESS:=auto}"
 : "${freshness_mode:=auto}" "${freshness_target_ms:=18}"
 : "${realtime_rate_mode:=auto}"
+: "${strict_realtime_priority:=0}"
 : "${MAXDEL:=24}" "${PFIFOMIN:=5}" "${PACKETSIZE:=450}"
 : "${DOWNLOAD_IFB_STAB:=0}"
 : "${DISABLE_QOS_OFFLOADS:=1}"
@@ -1717,7 +1718,7 @@ setup_game_qdisc() {
     print_msg "    Realtime queue: rate=${GAMERATE}kbit freshness=${realtime_target_ms}ms delay=${target_bytes}B burst-floor=${burst_floor_bytes}B limit=${bfifo_limit}B"
 
     # for fq_codel
-    local INTVL=$((100+2*1500*8/GAMERATE))
+    local INTVL=$((100+2*MTU*8/GAMERATE))
     local TARG=$((540*8/GAMERATE+4))
     [ "$TARG" -gt "$realtime_target_ms" ] && TARG="$realtime_target_ms"
     [ "$TARG" -lt 4 ] && TARG=4
@@ -1841,8 +1842,13 @@ setup_hfsc() {
     local gameburst=$((GAMERATE*10)); [ "$gameburst" -gt $((RATE*97/100)) ] && gameburst=$((RATE*97/100));
 
     # Define HFSC Classes
-    tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${gameburst}kbit" d "${DUR}ms" m2 "${GAMERATE}kbit" ||
-        qdisc_setup_failed "Failed to create HFSC realtime class 1:11 on $DEV."
+    if [ "$strict_realtime_priority" = 1 ]; then
+        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${RATE}kbit" d "${DUR}ms" m2 "${RATE}kbit" ||
+            qdisc_setup_failed "Failed to create strict HFSC realtime class 1:11 on $DEV."
+    else
+        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${gameburst}kbit" d "${DUR}ms" m2 "${GAMERATE}kbit" ||
+            qdisc_setup_failed "Failed to create HFSC realtime class 1:11 on $DEV."
+    fi
     tc class add dev "$DEV" parent 1:1 classid 1:12 hfsc ls m1 "$((RATE*70/100))kbit" d "${DUR}ms" m2 "$((RATE*30/100))kbit" ||
         qdisc_setup_failed "Failed to create HFSC fast class 1:12 on $DEV."
     tc class add dev "$DEV" parent 1:1 classid 1:13 hfsc ls m1 "$((RATE*20/100))kbit" d "${DUR}ms" m2 "$((RATE*45/100))kbit" ||
@@ -2088,8 +2094,13 @@ setup_hybrid() {
         qdisc_setup_failed "Failed to create Hybrid root class 1:1 on $DEV."
 
     # Class 1:11 - High priority realtime (HFSC RT + gameqdisc)
-    tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${gameburst}kbit" d "${DUR}ms" m2 "${GAMERATE}kbit" ||
-        qdisc_setup_failed "Failed to create Hybrid realtime class 1:11 on $DEV."
+    if [ "$strict_realtime_priority" = 1 ]; then
+        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${SHAPER_RATE}kbit" d "${DUR}ms" m2 "${SHAPER_RATE}kbit" ||
+            qdisc_setup_failed "Failed to create strict Hybrid realtime class 1:11 on $DEV."
+    else
+        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${gameburst}kbit" d "${DUR}ms" m2 "${GAMERATE}kbit" ||
+            qdisc_setup_failed "Failed to create Hybrid realtime class 1:11 on $DEV."
+    fi
     # Attach game qdisc (using $gameqdisc from HFSC config)
     setup_game_qdisc "$DEV" "$RATE" "$GAMERATE" "$gameqdisc" "$DIR" \
                      "$MTU" "$MAXDEL" "$PFIFOMIN" "$PACKETSIZE" \
@@ -2225,6 +2236,12 @@ select_realtime_rate() {
     mw_realtime_auto_rate "$line_rate"
     auto_rate="$MW_RT_RATE"
     MW_SELECTED_REALTIME_RATE="$auto_rate"
+
+    if [ "$realtime_rate_mode" = adaptive ]; then
+        mw_realtime_adaptive_range "$line_rate"
+        MW_SELECTED_REALTIME_RATE="$MW_RT_START"
+        return 0
+    fi
 
     [ "$realtime_rate_mode" = "manual" ] || return 0
     [ -n "$override" ] || return 0
@@ -2747,6 +2764,26 @@ setup_interface() {
     game_up="$MW_SELECTED_REALTIME_RATE"
     select_realtime_rate "$download" "$game_down_override" download || return 1
     game_down="$MW_SELECTED_REALTIME_RATE"
+
+    if [ "$realtime_rate_mode" = adaptive ]; then
+        local adaptive_up_floor adaptive_up_start adaptive_up_ceiling
+        local adaptive_down_floor adaptive_down_start adaptive_down_ceiling
+        mw_realtime_adaptive_range "$upload"
+        adaptive_up_floor="$MW_RT_FLOOR"; adaptive_up_start="$MW_RT_START"; adaptive_up_ceiling="$MW_RT_CEILING"
+        mw_realtime_adaptive_range "$download"
+        adaptive_down_floor="$MW_RT_FLOOR"; adaptive_down_start="$MW_RT_START"; adaptive_down_ceiling="$MW_RT_CEILING"
+        print_msg "  Adaptive upload queue budget: floor=${adaptive_up_floor}k start=${adaptive_up_start}k current=${game_up}k ceiling=${adaptive_up_ceiling}k"
+        print_msg "  Adaptive download queue budget: floor=${adaptive_down_floor}k start=${adaptive_down_start}k current=${game_down}k ceiling=${adaptive_down_ceiling}k"
+    fi
+
+    if [ "$strict_realtime_priority" = 1 ]; then
+        case "$qdisc" in
+            hfsc|hybrid)
+                print_msg -warn "Strict realtime priority is enabled; continuously backlogged EF/CS5/CS6/CS7 traffic can starve other traffic."
+                print_msg "  Strict scheduler follows the shaped parent; queue budget UL/DL: ${game_up}k/${game_down}k"
+                ;;
+        esac
+    fi
     
     case "$qdisc" in
         hfsc)
@@ -2808,6 +2845,11 @@ esac
 case "$realtime_rate_mode" in
     auto|manual|adaptive) ;;
     *) error_out "Unsupported realtime_rate_mode '$realtime_rate_mode'."; exit 1 ;;
+esac
+
+case "$strict_realtime_priority" in
+    0|1) ;;
+    *) error_out "Unsupported strict_realtime_priority '$strict_realtime_priority'; expected 0 or 1."; exit 1 ;;
 esac
 
 if [ "$gameqdisc" = "qfq" ]; then

@@ -179,8 +179,13 @@ return view.extend({
         o.value('netem', _('NETEM'));
         o.default = 'pfifo';
 
+        o = s.option(form.Flag, 'strict_realtime_priority', _('Strict Realtime Priority'),
+            addRelevanceInfo(_('WARNING: Gives EF, CS5, CS6, and CS7 traffic the full shaped-link realtime curve. Continuously backlogged realtime traffic can starve every other queue. The selected game queue discipline remains in use.'), 'strict_realtime_priority', rootQdisc, gameqdisc));
+        o.rmempty = false;
+        o.default = '0';
+
         o = s.option(form.ListValue, 'realtime_rate_mode', _('Realtime Rate Mode'),
-            _('Auto uses a fixed 1500 kbit/s reserve capped at 25% of the link. Manual uses the overrides below. Adaptive starts at Auto and adjusts each WAN direction up to 3000 kbit/s without rebuilding the qdisc tree.'));
+            _('Auto uses a fixed 1500 kbit/s reserve capped at 25% of the link. Manual uses the overrides below. Adaptive starts at 1000 kbit/s and adjusts each WAN direction from 500 to 2000 kbit/s in 250 kbit/s steps, capped at 25% of the link, without rebuilding the qdisc tree.'));
         o.value('auto', _('Auto'));
         o.value('manual', _('Manual'));
         o.value('adaptive', _('Adaptive'));
@@ -200,7 +205,7 @@ return view.extend({
         createOption('nongameqdiscoptions', _('Non-Game QDisc Options'), _('Cake options for non-realtime queueing discipline'), _('Default: besteffort ack-filter'));
 
         o = s.option(form.ListValue, 'freshness_mode', _('Realtime Freshness'),
-            addRelevanceInfo(_('Queue freshness target for realtime traffic. Auto/Balanced: 18 ms, Tight: 14 ms, Relaxed: 24 ms, Custom: use the custom target below. Finite queues retain a burst floor of up to two MTUs (maximum 3000 bytes), so the effective budget can be larger on slow realtime rates.'), 'freshness_mode', rootQdisc, gameqdisc));
+            addRelevanceInfo(_('Queue freshness target for realtime traffic. Auto/Balanced: 18 ms, Tight: 14 ms, Relaxed: 24 ms, Custom: use the custom target below. Finite queues retain a one-MTU burst floor, so the effective budget can be larger on slow realtime rates.'), 'freshness_mode', rootQdisc, gameqdisc));
         o.value('auto', _('Auto (Balanced)'));
         o.value('tight', _('Tight'));
         o.value('balanced', _('Balanced'));

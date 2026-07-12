@@ -1202,6 +1202,13 @@ return view.extend({
                     row.appendChild(E('span', {}, qosStats.realtime_rate_mode));
                     infoContainer.appendChild(row);
                 }
+                if (qosStats.strict_realtime_priority !== undefined) {
+                    var row = E('div', { 'style': 'margin-right: 1.5em; margin-bottom: 0.3em;' });
+                    row.appendChild(E('span', { 'style': 'font-weight: bold;' }, _('Strict Realtime Priority:')));
+                    row.appendChild(document.createTextNode(' '));
+                    row.appendChild(E('span', {}, qosStats.strict_realtime_priority ? _('Enabled') : _('Disabled')));
+                    infoContainer.appendChild(row);
+                }
                 if (qosStats.gameqdisc) {
                     var row = E('div', { 'style': 'margin-right: 1.5em; margin-bottom: 0.3em;' });
                     row.appendChild(E('span', { 'style': 'font-weight: bold;' }, _('Game Queue Discipline:')));
