@@ -13,9 +13,28 @@ return view.extend({
 
 		o = s.option(form.Value, 'mmx_mask', _('Firewall mask'),
 			_('Hex routing mark mask. Use at least three bits and avoid the lower byte, which is reserved for MultiWAN QoS.'));
-		o.datatype = 'hex(6)';
 		o.default = '0x3F0000';
 		o.placeholder = '0x3F0000';
+		o.validate = function(section_id, value) {
+			var mask, bits = 0;
+
+			if (!/^0x[0-9a-fA-F]{1,8}$/.test(value || ''))
+				return _('Use a hexadecimal value starting with 0x, for example 0x3F0000.');
+
+			mask = parseInt(value.substring(2), 16) >>> 0;
+			if ((mask & 0x000000ff) !== 0)
+				return _('The lower 8 bits are reserved for MultiWAN QoS. Use a mask such as 0x3F0000 or 0x00FC0000.');
+
+			while (mask) {
+				bits += mask & 1;
+				mask >>>= 1;
+			}
+
+			if (bits < 3)
+				return _('Set at least three mask bits.');
+
+			return true;
+		};
 
 		o = s.option(form.Flag, 'logging', _('Logging'),
 			_('Enables global firewall logging'));

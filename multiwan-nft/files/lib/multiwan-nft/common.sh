@@ -204,31 +204,26 @@ multiwan_nft_has_enabled_family()
 
 multiwan_nft_init()
 {
-	local bitcnt mmdefault source_routing mask_file mask_tmp cached_mask
+	local bitcnt mmdefault source_routing mask_file mask_tmp cached_mask normalized_mask
 
 	config_load 'multiwan-nft'
 
 	[ -d $MULTIWAN_NFT_STATUS_DIR ] || mkdir -p $MULTIWAN_NFT_STATUS_DIR/iface_state
 	[ -d "$MULTIWAN_NFT_STATUS_NFT_LOG_DIR" ] || mkdir -p "$MULTIWAN_NFT_STATUS_NFT_LOG_DIR"
 
-	# multiwan_nft's MARKing mask (at least 3 bits should be set)
+	# MultiWAN NFT routing mark mask. The lower byte is reserved for MultiWAN QoS.
 	mask_file="${MULTIWAN_NFT_STATUS_DIR}/mmx_mask"
 	cached_mask=
 	[ -s "$mask_file" ] && cached_mask="$(cat "$mask_file" 2>/dev/null)"
-	case "$cached_mask" in
-		0x[0-9a-fA-FxX]*|0X[0-9a-fA-FxX]*) MMX_MASK="$cached_mask" ;;
-		"")
-			config_get MMX_MASK globals mmx_mask '0x3F0000'
-			;;
-		*)
-			LOG warn "Ignoring invalid cached firewall mask; reloading it from UCI"
-			config_get MMX_MASK globals mmx_mask '0x3F0000'
-			;;
-	esac
-
-	case "$MMX_MASK" in
-		""|*[!0-9a-fA-FxX]*) MMX_MASK='0x3F0000' ;;
-	esac
+	if [ -n "$cached_mask" ] &&
+		normalized_mask="$(multiwan_nft_normalize_mask "$cached_mask" 2>/dev/null)"; then
+		MMX_MASK="$normalized_mask"
+	else
+		[ ! -e "$mask_file" ] || LOG warn "Ignoring empty or invalid cached firewall mask; reloading it from UCI"
+		config_get MMX_MASK globals mmx_mask '0x3F0000'
+		normalized_mask="$(multiwan_nft_normalize_mask "$MMX_MASK")" || return 1
+		MMX_MASK="$normalized_mask"
+	fi
 
 	mask_tmp="$(mktemp "${MULTIWAN_NFT_STATUS_DIR}/mmx_mask.XXXXXX")" || {
 		LOG error "Failed to create temporary firewall mask state file"
@@ -271,6 +266,47 @@ multiwan_nft_init()
 	# Inverted mask: only clears multiwan_nft's bits when saving ct mark
 	# Makes ct mark save independent of any other ct mark user (MultiWAN QoS, etc.)
 	MMX_INVMASK=$(printf "0x%08x" $(( 0xFFFFFFFF ^ $(printf "%d" "$MMX_MASK") )))
+}
+
+multiwan_nft_normalize_mask()
+{
+	local value="$1" mask_hex mask_dec bitcnt
+
+	case "$value" in
+		0x*|0X*) ;;
+		*)
+			LOG error "Invalid firewall mask '$value': use a hexadecimal value starting with 0x"
+			return 1
+			;;
+	esac
+
+	mask_hex="${value#0x}"
+	mask_hex="${mask_hex#0X}"
+	case "$mask_hex" in
+		""|*[!0-9a-fA-F]*)
+			LOG error "Invalid firewall mask '$value': use only hexadecimal digits"
+			return 1
+			;;
+	esac
+
+	if [ "${#mask_hex}" -gt 8 ]; then
+		LOG error "Invalid firewall mask '$value': value must fit in 32 bits"
+		return 1
+	fi
+
+	mask_dec=$((0x$mask_hex))
+	if [ $((mask_dec & 0x000000ff)) -ne 0 ]; then
+		LOG error "Invalid firewall mask '$value': lower 8 bits are reserved for MultiWAN QoS"
+		return 1
+	fi
+
+	bitcnt=$(multiwan_nft_count_one_bits "$mask_dec")
+	if [ "$bitcnt" -lt 3 ]; then
+		LOG error "Invalid firewall mask '$value': at least 3 bits must be set"
+		return 1
+	fi
+
+	printf "0x%08x\n" "$mask_dec"
 }
 
 # maps the 1st parameter so it only uses the bits allowed by the bitmask (2nd parameter)
