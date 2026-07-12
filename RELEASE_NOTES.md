@@ -2,13 +2,15 @@
 
 ## Unreleased
 
+## v1.0.27
+
 - Adds Auto, Manual, and supervised Adaptive realtime reserve modes for HFSC/Hybrid.
 - Corrects BFIFO, PFIFO, RED, NETEM, and QFQ child queue budgeting, including the ineffective burst/minimum calculations.
 - Prevents broadened private-LAN IFB fallback rules and fixes software-flow-offload ctinfo priority ordering.
 - Removes tracker-triggered QoS qdisc rebuilds so health checks follow normal hysteresis without disrupting traffic.
 - Reports hardware firewall flow offload as degraded compatibility while continuing startup.
 
-## Unreleased
+## v1.0.26
 
 QoS realtime freshness tuning.
 

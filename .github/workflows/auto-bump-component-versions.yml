@@ -58,6 +58,15 @@ jobs:
             return "$($versionMatch.Groups[1].Value).$($versionMatch.Groups[2].Value).$([int]$versionMatch.Groups[3].Value + 1)"
           }
 
+          function Get-VersionAtRef {
+            param([string]$Ref, [string]$Makefile)
+            $line = git show "${Ref}:$Makefile" | Where-Object { $_ -match '^PKG_VERSION:=' } | Select-Object -First 1
+            if (-not $line) {
+              throw "Could not read PKG_VERSION from $Makefile at $Ref"
+            }
+            return $line
+          }
+
           function Bump-NftVersion {
             $newVersion = Get-NextPatchVersion "multiwan-nft/Makefile"
             Replace-Line "multiwan-nft/Makefile" '^PKG_VERSION:=' "PKG_VERSION:=$newVersion"
@@ -98,16 +107,8 @@ jobs:
             $_ -like "luci-app-multiwan-qos/*" -or
             $_ -eq "install.sh"
           })
-          $nftVersionFiles = @(
-            "multiwan-nft/Makefile",
-            "luci-app-multiwan-nft/Makefile"
-          )
-          $qosVersionFiles = @(
-            "multiwan-qos/Makefile",
-            "luci-app-multiwan-qos/Makefile"
-          )
-          $nftVersionChanged = [bool]($changed | Where-Object { $nftVersionFiles -contains $_ })
-          $qosVersionChanged = [bool]($changed | Where-Object { $qosVersionFiles -contains $_ })
+          $nftVersionChanged = (Get-VersionAtRef $before "multiwan-nft/Makefile") -ne (Get-VersionAtRef $head "multiwan-nft/Makefile")
+          $qosVersionChanged = (Get-VersionAtRef $before "multiwan-qos/Makefile") -ne (Get-VersionAtRef $head "multiwan-qos/Makefile")
 
           $bumped = @()
           if ($nftRelevant.Count -gt 0 -and -not $nftVersionChanged) {
