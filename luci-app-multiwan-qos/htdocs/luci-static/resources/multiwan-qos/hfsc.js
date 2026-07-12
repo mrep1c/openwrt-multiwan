@@ -33,13 +33,14 @@ function addRelevanceInfo(description, settingName, rootQdisc, gameqdisc) {
         // Check gameqdisc-specific dependencies
         var gameqdiscDependencies = {
             'netem': ['netemdelayms', 'netemjitterms', 'netemdist', 'netem_direction', 'pktlossp'],
-            'pfifo': ['PFIFOMIN', 'PACKETSIZE']
+            'pfifo': ['PFIFOMIN']
         };
         
         // Settings that are used by multiple gameqdiscs
         var multiGameqdiscSettings = {
-            'freshness_mode': ['red', 'pfifo', 'bfifo', 'fq_codel', 'qfq'],
-            'freshness_target_ms': ['red', 'pfifo', 'bfifo', 'fq_codel', 'qfq']
+            'freshness_mode': ['red', 'pfifo', 'bfifo', 'fq_codel', 'qfq', 'netem'],
+            'freshness_target_ms': ['red', 'pfifo', 'bfifo', 'fq_codel', 'qfq', 'netem'],
+            'PACKETSIZE': ['red', 'pfifo', 'qfq', 'netem']
         };
         
         // Check if setting is gameqdisc-specific
@@ -178,8 +179,17 @@ return view.extend({
         o.value('netem', _('NETEM'));
         o.default = 'pfifo';
 
-        createOption('GAMEUP', _('Realtime Upload Reserve Override (kbit/s)'), _('Optional bandwidth override for the realtime/game upload lane. Leave empty for auto 1500 kbit/s, capped at 25% of very slow links. Increase only if realtime drops persist; use Realtime Freshness for queue delay.'), _('Default: auto'), 'uinteger');
-        createOption('GAMEDOWN', _('Realtime Download Reserve Override (kbit/s)'), _('Optional bandwidth override for the realtime/game download lane. Leave empty for auto 1500 kbit/s, capped at 25% of very slow links. Increase only if realtime drops persist; use Realtime Freshness for queue delay.'), _('Default: auto'), 'uinteger');
+        o = s.option(form.ListValue, 'realtime_rate_mode', _('Realtime Rate Mode'),
+            _('Auto uses a fixed 1500 kbit/s reserve capped at 25% of the link. Manual uses the overrides below. Adaptive starts at Auto and adjusts each WAN direction up to 3000 kbit/s without rebuilding the qdisc tree.'));
+        o.value('auto', _('Auto'));
+        o.value('manual', _('Manual'));
+        o.value('adaptive', _('Adaptive'));
+        o.default = 'auto';
+
+        o = createOption('GAMEUP', _('Realtime Upload Reserve Override (kbit/s)'), _('Manual upload reserve. A blank value keeps the automatic reserve for this direction.'), _('Default: auto'), 'uinteger');
+        o.depends('realtime_rate_mode', 'manual');
+        o = createOption('GAMEDOWN', _('Realtime Download Reserve Override (kbit/s)'), _('Manual download reserve. A blank value keeps the automatic reserve for this direction.'), _('Default: auto'), 'uinteger');
+        o.depends('realtime_rate_mode', 'manual');
 
         o = s.option(form.ListValue, 'nongameqdisc', _('Non-Game Queue Discipline'), 
             addRelevanceInfo(_('Select the queueing discipline for non-realtime traffic'), 'nongameqdisc', rootQdisc, gameqdisc));
@@ -190,7 +200,7 @@ return view.extend({
         createOption('nongameqdiscoptions', _('Non-Game QDisc Options'), _('Cake options for non-realtime queueing discipline'), _('Default: besteffort ack-filter'));
 
         o = s.option(form.ListValue, 'freshness_mode', _('Realtime Freshness'),
-            addRelevanceInfo(_('Queue freshness target for realtime traffic. Auto/Balanced: 18 ms, Tight: 14 ms, Relaxed: 24 ms, Custom: use the custom target below.'), 'freshness_mode', rootQdisc, gameqdisc));
+            addRelevanceInfo(_('Queue freshness target for realtime traffic. Auto/Balanced: 18 ms, Tight: 14 ms, Relaxed: 24 ms, Custom: use the custom target below. Finite queues retain a burst floor of up to two MTUs (maximum 3000 bytes), so the effective budget can be larger on slow realtime rates.'), 'freshness_mode', rootQdisc, gameqdisc));
         o.value('auto', _('Auto (Balanced)'));
         o.value('tight', _('Tight'));
         o.value('balanced', _('Balanced'));
@@ -202,7 +212,7 @@ return view.extend({
         o.depends('freshness_mode', 'custom');
 
         createOption('PFIFOMIN', _('PFIFO Min'), _('Minimum packet count for PFIFO queue'), _('Default: 5'), 'uinteger');
-        createOption('PACKETSIZE', _('Avg Packet Size (B)'), _('Used with PFIFOMIN to calculate the PFIFO packet limit. Default: 450 bytes.'), _('Default: 450'), 'uinteger');
+        createOption('PACKETSIZE', _('Avg Packet Size (B)'), _('Used to convert byte budgets for PFIFO, RED, NETEM, and QFQ child queues. Default: 450 bytes.'), _('Default: 450'), 'uinteger');
         createOption('netemdelayms', _('NETEM Delay (ms)'), _('NETEM delay in milliseconds'), _('Default: 30'), 'uinteger');
         createOption('netemjitterms', _('NETEM Jitter (ms)'), _('NETEM jitter in milliseconds'), _('Default: 7'), 'uinteger');
 

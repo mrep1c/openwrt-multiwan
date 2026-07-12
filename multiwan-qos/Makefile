@@ -45,11 +45,14 @@ define Package/multiwan-qos/install
 	$(INSTALL_DIR) $(1)/www/cgi-bin
 	$(INSTALL_DIR) $(1)/lib/multiwan-qos
 	$(INSTALL_DIR) $(1)/usr/lib/tc
+	$(INSTALL_DIR) $(1)/usr/sbin
 
 	$(INSTALL_BIN) ./etc/multiwan-qos.sh $(1)/etc/
 	$(INSTALL_BIN) ./etc/init.d/multiwan-qos $(1)/etc/init.d/
 	$(INSTALL_DATA) ./lib/multiwan-qos/hotplug-common.sh $(1)/lib/multiwan-qos/
 	$(INSTALL_DATA) ./lib/multiwan-qos/process-lock.sh $(1)/lib/multiwan-qos/
+	$(INSTALL_DATA) ./lib/multiwan-qos/realtime.sh $(1)/lib/multiwan-qos/
+	$(INSTALL_BIN) ./usr/sbin/multiwan-qos-adaptive $(1)/usr/sbin/
 	$(INSTALL_CONF) ./etc/hotplug.d/iface/13-multiwan-qos-hotplug $(1)/etc/hotplug.d/iface/
 	$(INSTALL_CONF) ./etc/config/multiwan-qos $(1)/etc/config/
 	$(INSTALL_BIN) ./etc/uci-defaults/10-multiwan-qos-migrate-config $(1)/etc/uci-defaults/

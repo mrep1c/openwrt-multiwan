@@ -1,0 +1,192 @@
+#!/bin/sh
+
+. /lib/functions.sh
+. /lib/multiwan-qos/process-lock.sh
+. /lib/multiwan-qos/realtime.sh
+
+STATE_ROOT=/var/run/multiwan-qos/adaptive
+LOCK_DIR=/var/run/multiwan_qos-refresh.lock
+RESTARTING=/tmp/multiwan_qos_restarting
+
+log() { logger -t multiwan-qos-adaptive -- "$*"; }
+
+fq_memory_limit() {
+    local mem=$(($1 * 1000 / 8))
+    [ "$mem" -lt 4000000 ] && mem=4000000
+    [ "$mem" -gt 16777216 ] && mem=16777216
+    printf '%s' "$mem"
+}
+
+change_child_leaf() {
+    local dev="$1" parent="$2" handle="$3" child="$4" rate="$5" mtu="$6"
+    local freshness="$7" packet_size="$8" pfifo_min="$9"
+    mw_realtime_queue_budget "$rate" "$freshness" "$mtu" "$packet_size" "$pfifo_min"
+    case "$child" in
+        pfifo) tc qdisc change dev "$dev" parent "$parent" handle "$handle" pfifo limit "$MW_RT_PFIFO_LIMIT" ;;
+        bfifo) tc qdisc change dev "$dev" parent "$parent" handle "$handle" bfifo limit "$MW_RT_QUEUE_BYTES" ;;
+        red) tc qdisc change dev "$dev" parent "$parent" handle "$handle" red limit "$MW_RT_RED_LIMIT" min "$MW_RT_RED_MIN" max "$MW_RT_RED_MAX" avpkt "$MW_RT_PACKET_SIZE" bandwidth "${rate}kbit" burst "$MW_RT_RED_BURST" probability 1.0 ;;
+        fq_codel)
+            local interval=$((100 + 2 * 1500 * 8 / rate)) target=$((540 * 8 / rate + 4))
+            [ "$target" -gt "$freshness" ] && target="$freshness"
+            [ "$target" -lt 4 ] && target=4
+            tc qdisc change dev "$dev" parent "$parent" handle "$handle" fq_codel memory_limit "$(fq_memory_limit "$rate")" interval "${interval}ms" target "${target}ms" quantum $((mtu * 2))
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+change_leaf() {
+    local dev="$1" qdisc="$2" child="$3" rate="$4" mtu="$5" freshness="$6"
+    local packet_size="$7" pfifo_min="$8" direction="$9"
+    local netem_direction="${10}" netem_delay="${11}" netem_jitter="${12}" netem_dist="${13}" packet_loss="${14}"
+    local interval target args
+
+    mw_realtime_queue_budget "$rate" "$freshness" "$mtu" "$packet_size" "$pfifo_min"
+    case "$qdisc" in
+        drr) return 0 ;;
+        pfifo) tc qdisc change dev "$dev" parent 1:11 handle 10: pfifo limit "$MW_RT_PFIFO_LIMIT" ;;
+        bfifo) tc qdisc change dev "$dev" parent 1:11 handle 10: bfifo limit "$MW_RT_QUEUE_BYTES" ;;
+        red) tc qdisc change dev "$dev" parent 1:11 handle 10: red limit "$MW_RT_RED_LIMIT" min "$MW_RT_RED_MIN" max "$MW_RT_RED_MAX" avpkt "$MW_RT_PACKET_SIZE" bandwidth "${rate}kbit" burst "$MW_RT_RED_BURST" probability 1.0 ;;
+        fq_codel)
+            interval=$((100 + 2 * 1500 * 8 / rate)); target=$((540 * 8 / rate + 4))
+            [ "$target" -gt "$freshness" ] && target="$freshness"; [ "$target" -lt 4 ] && target=4
+            tc qdisc change dev "$dev" parent 1:11 handle 10: fq_codel memory_limit "$(fq_memory_limit "$rate")" interval "${interval}ms" target "${target}ms" quantum $((mtu * 2))
+            ;;
+        qfq)
+            change_child_leaf "$dev" 10:1 101: "$child" "$rate" "$mtu" "$freshness" "$packet_size" "$pfifo_min" &&
+            change_child_leaf "$dev" 10:2 102: "$child" "$rate" "$mtu" "$freshness" "$packet_size" "$pfifo_min" &&
+            change_child_leaf "$dev" 10:3 103: "$child" "$rate" "$mtu" "$freshness" "$packet_size" "$pfifo_min"
+            ;;
+        netem)
+            if [ "$netem_direction" != both ] && { [ "$netem_direction" != egress ] || [ "$direction" != wan ]; } && { [ "$netem_direction" != ingress ] || [ "$direction" != lan ]; }; then
+                tc qdisc change dev "$dev" parent 1:11 handle 10: pfifo limit "$MW_RT_PFIFO_LIMIT"
+                return
+            fi
+            args="limit $MW_RT_NETEM_LIMIT"
+            [ "$netem_jitter" -ne 0 ] 2>/dev/null && [ "$netem_delay" -eq 0 ] 2>/dev/null && netem_delay=1
+            [ "$netem_delay" -eq 0 ] 2>/dev/null || args="$args delay ${netem_delay}ms"
+            [ "$netem_jitter" -eq 0 ] 2>/dev/null || args="$args ${netem_jitter}ms distribution $netem_dist"
+            [ -z "$packet_loss" ] || [ "$packet_loss" = none ] || args="$args loss $packet_loss"
+            # shellcheck disable=SC2086
+            tc qdisc change dev "$dev" parent 1:11 handle 10: netem $args
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+change_class() {
+    local dev="$1" rate="$2" shaper="$3" mtu="$4"
+    mw_realtime_curve "$rate" "$shaper" "$mtu"
+    tc class change dev "$dev" parent 1:1 classid 1:11 hfsc rt m1 "${MW_RT_BURST}kbit" d "${MW_RT_DUR}ms" m2 "${rate}kbit"
+}
+
+apply_rate() {
+    local dev="$1" old="$2" new="$3" shaper="$4" qdisc="$5" child="$6" mtu="$7" freshness="$8"
+    local packet_size="$9" pfifo_min="${10}" direction="${11}" netem_direction="${12}"
+    local netem_delay="${13}" netem_jitter="${14}" netem_dist="${15}" packet_loss="${16}"
+
+    mw_lock_acquire "$LOCK_DIR" || return 2
+    if [ "$new" -gt "$old" ]; then
+        change_leaf "$dev" "$qdisc" "$child" "$new" "$mtu" "$freshness" "$packet_size" "$pfifo_min" "$direction" "$netem_direction" "$netem_delay" "$netem_jitter" "$netem_dist" "$packet_loss" &&
+        change_class "$dev" "$new" "$shaper" "$mtu"
+    else
+        change_class "$dev" "$new" "$shaper" "$mtu" &&
+        change_leaf "$dev" "$qdisc" "$child" "$new" "$mtu" "$freshness" "$packet_size" "$pfifo_min" "$direction" "$netem_direction" "$netem_delay" "$netem_jitter" "$netem_dist" "$packet_loss"
+    fi
+    local rv=$?
+    mw_lock_release_for "$LOCK_DIR" "$MW_LOCK_TOKEN"
+    return "$rv"
+}
+
+process_direction() {
+    local dev="$1" line_rate="$2" shaper="$3" qdisc="$4" child="$5" mtu="$6" direction="$7"
+    local key state_dir current previous_bytes previous_drops stats bytes drops delta_bytes delta_drops demand
+    local high low new candidate rv
+
+    [ -d "/sys/class/net/$dev" ] || return 0
+    key="$(printf '%s-%s' "$dev" "$direction" | tr -c 'A-Za-z0-9_.-' '_')"
+    state_dir="$STATE_ROOT/$key"; mkdir -p "$state_dir"
+    [ -f "$state_dir/error" ] && return 0
+
+    mw_realtime_adaptive_ceiling "$line_rate"
+    current="$(cat "$state_dir/rate" 2>/dev/null)"; : "${current:=$MW_RT_BASELINE}"
+    previous_bytes="$(cat "$state_dir/bytes" 2>/dev/null)"; previous_drops="$(cat "$state_dir/drops" 2>/dev/null)"
+    high="$(cat "$state_dir/high" 2>/dev/null)"; low="$(cat "$state_dir/low" 2>/dev/null)"; : "${high:=0}" "${low:=0}"
+
+    stats="$(tc -s class show dev "$dev" classid 1:11 2>/dev/null)" || return 0
+    bytes="$(printf '%s\n' "$stats" | awk '/ Sent / {print $2; exit}')"
+    drops="$(printf '%s\n' "$stats" | awk '/ Sent / {for(i=1;i<=NF;i++) {key=$i; gsub(/[(),]/,"",key); if(key=="dropped") {value=$(i+1); gsub(/[(),]/,"",value); print value; exit}}}')"
+    case "$bytes:$drops" in *[!0-9:]*|:*) return 0 ;; esac
+    printf '%s\n' "$bytes" > "$state_dir/bytes"; printf '%s\n' "$drops" > "$state_dir/drops"
+    [ -n "$previous_bytes" ] && [ -n "$previous_drops" ] || {
+        printf '%s\n' "$current" > "$state_dir/rate"
+        printf 'mode=adaptive direction=%s device=%s rate=%s baseline=%s ceiling=%s state=active\n' "$direction" "$dev" "$current" "$MW_RT_BASELINE" "$MW_RT_CEILING" > "$state_dir/status"
+        return 0
+    }
+    [ "$bytes" -ge "$previous_bytes" ] && [ "$drops" -ge "$previous_drops" ] || return 0
+
+    delta_bytes=$((bytes - previous_bytes)); delta_drops=$((drops - previous_drops))
+    demand=$(((delta_bytes + delta_drops * PACKETSIZE) * 8 / 1000))
+    new="$current"
+    if [ "$delta_drops" -gt 0 ] || [ $((demand * 100)) -ge $((current * 80)) ]; then
+        high=$((high + 1)); low=0
+    else
+        high=0
+        if [ $((demand * 100)) -le $((current * 50)) ]; then low=$((low + 1)); else low=0; fi
+    fi
+    if [ "$delta_drops" -gt 0 ] || [ "$high" -ge 2 ]; then
+        candidate=$(((demand * 125 / 100 + 249) / 250 * 250))
+        [ "$candidate" -lt $((current + 250)) ] && candidate=$((current + 250))
+        [ "$candidate" -gt "$MW_RT_CEILING" ] && candidate="$MW_RT_CEILING"
+        new="$candidate"; high=0
+    elif [ "$low" -ge 60 ] && [ "$current" -gt "$MW_RT_BASELINE" ]; then
+        new=$((current - 250)); [ "$new" -lt "$MW_RT_BASELINE" ] && new="$MW_RT_BASELINE"; low=0
+    fi
+    printf '%s\n' "$high" > "$state_dir/high"; printf '%s\n' "$low" > "$state_dir/low"
+    [ "$new" -ne "$current" ] || return 0
+
+    apply_rate "$dev" "$current" "$new" "$shaper" "$qdisc" "$child" "$mtu" "$FRESHNESS" "$PACKETSIZE" "$PFIFOMIN" "$direction" "$NETEM_DIRECTION" "$NETEM_DELAY" "$NETEM_JITTER" "$NETEM_DIST" "$PACKET_LOSS"
+    rv=$?
+    [ "$rv" -eq 2 ] && return 0
+    if [ "$rv" -ne 0 ]; then
+        printf '%s\n' "failed to change $dev from ${current}kbit to ${new}kbit" > "$state_dir/error"
+        log "ERROR: adaptive $direction update failed on $dev; leaving the existing qdisc type unchanged"
+        return 0
+    fi
+    printf '%s\n' "$new" > "$state_dir/rate"
+    printf 'mode=adaptive direction=%s device=%s rate=%s baseline=%s ceiling=%s state=active\n' "$direction" "$dev" "$new" "$MW_RT_BASELINE" "$MW_RT_CEILING" > "$state_dir/status"
+    log "Adjusted $direction realtime reserve on $dev: ${current}kbit -> ${new}kbit"
+}
+
+process_interface() {
+    local section="$1" enabled device qdisc upload download mtu shaper
+    config_get_bool enabled "$section" enabled 1; [ "$enabled" -eq 1 ] || return 0
+    config_get device "$section" device; config_get qdisc "$section" qdisc hfsc
+    case "$qdisc" in hfsc|hybrid) ;; *) return 0 ;; esac
+    config_get upload "$section" upload; config_get download "$section" download
+    mtu="$(cat "/sys/class/net/$device/mtu" 2>/dev/null)"; : "${mtu:=1500}"
+    shaper="$upload"; [ "$qdisc" = hybrid ] && shaper=$((upload * 98 / 100))
+    process_direction "$device" "$upload" "$shaper" "$GAMEQDISC" "$GAMEQDISC_CHILD" "$mtu" wan
+    shaper="$download"; [ "$qdisc" = hybrid ] && shaper=$((download * 98 / 100))
+    process_direction "ifb-$device" "$download" "$shaper" "$GAMEQDISC" "$GAMEQDISC_CHILD" "$mtu" lan
+}
+
+mkdir -p "$STATE_ROOT"
+while [ -f "$RESTARTING" ]; do sleep 1; done
+while true; do
+    [ -f "$RESTARTING" ] && exit 0
+    config_load multiwan-qos
+    config_get RATE_MODE hfsc realtime_rate_mode auto
+    [ "$RATE_MODE" = adaptive ] || exit 0
+    config_get GAMEQDISC hfsc gameqdisc pfifo; config_get GAMEQDISC_CHILD hfsc gameqdisc_child red
+    config_get FRESHNESS_MODE hfsc freshness_mode auto; config_get FRESHNESS hfsc freshness_target_ms 18
+    case "$FRESHNESS_MODE" in tight) FRESHNESS=14 ;; balanced|auto|'') FRESHNESS=18 ;; relaxed) FRESHNESS=24 ;; esac
+    config_get PACKETSIZE hfsc PACKETSIZE 450; config_get PFIFOMIN hfsc PFIFOMIN 5
+    config_get NETEM_DIRECTION hfsc netem_direction both; config_get NETEM_DELAY hfsc netemdelayms 0
+    config_get NETEM_JITTER hfsc netemjitterms 0; config_get NETEM_DIST hfsc netemdist normal
+    config_get PACKET_LOSS hfsc pktlossp none
+    config_foreach process_interface interface
+    sleep 1
+done
+
+exit 0

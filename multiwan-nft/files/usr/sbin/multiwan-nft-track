@@ -165,39 +165,6 @@ validate_wrap() {
 	LOG notice "libwrap_mwan3_sockopt not found, using native interface binding"
 }
 
-maybe_refresh_multiwan_qos() {
-	local state_dir state_file now last_refresh cooldown enabled
-
-	[ -n "$DEVICE" ] || return 1
-	[ -x /etc/init.d/multiwan-qos ] || return 1
-	[ -f /etc/config/multiwan-qos ] || return 1
-	[ ! -f /tmp/multiwan_qos_restarting ] || return 1
-
-	enabled="$(uci -q get multiwan-qos.global.enabled 2>/dev/null)"
-	[ "$enabled" = "1" ] || return 1
-
-	cooldown=60
-	state_dir="${MULTIWAN_NFT_TRACK_STATUS_DIR:-/var/run/multiwan-nft-track}/${INTERFACE}"
-	state_file="${state_dir}/MULTIWAN_QOS_REFRESH"
-	mkdir -p "$state_dir" 2>/dev/null
-
-	now="$(date +%s 2>/dev/null)" || now=0
-	last_refresh="$(cat "$state_file" 2>/dev/null)"
-	case "$last_refresh" in
-		""|*[!0-9]*) last_refresh=0 ;;
-	esac
-
-	if [ "$now" -gt 0 ] && [ "$last_refresh" -gt 0 ] && [ $((now - last_refresh)) -lt "$cooldown" ]; then
-		LOG info "Skipping MultiWAN QoS refresh for interface $INTERFACE ($DEVICE): cooldown active"
-		return 1
-	fi
-
-	[ "$now" -gt 0 ] && printf '%s\n' "$now" > "$state_file" 2>/dev/null
-	/etc/init.d/multiwan-qos refresh "$DEVICE" >/dev/null 2>&1 || return 1
-	LOG notice "Refreshed MultiWAN QoS qdisc for interface $INTERFACE ($DEVICE) after tracking failures"
-	return 0
-}
-
 disconnected() {
 	local status="$(cat ${MULTIWAN_NFT_TRACK_STATUS_DIR}/${INTERFACE}/STATUS)"
 
@@ -375,8 +342,6 @@ main() {
 	local host_up_count=0
 	local lost=0
 	local turn=0
-	local multiwan_qos_refresh_attempted=0
-	local multiwan_qos_refresh_pending=0
 
 	while true; do
 		if [ "${IFDOWN_EVENT}" -eq 1 ]; then
@@ -505,38 +470,22 @@ main() {
 		done
 
 		if [ "$host_up_count" -lt "$reliability" ]; then
-			if [ "$STATUS" = "online" ] && [ "$multiwan_qos_refresh_attempted" -eq 0 ]; then
-				multiwan_qos_refresh_attempted=1
-				if maybe_refresh_multiwan_qos; then
-					multiwan_qos_refresh_pending=1
-					sleep_time=$recovery_interval
-					LOG notice "Retrying tracking on $INTERFACE ($DEVICE) after MultiWAN QoS refresh"
-					continue
-				fi
-			fi
 			let score--
 
 			if [ "$score" -lt "$up" ]; then
 				score=0
-				multiwan_qos_refresh_pending=0
 				[ ${keep_failure_interval} -eq 1 ] && sleep_time=$failure_interval
 			elif [ "$score" -eq "$up" ]; then
 				log_tracking_failure_context "$last_failed_target" "offline" "$score" "$lost"
 				disconnecting
 				sleep_time=$failure_interval
 				disconnected
-				multiwan_qos_refresh_pending=0
 			elif [ "$score" -gt "$up" ]; then
 				log_tracking_failure_context "$last_failed_target" "disconnecting" "$score" "$lost"
 				disconnecting
 				sleep_time=$failure_interval
 			fi
 		else
-			if [ "$multiwan_qos_refresh_pending" -eq 1 ]; then
-				LOG notice "Tracking on $INTERFACE ($DEVICE) recovered after MultiWAN QoS refresh"
-				multiwan_qos_refresh_pending=0
-			fi
-			multiwan_qos_refresh_attempted=0
 			if [ "$score" -lt $((down+up)) ] && [ "$lost" -gt 0 ]; then
 				LOG info "Lost $((lost*count)) ping(s) on interface $INTERFACE ($DEVICE). Current score: $score"
 			fi

@@ -1195,6 +1195,13 @@ return view.extend({
                     infoContainer.appendChild(row);
                 }
             } else if (qosStats.root_qdisc === 'hfsc' || qosStats.root_qdisc === 'hybrid') {
+                if (qosStats.realtime_rate_mode) {
+                    var row = E('div', { 'style': 'margin-right: 1.5em; margin-bottom: 0.3em;' });
+                    row.appendChild(E('span', { 'style': 'font-weight: bold;' }, _('Realtime Rate Mode:')));
+                    row.appendChild(document.createTextNode(' '));
+                    row.appendChild(E('span', {}, qosStats.realtime_rate_mode));
+                    infoContainer.appendChild(row);
+                }
                 if (qosStats.gameqdisc) {
                     var row = E('div', { 'style': 'margin-right: 1.5em; margin-bottom: 0.3em;' });
                     row.appendChild(E('span', { 'style': 'font-weight: bold;' }, _('Game Queue Discipline:')));
@@ -1202,6 +1209,20 @@ return view.extend({
                     row.appendChild(E('span', {}, qosStats.gameqdisc || '-'));
                     infoContainer.appendChild(row);
                 }
+                (qosStats.adaptive_realtime_state || []).forEach(function(state) {
+                    var row = E('div', { 'style': 'margin-right: 1.5em; margin-bottom: 0.3em;' });
+                    row.appendChild(E('span', { 'style': 'font-weight: bold;' }, _('Adaptive State:')));
+                    row.appendChild(document.createTextNode(' '));
+                    row.appendChild(E('span', {}, state));
+                    infoContainer.appendChild(row);
+                });
+                (qosStats.adaptive_realtime_errors || []).forEach(function(error) {
+                    var row = E('div', { 'style': 'margin-right: 1.5em; margin-bottom: 0.3em; color: var(--error-color, #b42318);' });
+                    row.appendChild(E('span', { 'style': 'font-weight: bold;' }, _('Adaptive Error:')));
+                    row.appendChild(document.createTextNode(' '));
+                    row.appendChild(E('span', {}, error));
+                    infoContainer.appendChild(row);
+                });
             }
             
             generalInfo.appendChild(infoContainer);

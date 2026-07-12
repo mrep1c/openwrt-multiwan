@@ -88,6 +88,8 @@ MULTIWAN_QOS_GEN_FILES_BACKEND="
     $MULTIWAN_QOS_DEFAULTS_FILE
     $MULTIWAN_QOS_HOTPLUG_COMMON
     /lib/multiwan-qos/process-lock.sh
+    /lib/multiwan-qos/realtime.sh
+    /usr/sbin/multiwan-qos-adaptive
     /usr/lib/tc/experimental.dist
     /usr/lib/tc/normal.dist
     /usr/lib/tc/normmix20-64.dist
@@ -1069,6 +1071,14 @@ load_and_fix_config() {
         esac
     done
 
+    if ! uci -q get multiwan-qos.hfsc.realtime_rate_mode >/dev/null 2>&1 && [ -z "$nofix" ]; then
+        local legacy_up legacy_down migrated_mode=auto
+        legacy_up="$(uci -q get multiwan-qos.hfsc.GAMEUP)"
+        legacy_down="$(uci -q get multiwan-qos.hfsc.GAMEDOWN)"
+        [ -n "$legacy_up$legacy_down" ] && migrated_mode=manual
+        uci set "multiwan-qos.hfsc.realtime_rate_mode=$migrated_mode" && uci commit multiwan-qos || return 1
+    fi
+
     export MULTIWAN_QOS_CONFIG_LOADED=
     try_load_and_fix_config "$@"
     rv=$?
@@ -1803,6 +1813,18 @@ manage_custom_rules_file() {
     esac
 }
 
+start_adaptive_monitor() {
+    [ "$realtime_rate_mode" = adaptive ] || return 0
+    [ -x /usr/sbin/multiwan-qos-adaptive ] || { error_out "Adaptive monitor is missing."; return 1; }
+    rm -rf /var/run/multiwan-qos/adaptive
+    procd_open_instance adaptive
+    procd_set_param command /usr/sbin/multiwan-qos-adaptive
+    procd_set_param respawn 3600 5 5
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
 start_service_impl() {
     # handle first run after installation or update from older versions
     if [ "$VERSION" = dev ]; then
@@ -1877,6 +1899,8 @@ start_service_impl() {
         DISABLE_ON_STOP=0 stop_service_impl
         return 1
     fi
+
+    start_adaptive_monitor || { DISABLE_ON_STOP=0 stop_service_impl; return 1; }
 
     enable || {
         error_out "Failed to enable MultiWAN QoS init service; rolling back qdisc/nft state."
@@ -2068,6 +2092,16 @@ status_service() {
         not_managing=", but multiwan_qos is not managing it"
     fi
     print_msg "multiwan_qos global:enabled is $config_enabled."
+    print_msg "Realtime rate mode: ${realtime_rate_mode:-auto}"
+    if [ "${realtime_rate_mode:-auto}" = adaptive ]; then
+        local adaptive_status
+        for adaptive_status in /var/run/multiwan-qos/adaptive/*/status; do
+            [ -f "$adaptive_status" ] && print_msg "  $(cat "$adaptive_status")"
+        done
+        for adaptive_status in /var/run/multiwan-qos/adaptive/*/error; do
+            [ -f "$adaptive_status" ] && print_msg "  WARNING: $(cat "$adaptive_status")"
+        done
+    fi
 
     local active_qdisc='' active_device=''
     capture_active_interface() {
@@ -2220,7 +2254,7 @@ status_service() {
     print_msg "" "==== Health Check ===="
     health_check
 
-    # Check for flow offloading settings (incompatible with multiwan_qos)
+    # Report flow offloading compatibility.
     print_msg "" "==== Flow Offloading Check ===="
     local flow_offloading_enabled=0
     local flow_offloading_hw_enabled=0
@@ -2228,26 +2262,23 @@ status_service() {
     # Check software flow offloading in firewall defaults
     if [ "$(uci -q get firewall.@defaults[0].flow_offloading)" = "1" ]; then
         flow_offloading_enabled=1
-        print_msg "WARNING: Software flow offloading is enabled."
+        print_msg "Software flow offloading is enabled; tc ctinfo compatibility is active."
     fi
     
     # Check hardware flow offloading in firewall defaults
     if [ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = "1" ]; then
         flow_offloading_hw_enabled=1
-        print_msg "WARNING: Hardware flow offloading is enabled."
+        print_msg "WARNING: Hardware flow offloading is enabled; traffic may bypass software QoS shaping."
     fi
     
-    if [ "$flow_offloading_enabled" -eq 1 ] || [ "$flow_offloading_hw_enabled" -eq 1 ]; then
-        print_msg "CRITICAL: Flow offloading is incompatible with multiwan_qos and may cause issues!"
+    if [ "$flow_offloading_hw_enabled" -eq 1 ]; then
+        print_msg "QoS is continuing as configured, but hardware-offloaded flows cannot be guaranteed."
         print_msg "To disable flow offloading, run:"
-        if [ "$flow_offloading_enabled" -eq 1 ]; then
-            print_msg "  uci set firewall.@defaults[0].flow_offloading='0'"
-        fi
-        if [ "$flow_offloading_hw_enabled" -eq 1 ]; then
-            print_msg "  uci set firewall.@defaults[0].flow_offloading_hw='0'"
-        fi
+        print_msg "  uci set firewall.@defaults[0].flow_offloading_hw='0'"
         print_msg "  uci commit firewall"
         print_msg "  /etc/init.d/firewall restart"
+    elif [ "$flow_offloading_enabled" -eq 1 ]; then
+        print_msg "Software flow offloading is supported with the installed priority-1 ctinfo restore filter."
     else
         print_msg "Flow offloading is disabled (compatible with multiwan_qos)."
     fi

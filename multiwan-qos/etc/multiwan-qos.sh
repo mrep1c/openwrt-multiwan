@@ -14,6 +14,7 @@ IFS="$DEFAULT_IFS"
 : "${VERSION}" "${global_enabled:=}" "${nongameqdisc:=}" "${nongameqdiscoptions:=}" "${OVERHEAD:=}"
 : "${gameqdisc:=pfifo}" "${gameqdisc_child:=red}" "${nongameqdisc:=fq_codel}" "${ACK_FILTER_EGRESS:=auto}"
 : "${freshness_mode:=auto}" "${freshness_target_ms:=18}"
+: "${realtime_rate_mode:=auto}"
 : "${MAXDEL:=24}" "${PFIFOMIN:=5}" "${PACKETSIZE:=450}"
 : "${DOWNLOAD_IFB_STAB:=0}"
 : "${DISABLE_QOS_OFFLOADS:=1}"
@@ -27,6 +28,7 @@ QOS_OFFLOAD_WARNED_MISSING_ETHTOOL=0
 
 . /lib/functions.sh
 . /lib/multiwan-qos/process-lock.sh
+. /lib/multiwan-qos/realtime.sh
 
 # Config is loaded by the caller (multiwan_qos init), this is a fallback just in case
 [ -n "$MULTIWAN_QOS_CONFIG_LOADED" ] || {
@@ -88,6 +90,9 @@ config_load 'multiwan-qos' || { error_out "Failed to get UCI config."; exit 1; }
 # Check if Software Flow Offloading is enabled
 SFO_ENABLED=0
 [ "$(uci -q get firewall.@defaults[0].flow_offloading)" = "1" ] && SFO_ENABLED=1
+HFO_ENABLED=0
+[ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = "1" ] && HFO_ENABLED=1
+[ "$HFO_ENABLED" -eq 0 ] || print_msg -warn "Hardware firewall flow offload is enabled; packets may bypass software QoS shaping. Continuing as configured."
 
 # Calculated values - moved to per-interface setup
 
@@ -1604,7 +1609,7 @@ attach_classful_game_default_filter() {
 attach_classful_game_child_qdisc() {
     local DEV="$1" PARENT="$2" HANDLE="$3" CHILD_QDISC="$4" GAMERATE="$5" MTU="$6"
     local pfifo_limit="$7" bfifo_limit="$8" REDMIN="$9" REDMAX="${10}"
-    local BURST="${11}" INTVL="${12}" TARG="${13}"
+    local BURST="${11}" INTVL="${12}" TARG="${13}" PACKET_SIZE="${14:-500}"
 
     case "$CHILD_QDISC" in
         "pfifo")
@@ -1620,7 +1625,7 @@ attach_classful_game_child_qdisc() {
             ;;
         "red")
             tc qdisc add dev "$DEV" parent "$PARENT" handle "$HANDLE" red \
-                limit 150000 min "$REDMIN" max "$REDMAX" avpkt 500 \
+                limit $((REDMAX * 3)) min "$REDMIN" max "$REDMAX" avpkt "$PACKET_SIZE" \
                 bandwidth "${GAMERATE}kbit" probability 1.0 burst "$BURST"
             ;;
         *)
@@ -1701,36 +1706,15 @@ setup_game_qdisc() {
     realtime_target_ms="$(realtime_freshness_target_ms "$FRESHNESS_MODE" "$FRESHNESS_TARGET_MS" "$MAXDEL")"
     PACKETSIZE="$(realtime_packet_size_bytes "$PACKETSIZE" "$MTU")"
 
-    local BFIFO_BURST_CAP_BYTES=3000
-    local PFIFO_MIN_PACKETS=12
-    local NETEM_MIN_PACKETS=12
+    mw_realtime_queue_budget "$GAMERATE" "$realtime_target_ms" "$MTU" "$PACKETSIZE" "$PFIFOMIN"
+    local target_bytes="$MW_RT_DELAY_BYTES" burst_floor_bytes="$MW_RT_BURST_FLOOR"
+    local bfifo_limit="$MW_RT_QUEUE_BYTES" pfifo_limit="$MW_RT_PFIFO_LIMIT"
+    local netem_limit="$MW_RT_NETEM_LIMIT"
+    local REDMAX="$MW_RT_RED_MAX" REDMIN="$MW_RT_RED_MIN"
+    local REDLIMIT="$MW_RT_RED_LIMIT" BURST="$MW_RT_RED_BURST"
+    PACKETSIZE="$MW_RT_PACKET_SIZE"
 
-    local target_bytes=$((realtime_target_ms * GAMERATE / 8))
-    [ "$target_bytes" -lt 1 ] && target_bytes=1
-
-    local burst_floor_bytes="$target_bytes"
-    [ "$burst_floor_bytes" -gt "$BFIFO_BURST_CAP_BYTES" ] && burst_floor_bytes="$BFIFO_BURST_CAP_BYTES"
-
-    local bfifo_limit="$target_bytes"
-    [ "$bfifo_limit" -lt "$burst_floor_bytes" ] && bfifo_limit="$burst_floor_bytes"
-
-    local pfifo_limit=$((PFIFOMIN + target_bytes / PACKETSIZE))
-    local pfifo_delay_cap="$pfifo_limit"
-    [ "$pfifo_limit" -lt "$PFIFO_MIN_PACKETS" ] && pfifo_limit=$PFIFO_MIN_PACKETS
-    [ "$pfifo_limit" -gt "$pfifo_delay_cap" ] && pfifo_limit="$pfifo_delay_cap"
-
-    local netem_limit=$((4 + 9 * GAMERATE / 8 / 500))
-    local netem_delay_cap=$((target_bytes / 500))
-    [ "$netem_delay_cap" -lt 1 ] && netem_delay_cap=1
-    [ "$netem_limit" -lt "$NETEM_MIN_PACKETS" ] && netem_limit=$NETEM_MIN_PACKETS
-    [ "$netem_limit" -gt "$netem_delay_cap" ] && netem_limit="$netem_delay_cap"
-
-    # Calculate RED thresholds from the same stale-packet delay budget as BFIFO.
-    local REDMAX="$target_bytes"
-    local REDMIN=$((REDMAX / 3))
-    [ "$REDMIN" -lt 1 ] && REDMIN=1
-    # Calculate BURST: (min + min + max)/(3 * avpkt) as per RED documentation
-    local BURST=$(( (REDMIN + REDMIN + REDMAX) / (3 * 500) )); [ "$BURST" -lt 2 ] && BURST=2
+    print_msg "    Realtime queue: rate=${GAMERATE}kbit freshness=${realtime_target_ms}ms delay=${target_bytes}B burst-floor=${burst_floor_bytes}B limit=${bfifo_limit}B"
 
     # for fq_codel
     local INTVL=$((100+2*1500*8/GAMERATE))
@@ -1756,11 +1740,11 @@ setup_game_qdisc() {
             if ! {
                 tc qdisc add dev "$DEV" parent 1:11 handle 10: qfq &&
                 tc class add dev "$DEV" parent 10: classid 10:1 qfq weight 8000 &&
-                attach_classful_game_child_qdisc "$DEV" 10:1 101: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
+                attach_classful_game_child_qdisc "$DEV" 10:1 101: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" "$PACKETSIZE" &&
                 tc class add dev "$DEV" parent 10: classid 10:2 qfq weight 4000 &&
-                attach_classful_game_child_qdisc "$DEV" 10:2 102: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" &&
+                attach_classful_game_child_qdisc "$DEV" 10:2 102: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" "$PACKETSIZE" &&
                 tc class add dev "$DEV" parent 10: classid 10:3 qfq weight 1000 &&
-                attach_classful_game_child_qdisc "$DEV" 10:3 103: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG"
+                attach_classful_game_child_qdisc "$DEV" 10:3 103: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" "$PACKETSIZE"
             }; then
                 qdisc_setup_failed "Failed to set up QFQ $gameqdisc_child child qdisc on $DEV."
             fi
@@ -1774,7 +1758,7 @@ setup_game_qdisc() {
             tc qdisc add dev "$DEV" parent 1:11 handle 10: bfifo limit "$bfifo_limit"
         ;;
         "red")
-            tc qdisc add dev "$DEV" parent 1:11 handle 10: red limit 150000 min $REDMIN max $REDMAX avpkt 500 bandwidth "${GAMERATE}kbit" burst $BURST probability 1.0
+            tc qdisc add dev "$DEV" parent 1:11 handle 10: red limit "$REDLIMIT" min "$REDMIN" max "$REDMAX" avpkt "$PACKETSIZE" bandwidth "${GAMERATE}kbit" burst "$BURST" probability 1.0
             ## send game packets to 10:, they're all treated the same
         ;;
         "fq_codel")
@@ -2231,18 +2215,28 @@ calculate_htb_burst() {
 # handles latency; this rate only needs to cover game/voice traffic plus modest
 # overhead, with a slow-link cap to avoid consuming tiny connections.
 calculate_realtime_rate() {
-    local rate="$1" dir="$2" realtime cap
+    mw_realtime_auto_rate "$1"
+    echo "$MW_RT_RATE"
+}
 
-    [ "$rate" -gt 0 ] 2>/dev/null || rate=1
+select_realtime_rate() {
+    local line_rate="$1" override="$2" direction="$3" auto_rate
 
-    realtime=1500
+    mw_realtime_auto_rate "$line_rate"
+    auto_rate="$MW_RT_RATE"
+    MW_SELECTED_REALTIME_RATE="$auto_rate"
 
-    # On very slow links, do not let the realtime lane consume the connection.
-    cap=$((rate * 25 / 100))
-    [ "$cap" -lt 1 ] && cap=1
-    [ "$realtime" -gt "$cap" ] && realtime=$cap
+    [ "$realtime_rate_mode" = "manual" ] || return 0
+    [ -n "$override" ] || return 0
+    if [ "$override" -gt 0 ] 2>/dev/null && [ "$override" -lt "$line_rate" ] 2>/dev/null; then
+        MW_SELECTED_REALTIME_RATE="$override"
+        [ "$override" -ge "$auto_rate" ] ||
+            log_msg -warn "Manual realtime $direction reserve ${override}kbit is below the automatic ${auto_rate}kbit reserve; burst drops are more likely."
+        return 0
+    fi
 
-    echo "$realtime"
+    error_out "Invalid manual realtime $direction reserve '$override' for line rate ${line_rate}kbit."
+    return 1
 }
 
 # Function to setup HTB qdisc (simple.qos style with 3 classes)
@@ -2451,7 +2445,10 @@ apply_tc_custom_ingress_rules() {
             if [ "$ip" != "any" ]; then
                 # Skip private LAN IP matching for WAN ingress hooks as they haven't been NAT'd yet.
                 case "$ip" in
-                    192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) ip_match="" ;;
+                    192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*)
+                        debug_log "Skipping IFB flower fallback for '$rule_label': private LAN constraint '$ip' is not representable before NAT."
+                        continue
+                        ;;
                     *)
                         if [ "$is_inbound" -eq 1 ]; then
                             ip_match="dst_ip $ip"
@@ -2741,27 +2738,15 @@ setup_interface() {
     
     # Calculate a small realtime reserve per interface. The non-realtime lane
     # gets the rest of the link and is still host-fair through CAKE in hybrid.
-    local game_up="$(calculate_realtime_rate "$upload" "wan")"
-    local game_down="$(calculate_realtime_rate "$download" "lan")"
+    local game_up game_down
     local game_up_override game_down_override
     config_get game_up_override hfsc GAMEUP
     config_get game_down_override hfsc GAMEDOWN
 
-    if [ -n "$game_up_override" ]; then
-        if [ "$game_up_override" -gt 0 ] 2>/dev/null && [ "$game_up_override" -lt "$upload" ] 2>/dev/null; then
-            game_up="$game_up_override"
-        else
-            log_msg -warn "Ignoring invalid hfsc.GAMEUP override '$game_up_override' for $device."
-        fi
-    fi
-
-    if [ -n "$game_down_override" ]; then
-        if [ "$game_down_override" -gt 0 ] 2>/dev/null && [ "$game_down_override" -lt "$download" ] 2>/dev/null; then
-            game_down="$game_down_override"
-        else
-            log_msg -warn "Ignoring invalid hfsc.GAMEDOWN override '$game_down_override' for $device."
-        fi
-    fi
+    select_realtime_rate "$upload" "$game_up_override" upload || return 1
+    game_up="$MW_SELECTED_REALTIME_RATE"
+    select_realtime_rate "$download" "$game_down_override" download || return 1
+    game_down="$MW_SELECTED_REALTIME_RATE"
     
     case "$qdisc" in
         hfsc)
@@ -2801,7 +2786,7 @@ setup_interface() {
     # SFO compatibility
     if [ "$SFO_ENABLED" = "1" ]; then
         print_msg "  Enabling SFO compatibility"
-        tc filter add dev "$device" parent 1: protocol all matchall action ctinfo dscp 63 128 continue ||
+        tc filter add dev "$device" parent 1: protocol all prio 1 matchall action ctinfo dscp 63 128 continue ||
             qdisc_setup_failed "Failed to install SFO ctinfo filter on $device."
     fi
 }
@@ -2818,6 +2803,11 @@ case "$gameqdisc" in
         error_out "Unsupported gameqdisc '$gameqdisc' selected in config."
         exit 1
         ;;
+esac
+
+case "$realtime_rate_mode" in
+    auto|manual|adaptive) ;;
+    *) error_out "Unsupported realtime_rate_mode '$realtime_rate_mode'."; exit 1 ;;
 esac
 
 if [ "$gameqdisc" = "qfq" ]; then
@@ -2922,17 +2912,11 @@ if [ "$1" = "refresh-device" ]; then
         dev_mtu=$(cat "/sys/class/net/$device/mtu" 2>/dev/null)
         [ -z "$dev_mtu" ] || [ "$dev_mtu" -le 0 ] 2>/dev/null && dev_mtu=1500
 
-        game_down="$(calculate_realtime_rate "$download" "lan")"
         config_get game_down_override hfsc GAMEDOWN
-        if [ -n "$game_down_override" ]; then
-            if [ "$game_down_override" -gt 0 ] 2>/dev/null && [ "$game_down_override" -lt "$download" ] 2>/dev/null; then
-                game_down="$game_down_override"
-            else
-                log_msg -warn "Ignoring invalid hfsc.GAMEDOWN override '$game_down_override' for $device."
-            fi
-        fi
+        select_realtime_rate "$download" "$game_down_override" download || return 1
+        game_down="$MW_SELECTED_REALTIME_RATE"
 
-        log_msg "Soft-refreshing qdisc tree for $device via $lan_dev"
+        log_msg "Rebuilding qdisc tree for $device via $lan_dev"
         disable_qos_offloads "$device" "wan"
         disable_qos_offloads "$lan_dev" "ifb"
         disable_configured_extra_offloads
