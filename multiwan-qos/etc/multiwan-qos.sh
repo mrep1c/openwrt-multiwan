@@ -1857,7 +1857,7 @@ setup_hfsc() {
     mw_realtime_curve "$GAMERATE" "$RATE" "$MTU" "$realtime_target_ms"
 
     # Define HFSC Classes
-    if [ "$strict_realtime_priority" = 1 ]; then
+    if [ "$strict_realtime_priority" = 1 ] && [ "$realtime_rate_mode" != adaptive ]; then
         tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${RATE}kbit" d "${realtime_target_ms}ms" m2 "${RATE}kbit" ||
             qdisc_setup_failed "Failed to create strict HFSC realtime class 1:11 on $DEV."
     else
@@ -2112,7 +2112,7 @@ setup_hybrid() {
         qdisc_setup_failed "Failed to create Hybrid root class 1:1 on $DEV."
 
     # Class 1:11 - High priority realtime (HFSC RT + gameqdisc)
-    if [ "$strict_realtime_priority" = 1 ]; then
+    if [ "$strict_realtime_priority" = 1 ] && [ "$realtime_rate_mode" != adaptive ]; then
         tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${SHAPER_RATE}kbit" d "${realtime_target_ms}ms" m2 "${SHAPER_RATE}kbit" ||
             qdisc_setup_failed "Failed to create strict Hybrid realtime class 1:11 on $DEV."
     else
@@ -2798,8 +2798,12 @@ setup_interface() {
     if [ "$strict_realtime_priority" = 1 ]; then
         case "$qdisc" in
             hfsc|hybrid)
-                print_msg -warn "Strict realtime priority is enabled; continuously backlogged EF/CS5/CS6/CS7 traffic can starve other traffic."
-                print_msg "  Strict scheduler follows the shaped parent; Adaptive remains measurement-only."
+                if [ "$realtime_rate_mode" = adaptive ]; then
+                    print_msg -warn "Strict realtime priority is ignored in Adaptive mode; Adaptive controls the realtime HFSC curve."
+                else
+                    print_msg -warn "Strict realtime priority is enabled; continuously backlogged EF/CS5/CS6/CS7 traffic can starve other traffic."
+                    print_msg "  Strict scheduler follows the shaped parent."
+                fi
                 ;;
         esac
     fi

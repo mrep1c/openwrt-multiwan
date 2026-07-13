@@ -2093,7 +2093,9 @@ status_service() {
     fi
     print_msg "multiwan_qos global:enabled is $config_enabled."
     print_msg "Realtime rate mode: ${realtime_rate_mode:-auto}"
-    if [ "${strict_realtime_priority:-0}" = 1 ]; then
+    if [ "${strict_realtime_priority:-0}" = 1 ] && [ "${realtime_rate_mode:-auto}" = adaptive ]; then
+        print_msg "Strict realtime priority: ignored (Adaptive controls the realtime HFSC curve)"
+    elif [ "${strict_realtime_priority:-0}" = 1 ]; then
         print_msg "Strict realtime priority: enabled"
         print_msg "  WARNING: continuously backlogged EF/CS5/CS6/CS7 traffic can starve other traffic."
     else
@@ -2235,7 +2237,7 @@ status_service() {
 
         listed_interfaces=$((listed_interfaces + 1))
         print_msg "Interface $config: enabled=$enabled device=${device:-unset} qdisc=$qdisc upload=${upload:-unset} download=${download:-unset} preset=$preset"
-        if [ "${strict_realtime_priority:-0}" = 1 ]; then
+        if [ "${strict_realtime_priority:-0}" = 1 ] && [ "${realtime_rate_mode:-auto}" != adaptive ]; then
             case "$qdisc" in
                 hfsc)
                     print_msg "  Strict scheduler rate: upload=${upload:-unset}kbit download=${download:-unset}kbit"

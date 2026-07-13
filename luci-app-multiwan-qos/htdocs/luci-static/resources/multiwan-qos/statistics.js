@@ -1206,7 +1206,9 @@ return view.extend({
                     var row = E('div', { 'style': 'margin-right: 1.5em; margin-bottom: 0.3em;' });
                     row.appendChild(E('span', { 'style': 'font-weight: bold;' }, _('Strict Realtime Priority:')));
                     row.appendChild(document.createTextNode(' '));
-                    row.appendChild(E('span', {}, qosStats.strict_realtime_priority ? _('Enabled') : _('Disabled')));
+                    row.appendChild(E('span', {}, qosStats.strict_realtime_priority
+                        ? (qosStats.realtime_rate_mode === 'adaptive' ? _('Ignored by Adaptive') : _('Enabled'))
+                        : _('Disabled')));
                     infoContainer.appendChild(row);
                 }
                 if (qosStats.gameqdisc) {

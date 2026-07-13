@@ -21,7 +21,7 @@ mw_realtime_adaptive_range() {
     cap=$((line_rate * 25 / 100))
     [ "$cap" -lt 1 ] && cap=1
 
-    MW_RT_FLOOR=250
+    MW_RT_FLOOR=500
     [ "$MW_RT_FLOOR" -gt "$cap" ] && MW_RT_FLOOR="$cap"
     MW_RT_START=1000
     [ "$MW_RT_START" -gt "$cap" ] && MW_RT_START="$cap"

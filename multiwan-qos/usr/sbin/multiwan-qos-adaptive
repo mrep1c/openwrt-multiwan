@@ -79,12 +79,7 @@ apply_rate() {
 write_status() {
     local state_dir="$1" direction="$2" dev="$3" current="$4" shaper="$5"
     local state="$6" peak="$7" desired="$8" backlog="$9" drop_delta="${10}"
-    local priority_mode=bounded scheduler_rate="$current"
-
-    if [ "$STRICT_REALTIME_PRIORITY" = 1 ]; then
-        priority_mode=strict
-        scheduler_rate="$shaper"
-    fi
+    local priority_mode=adaptive scheduler_rate="$current"
     printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s recommended_rate=%s queue_budget_rate=%s floor=%s start=%s ceiling=%s peak=%s desired=%s backlog=%s drop_delta=%s state=%s\n' \
         "$priority_mode" "$direction" "$dev" "$scheduler_rate" "$current" "$MW_RT_START" \
         "$MW_RT_FLOOR" "$MW_RT_START" "$MW_RT_CEILING" "$peak" "$desired" "$backlog" "$drop_delta" "$state" \
@@ -223,26 +218,20 @@ process_direction() {
     printf '%s\n' "$last_increase" > "$state_dir/last_increase"
 
     if [ "$new" -ne "$current" ]; then
-        if [ "$STRICT_REALTIME_PRIORITY" = 1 ]; then
+        apply_rate "$dev" "$new" "$shaper" "$mtu" "$FRESHNESS"
+        rv=$?
+        if [ "$rv" -eq 2 ]; then
+            state=lock-busy
+            new="$current"
+        elif [ "$rv" -ne 0 ]; then
+            printf '%s\n' "failed to change $dev from ${current}kbit to ${new}kbit" > "$state_dir/error"
+            log "ERROR: adaptive $direction class update failed on $dev; preserving ${current}kbit and the existing leaf qdisc"
+            state=degraded
+            new="$current"
+        else
             printf '%s\n' "$new" > "$state_dir/rate"
             rm -f "$state_dir/error"
-            log "Updated $direction realtime recommendation on $dev: ${current}kbit -> ${new}kbit (strict scheduler unchanged)"
-        else
-            apply_rate "$dev" "$new" "$shaper" "$mtu" "$FRESHNESS"
-            rv=$?
-            if [ "$rv" -eq 2 ]; then
-                state=lock-busy
-                new="$current"
-            elif [ "$rv" -ne 0 ]; then
-                printf '%s\n' "failed to change $dev from ${current}kbit to ${new}kbit" > "$state_dir/error"
-                log "ERROR: adaptive $direction class update failed on $dev; preserving ${current}kbit and the existing leaf qdisc"
-                state=degraded
-                new="$current"
-            else
-                printf '%s\n' "$new" > "$state_dir/rate"
-                rm -f "$state_dir/error"
-                log "Adjusted $direction realtime HFSC rate on $dev: ${current}kbit -> ${new}kbit"
-            fi
+            log "Adjusted $direction realtime HFSC rate on $dev: ${current}kbit -> ${new}kbit"
         fi
     fi
 
@@ -280,11 +269,6 @@ while [ -f "$RESTARTING" ]; do sleep 1; done
 config_load multiwan-qos
 config_get RATE_MODE hfsc realtime_rate_mode auto
 [ "$RATE_MODE" = adaptive ] || exit 0
-config_get STRICT_REALTIME_PRIORITY hfsc strict_realtime_priority 0
-case "$STRICT_REALTIME_PRIORITY" in
-    0|1) ;;
-    *) log "ERROR: invalid strict_realtime_priority '$STRICT_REALTIME_PRIORITY'"; exit 1 ;;
-esac
 config_get FRESHNESS_MODE hfsc freshness_mode auto
 config_get FRESHNESS hfsc freshness_target_ms 18
 case "$FRESHNESS_MODE" in tight) FRESHNESS=14 ;; balanced|auto|'') FRESHNESS=18 ;; relaxed) FRESHNESS=24 ;; esac
