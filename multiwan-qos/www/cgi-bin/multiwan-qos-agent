@@ -19,6 +19,7 @@ local STATE_FILE = "/tmp/multiwan_qos_agent_state.json"
 local RESTARTING_FILE = "/tmp/multiwan_qos_restarting"
 local NFT_TABLE = "inet dscptag"
 local NFT_CHAIN = "multiwan_qos_agent"
+local NFT_REAPPLY_CHAIN = "multiwan_qos_agent_reapply"
 local LOCK_DIR = "/tmp/multiwan_qos_agent.lock"
 local LOCK_HELPER = "/lib/multiwan-qos/process-lock.sh"
 local MIN_REQUEST_INTERVAL_SEC = 1  -- minimum seconds between requests
@@ -442,7 +443,8 @@ end
 -- Build and apply nftables rules
 
 local function flush_agent_chain()
-    return command_ok("nft flush chain " .. NFT_TABLE .. " " .. NFT_CHAIN .. " 2>/dev/null")
+    return command_ok("nft flush chain " .. NFT_TABLE .. " " .. NFT_CHAIN ..
+        " 2>/dev/null && nft flush chain " .. NFT_TABLE .. " " .. NFT_REAPPLY_CHAIN .. " 2>/dev/null")
 end
 
 local function add_nft_rule(rule_str)
@@ -451,7 +453,8 @@ local function add_nft_rule(rule_str)
 end
 
 local function agent_chain_exists()
-    return command_ok("nft list chain " .. NFT_TABLE .. " " .. NFT_CHAIN .. " >/dev/null 2>&1")
+    return command_ok("nft list chain " .. NFT_TABLE .. " " .. NFT_CHAIN ..
+        " >/dev/null 2>&1 && nft list chain " .. NFT_TABLE .. " " .. NFT_REAPPLY_CHAIN .. " >/dev/null 2>&1")
 end
 
 local function cleanup_stale_rules()
@@ -472,9 +475,13 @@ end
 
 local function agent_rule_actions(dscp_class, safe_game, direction)
     return string.format(
-        'ip dscp set %s counter comment "agent_%s_%s"',
+        'ip dscp set %s meta priority set 1:11 counter comment "agent_%s_%s"',
         dscp_class, safe_game, direction
     )
+end
+
+local function agent_reapply_actions(dscp_class)
+    return string.format('ip dscp set %s', dscp_class)
 end
 
 local function make_rule_meta(game, direction, proto, remote_ip, remote_port, local_port, dscp_class)
@@ -715,6 +722,49 @@ local function verify_agent_rules(expected_count, dscp_class, dscp_value)
     }
 end
 
+local function verify_reapply_rules(expected_count, dscp_class, dscp_value)
+    local output, listed = read_command("nft -a list chain " .. NFT_TABLE .. " " .. NFT_REAPPLY_CHAIN)
+    local rule_count = 0
+    local dscp_rule_count = 0
+
+    if not listed or nft_output_has_error(output) then
+        return { ok = false, status = "reapply_list_failed", rule_count = 0, nft_output = output }
+    end
+
+    for line in output:gmatch("[^\r\n]+") do
+        local trimmed = trim(line)
+        if nft_line_is_rule(trimmed) then
+            rule_count = rule_count + 1
+            local dscp_token = trimmed:lower():match("ip%s+dscp%s+set%s+([%w_]+)")
+            if dscp_token == dscp_class or nft_token_matches_number(dscp_token, dscp_value) then
+                dscp_rule_count = dscp_rule_count + 1
+            end
+        end
+    end
+
+    local ok = rule_count == expected_count and dscp_rule_count == expected_count
+    return {
+        ok = ok,
+        status = ok and "verified" or "reapply_count_mismatch",
+        rule_count = rule_count,
+        dscp_rule_count = dscp_rule_count,
+        nft_output = output
+    }
+end
+
+local function verify_agent_chains(expected_count, dscp_class, dscp_value)
+    local primary = verify_agent_rules(expected_count, dscp_class, dscp_value)
+    local reapply = verify_reapply_rules(expected_count, dscp_class, dscp_value)
+    primary.reapply_rule_count = reapply.rule_count or 0
+    primary.reapply_verification_status = reapply.status
+    if not reapply.ok then
+        primary.ok = false
+        primary.status = reapply.status
+        primary.message = "Agent DSCP reapply chain did not match the primary agent chain"
+    end
+    return primary
+end
+
 local function current_agent_status()
     local state = read_agent_state()
     local state_rule_count = tonumber(state and state.rule_count or 0) or 0
@@ -788,6 +838,7 @@ local function apply_connection_rules(pc_ip, connections, dscp_class, dscp_value
     end
 
     buffer[#buffer + 1] = "flush chain " .. NFT_TABLE .. " " .. NFT_CHAIN
+    buffer[#buffer + 1] = "flush chain " .. NFT_TABLE .. " " .. NFT_REAPPLY_CHAIN
     local conntrack_lines = read_conntrack_lines()
 
     for _, conn in ipairs(connections) do
@@ -811,6 +862,11 @@ local function apply_connection_rules(pc_ip, connections, dscp_class, dscp_value
                         NFT_TABLE, NFT_CHAIN, pc_ip, conn.remote_ip, proto, local_port, proto, remote_port,
                         agent_rule_actions(dscp_class, safe_game, "UP")
                     )
+                    buffer[#buffer + 1] = string.format(
+                        'add rule %s %s ip saddr %s ip daddr %s %s sport %d %s dport %d %s',
+                        NFT_TABLE, NFT_REAPPLY_CHAIN, pc_ip, conn.remote_ip, proto, local_port, proto, remote_port,
+                        agent_reapply_actions(dscp_class)
+                    )
                     rules_meta[#rules_meta + 1] = mark_rule_meta_source(
                         make_rule_meta(game, "UP", proto, conn.remote_ip, remote_port, local_port, dscp_class),
                         "router_conntrack")
@@ -819,6 +875,11 @@ local function apply_connection_rules(pc_ip, connections, dscp_class, dscp_value
                         'add rule %s %s ip saddr %s ip daddr %s %s sport %d %s dport %d %s',
                         NFT_TABLE, NFT_CHAIN, conn.remote_ip, pc_ip, proto, remote_port, proto, local_port,
                         agent_rule_actions(dscp_class, safe_game, "DN")
+                    )
+                    buffer[#buffer + 1] = string.format(
+                        'add rule %s %s ip saddr %s ip daddr %s %s sport %d %s dport %d %s',
+                        NFT_TABLE, NFT_REAPPLY_CHAIN, conn.remote_ip, pc_ip, proto, remote_port, proto, local_port,
+                        agent_reapply_actions(dscp_class)
                     )
                     rules_meta[#rules_meta + 1] = mark_rule_meta_source(
                         make_rule_meta(game, "DN", proto, conn.remote_ip, remote_port, local_port, dscp_class),
@@ -837,7 +898,7 @@ local function apply_connection_rules(pc_ip, connections, dscp_class, dscp_value
     end
 
     if rules_added > 0 and state_matches_desired_rules(existing_state, rules_added, rules_meta, dscp_value) then
-        local verification = verify_agent_rules(rules_added, dscp_class, dscp_value)
+        local verification = verify_agent_chains(rules_added, dscp_class, dscp_value)
         if verification and verification.ok then
             return rules_added, nil, verification, rules_meta, ignored_connections,
                 conntrack_resolved, conntrack_unmatched, true
@@ -860,7 +921,7 @@ local function apply_connection_rules(pc_ip, connections, dscp_class, dscp_value
         return nil, "Failed to apply nft agent rules", nil, rules_meta, ignored_connections, conntrack_resolved, conntrack_unmatched
     end
 
-    return rules_added, nil, verify_agent_rules(rules_added, dscp_class, dscp_value),
+    return rules_added, nil, verify_agent_chains(rules_added, dscp_class, dscp_value),
         rules_meta, ignored_connections, conntrack_resolved, conntrack_unmatched, false
 end
 -- Main CGI handler

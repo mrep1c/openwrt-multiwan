@@ -7,216 +7,292 @@
 STATE_ROOT=/var/run/multiwan-qos/adaptive
 LOCK_DIR=/var/run/multiwan_qos-refresh.lock
 RESTARTING=/tmp/multiwan_qos_restarting
+SAMPLE_INTERVAL=0.25
 
 log() { logger -t multiwan-qos-adaptive -- "$*"; }
 
-fq_memory_limit() {
-    local mem=$(($1 * 1000 / 8))
-    [ "$mem" -lt 4000000 ] && mem=4000000
-    [ "$mem" -gt 16777216 ] && mem=16777216
-    printf '%s' "$mem"
+read_number() {
+    local value
+    if [ -r "$1" ]; then
+        IFS= read -r value < "$1"
+    else
+        value="$2"
+    fi
+    case "$value" in ''|*[!0-9]*) value="$2" ;; esac
+    printf '%s' "$value"
 }
 
-change_child_leaf() {
-    local dev="$1" parent="$2" handle="$3" child="$4" rate="$5" mtu="$6"
-    local freshness="$7" packet_size="$8" pfifo_min="$9"
-    mw_realtime_queue_budget "$rate" "$freshness" "$mtu" "$packet_size" "$pfifo_min"
-    case "$child" in
-        pfifo) tc qdisc change dev "$dev" parent "$parent" handle "$handle" pfifo limit "$MW_RT_PFIFO_LIMIT" ;;
-        bfifo) tc qdisc change dev "$dev" parent "$parent" handle "$handle" bfifo limit "$MW_RT_QUEUE_BYTES" ;;
-        red) tc qdisc change dev "$dev" parent "$parent" handle "$handle" red limit "$MW_RT_RED_LIMIT" min "$MW_RT_RED_MIN" max "$MW_RT_RED_MAX" avpkt "$MW_RT_PACKET_SIZE" bandwidth "${rate}kbit" burst "$MW_RT_RED_BURST" probability 1.0 ;;
-        fq_codel)
-            local interval=$((100 + 2 * mtu * 8 / rate)) target=$((540 * 8 / rate + 4))
-            [ "$target" -gt "$freshness" ] && target="$freshness"
-            [ "$target" -lt 4 ] && target=4
-            tc qdisc change dev "$dev" parent "$parent" handle "$handle" fq_codel memory_limit "$(fq_memory_limit "$rate")" interval "${interval}ms" target "${target}ms" quantum $((mtu * 2))
-            ;;
-        *) return 1 ;;
-    esac
-}
+read_realtime_stats() {
+    local dev="$1" stats
 
-change_leaf() {
-    local dev="$1" qdisc="$2" child="$3" rate="$4" mtu="$5" freshness="$6"
-    local packet_size="$7" pfifo_min="$8" direction="$9"
-    local netem_direction="${10}" netem_delay="${11}" netem_jitter="${12}" netem_dist="${13}" packet_loss="${14}"
-    local interval target args
-
-    mw_realtime_queue_budget "$rate" "$freshness" "$mtu" "$packet_size" "$pfifo_min"
-    case "$qdisc" in
-        drr) return 0 ;;
-        pfifo) tc qdisc change dev "$dev" parent 1:11 handle 10: pfifo limit "$MW_RT_PFIFO_LIMIT" ;;
-        bfifo) tc qdisc change dev "$dev" parent 1:11 handle 10: bfifo limit "$MW_RT_QUEUE_BYTES" ;;
-        red) tc qdisc change dev "$dev" parent 1:11 handle 10: red limit "$MW_RT_RED_LIMIT" min "$MW_RT_RED_MIN" max "$MW_RT_RED_MAX" avpkt "$MW_RT_PACKET_SIZE" bandwidth "${rate}kbit" burst "$MW_RT_RED_BURST" probability 1.0 ;;
-        fq_codel)
-            interval=$((100 + 2 * mtu * 8 / rate)); target=$((540 * 8 / rate + 4))
-            [ "$target" -gt "$freshness" ] && target="$freshness"; [ "$target" -lt 4 ] && target=4
-            tc qdisc change dev "$dev" parent 1:11 handle 10: fq_codel memory_limit "$(fq_memory_limit "$rate")" interval "${interval}ms" target "${target}ms" quantum $((mtu * 2))
-            ;;
-        qfq)
-            change_child_leaf "$dev" 10:1 101: "$child" "$rate" "$mtu" "$freshness" "$packet_size" "$pfifo_min" &&
-            change_child_leaf "$dev" 10:2 102: "$child" "$rate" "$mtu" "$freshness" "$packet_size" "$pfifo_min" &&
-            change_child_leaf "$dev" 10:3 103: "$child" "$rate" "$mtu" "$freshness" "$packet_size" "$pfifo_min"
-            ;;
-        netem)
-            if [ "$netem_direction" != both ] && { [ "$netem_direction" != egress ] || [ "$direction" != wan ]; } && { [ "$netem_direction" != ingress ] || [ "$direction" != lan ]; }; then
-                tc qdisc change dev "$dev" parent 1:11 handle 10: pfifo limit "$MW_RT_PFIFO_LIMIT"
-                return
-            fi
-            args="limit $MW_RT_NETEM_LIMIT"
-            [ "$netem_jitter" -ne 0 ] 2>/dev/null && [ "$netem_delay" -eq 0 ] 2>/dev/null && netem_delay=1
-            [ "$netem_delay" -eq 0 ] 2>/dev/null || args="$args delay ${netem_delay}ms"
-            [ "$netem_jitter" -eq 0 ] 2>/dev/null || args="$args ${netem_jitter}ms distribution $netem_dist"
-            [ -z "$packet_loss" ] || [ "$packet_loss" = none ] || args="$args loss $packet_loss"
-            # shellcheck disable=SC2086
-            tc qdisc change dev "$dev" parent 1:11 handle 10: netem $args
-            ;;
-        *) return 1 ;;
-    esac
+    stats="$(tc -s class show dev "$dev" classid 1:11 2>/dev/null)" || return 1
+    printf '%s\n' "$stats" | awk '
+        BEGIN {
+            if ((getline uptime < "/proc/uptime") > 0) {
+                split(uptime, field, " ")
+                now = int((field[1] * 1000) + 0.5)
+            }
+            close("/proc/uptime")
+        }
+        / Sent / && bytes == "" {
+            bytes = $2
+            for (i = 1; i <= NF; i++) {
+                key = $i
+                gsub(/[(),]/, "", key)
+                if (key == "dropped") {
+                    drops = $(i + 1)
+                    gsub(/[(),]/, "", drops)
+                }
+            }
+        }
+        /backlog/ && backlog == "" {
+            backlog = $3
+            sub(/p$/, "", backlog)
+        }
+        END {
+            if (bytes ~ /^[0-9]+$/ && drops ~ /^[0-9]+$/ && backlog ~ /^[0-9]+$/ && now > 0)
+                printf "%s %s %s %s\n", bytes, drops, backlog, now
+            else
+                exit 1
+        }
+    '
 }
 
 change_class() {
-    local dev="$1" rate="$2" shaper="$3" mtu="$4"
-    mw_realtime_curve "$rate" "$shaper" "$mtu"
-    tc class change dev "$dev" parent 1:1 classid 1:11 hfsc rt m1 "${MW_RT_BURST}kbit" d "${MW_RT_DUR}ms" m2 "${rate}kbit"
+    local dev="$1" rate="$2" shaper="$3" mtu="$4" freshness="$5"
+
+    mw_realtime_curve "$rate" "$shaper" "$mtu" "$freshness"
+    tc class change dev "$dev" parent 1:1 classid 1:11 hfsc rt \
+        umax "${MW_RT_WORK_BYTES}b" dmax "${MW_RT_DMAX}ms" rate "${MW_RT_SCHEDULER_RATE}kbit"
 }
 
 apply_rate() {
-    local dev="$1" old="$2" new="$3" shaper="$4" qdisc="$5" child="$6" mtu="$7" freshness="$8"
-    local packet_size="$9" pfifo_min="${10}" direction="${11}" netem_direction="${12}"
-    local netem_delay="${13}" netem_jitter="${14}" netem_dist="${15}" packet_loss="${16}" strict="${17}"
+    local dev="$1" rate="$2" shaper="$3" mtu="$4" freshness="$5" rv
 
     mw_lock_acquire "$LOCK_DIR" || return 2
-    if [ "$strict" = 1 ]; then
-        change_leaf "$dev" "$qdisc" "$child" "$new" "$mtu" "$freshness" "$packet_size" "$pfifo_min" "$direction" "$netem_direction" "$netem_delay" "$netem_jitter" "$netem_dist" "$packet_loss"
-    elif [ "$new" -gt "$old" ]; then
-        change_leaf "$dev" "$qdisc" "$child" "$new" "$mtu" "$freshness" "$packet_size" "$pfifo_min" "$direction" "$netem_direction" "$netem_delay" "$netem_jitter" "$netem_dist" "$packet_loss" &&
-        change_class "$dev" "$new" "$shaper" "$mtu"
-    else
-        change_class "$dev" "$new" "$shaper" "$mtu" &&
-        change_leaf "$dev" "$qdisc" "$child" "$new" "$mtu" "$freshness" "$packet_size" "$pfifo_min" "$direction" "$netem_direction" "$netem_delay" "$netem_jitter" "$netem_dist" "$packet_loss"
-    fi
-    local rv=$?
+    change_class "$dev" "$rate" "$shaper" "$mtu" "$freshness"
+    rv=$?
     mw_lock_release_for "$LOCK_DIR" "$MW_LOCK_TOKEN"
     return "$rv"
 }
 
 write_status() {
-    local state_dir="$1" direction="$2" dev="$3" current="$4" shaper="$5" state="$6"
+    local state_dir="$1" direction="$2" dev="$3" current="$4" shaper="$5"
+    local state="$6" peak="$7" desired="$8" backlog="$9" drop_delta="${10}"
     local priority_mode=bounded scheduler_rate="$current"
 
     if [ "$STRICT_REALTIME_PRIORITY" = 1 ]; then
         priority_mode=strict
         scheduler_rate="$shaper"
     fi
-    printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s queue_budget_rate=%s floor=%s start=%s ceiling=%s state=%s\n' \
-        "$priority_mode" "$direction" "$dev" "$scheduler_rate" "$current" \
-        "$MW_RT_FLOOR" "$MW_RT_START" "$MW_RT_CEILING" "$state" > "$state_dir/status"
+    printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s recommended_rate=%s queue_budget_rate=%s floor=%s start=%s ceiling=%s peak=%s desired=%s backlog=%s drop_delta=%s state=%s\n' \
+        "$priority_mode" "$direction" "$dev" "$scheduler_rate" "$current" "$MW_RT_START" \
+        "$MW_RT_FLOOR" "$MW_RT_START" "$MW_RT_CEILING" "$peak" "$desired" "$backlog" "$drop_delta" "$state" \
+        > "$state_dir/status"
+}
+
+reset_sample_state() {
+    local state_dir="$1" bytes="$2" drops="$3" now="$4" current="$5"
+
+    printf '%s\n' "$bytes" > "$state_dir/bytes"
+    printf '%s\n' "$drops" > "$state_dir/drops"
+    printf '%s\n' "$now" > "$state_dir/sample_ms"
+    printf '%s\n' "$now" > "$state_dir/window_ms"
+    printf '0\n' > "$state_dir/peak"
+    printf '%s\n' "$current" > "$state_dir/desired"
+    printf '0\n' > "$state_dir/backlog_samples"
 }
 
 process_direction() {
-    local dev="$1" line_rate="$2" shaper="$3" qdisc="$4" child="$5" mtu="$6" direction="$7"
-    local key state_dir current previous_bytes previous_drops stats bytes drops delta_bytes delta_drops demand
-    local high low new candidate rv
+    local dev="$1" line_rate="$2" shaper="$3" mtu="$4" direction="$5"
+    local key state_dir current stats bytes drops backlog now previous_bytes previous_drops previous_ms elapsed
+    local delta_bytes delta_drops sample_rate window_ms peak rolling_peak desired window_complete
+    local backlog_samples lower_target lower_since last_decrease last_increase new state rv
 
     [ -d "/sys/class/net/$dev" ] || return 0
-    key="$(printf '%s-%s' "$dev" "$direction" | tr -c 'A-Za-z0-9_.-' '_')"
-    state_dir="$STATE_ROOT/$key"; mkdir -p "$state_dir"
-    [ -f "$state_dir/error" ] && return 0
+    key="${dev}-${direction}"
+    case "$key" in
+        *[!A-Za-z0-9_.:@-]*) log "ERROR: unsafe adaptive state key for device '$dev'"; return 0 ;;
+    esac
+    state_dir="$STATE_ROOT/$key"
+    [ -d "$state_dir" ] || mkdir -p "$state_dir"
 
     mw_realtime_adaptive_range "$line_rate"
-    current="$(cat "$state_dir/rate" 2>/dev/null)"
-    case "$current" in ''|*[!0-9]*) current="$MW_RT_START" ;; esac
+    current="$(read_number "$state_dir/rate" "$MW_RT_START")"
     [ "$current" -lt "$MW_RT_FLOOR" ] && current="$MW_RT_FLOOR"
     [ "$current" -gt "$MW_RT_CEILING" ] && current="$MW_RT_CEILING"
     printf '%s\n' "$current" > "$state_dir/rate"
-    previous_bytes="$(cat "$state_dir/bytes" 2>/dev/null)"; previous_drops="$(cat "$state_dir/drops" 2>/dev/null)"
-    high="$(cat "$state_dir/high" 2>/dev/null)"; low="$(cat "$state_dir/low" 2>/dev/null)"; : "${high:=0}" "${low:=0}"
 
-    if [ "$STRICT_REALTIME_PRIORITY" = 1 ] && [ "$qdisc" = drr ]; then
-        printf '%s\n' "$current" > "$state_dir/rate"
-        write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" "strict-fixed/no-adjustable-leaf"
+    stats="$(read_realtime_stats "$dev")" || return 0
+    set -- $stats
+    bytes="$1"; drops="$2"; backlog="$3"; now="$4"
+
+    previous_bytes="$(read_number "$state_dir/bytes" 0)"
+    previous_drops="$(read_number "$state_dir/drops" 0)"
+    previous_ms="$(read_number "$state_dir/sample_ms" 0)"
+    if [ "$previous_ms" -eq 0 ] || [ "$bytes" -lt "$previous_bytes" ] || [ "$drops" -lt "$previous_drops" ]; then
+        reset_sample_state "$state_dir" "$bytes" "$drops" "$now" "$current"
+        write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" initializing 0 "$current" "$backlog" 0
         return 0
     fi
 
-    stats="$(tc -s class show dev "$dev" classid 1:11 2>/dev/null)" || return 0
-    bytes="$(printf '%s\n' "$stats" | awk '/ Sent / {print $2; exit}')"
-    drops="$(printf '%s\n' "$stats" | awk '/ Sent / {for(i=1;i<=NF;i++) {key=$i; gsub(/[(),]/,"",key); if(key=="dropped") {value=$(i+1); gsub(/[(),]/,"",value); print value; exit}}}')"
-    case "$bytes:$drops" in *[!0-9:]*|:*) return 0 ;; esac
-    printf '%s\n' "$bytes" > "$state_dir/bytes"; printf '%s\n' "$drops" > "$state_dir/drops"
-    [ -n "$previous_bytes" ] && [ -n "$previous_drops" ] || {
-        printf '%s\n' "$current" > "$state_dir/rate"
-        write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" active
-        return 0
-    }
-    [ "$bytes" -ge "$previous_bytes" ] && [ "$drops" -ge "$previous_drops" ] || return 0
+    elapsed=$((now - previous_ms))
+    [ "$elapsed" -gt 0 ] || return 0
+    delta_bytes=$((bytes - previous_bytes))
+    delta_drops=$((drops - previous_drops))
+    sample_rate=$((delta_bytes * 8 / elapsed))
+    printf '%s\n' "$bytes" > "$state_dir/bytes"
+    printf '%s\n' "$drops" > "$state_dir/drops"
+    printf '%s\n' "$now" > "$state_dir/sample_ms"
 
-    delta_bytes=$((bytes - previous_bytes)); delta_drops=$((drops - previous_drops))
-    demand=$(((delta_bytes + delta_drops * PACKETSIZE) * 8 / 1000))
-    new="$current"
-    if [ "$delta_drops" -gt 0 ] || [ $((demand * 100)) -ge $((current * 80)) ]; then
-        high=$((high + 1)); low=0
+    window_ms="$(read_number "$state_dir/window_ms" "$now")"
+    peak="$(read_number "$state_dir/peak" 0)"
+    rolling_peak="$(read_number "$state_dir/rolling_peak" 0)"
+    desired="$(read_number "$state_dir/desired" "$current")"
+    window_complete=0
+    if [ $((now - window_ms)) -ge 1000 ]; then
+        rolling_peak="$peak"
+        desired=$(((rolling_peak * 100 + 74) / 75))
+        desired=$(((desired + 49) / 50 * 50))
+        [ "$desired" -lt "$MW_RT_FLOOR" ] && desired="$MW_RT_FLOOR"
+        [ "$desired" -gt "$MW_RT_CEILING" ] && desired="$MW_RT_CEILING"
+        peak="$sample_rate"
+        window_ms="$now"
+        window_complete=1
+    elif [ "$sample_rate" -gt "$peak" ]; then
+        peak="$sample_rate"
+    fi
+    printf '%s\n' "$window_ms" > "$state_dir/window_ms"
+    printf '%s\n' "$peak" > "$state_dir/peak"
+    printf '%s\n' "$rolling_peak" > "$state_dir/rolling_peak"
+    printf '%s\n' "$desired" > "$state_dir/desired"
+
+    backlog_samples="$(read_number "$state_dir/backlog_samples" 0)"
+    if [ "$backlog" -gt 0 ]; then
+        backlog_samples=$((backlog_samples + 1))
     else
-        high=0
-        if [ $((demand * 100)) -le $((current * 50)) ]; then low=$((low + 1)); else low=0; fi
+        backlog_samples=0
     fi
-    if [ "$delta_drops" -gt 0 ] || [ "$high" -ge 2 ]; then
-        candidate=$(((demand * 125 / 100 + 249) / 250 * 250))
-        [ "$candidate" -lt $((current + 250)) ] && candidate=$((current + 250))
-        [ "$candidate" -gt "$MW_RT_CEILING" ] && candidate="$MW_RT_CEILING"
-        new="$candidate"; high=0
-    elif [ "$low" -ge 60 ] && [ "$current" -gt "$MW_RT_FLOOR" ]; then
-        new=$((current - 250)); [ "$new" -lt "$MW_RT_FLOOR" ] && new="$MW_RT_FLOOR"; low=0
-    fi
-    printf '%s\n' "$high" > "$state_dir/high"; printf '%s\n' "$low" > "$state_dir/low"
-    [ "$new" -ne "$current" ] || return 0
+    printf '%s\n' "$backlog_samples" > "$state_dir/backlog_samples"
 
-    apply_rate "$dev" "$current" "$new" "$shaper" "$qdisc" "$child" "$mtu" "$FRESHNESS" "$PACKETSIZE" "$PFIFOMIN" "$direction" "$NETEM_DIRECTION" "$NETEM_DELAY" "$NETEM_JITTER" "$NETEM_DIST" "$PACKET_LOSS" "$STRICT_REALTIME_PRIORITY"
-    rv=$?
-    [ "$rv" -eq 2 ] && return 0
-    if [ "$rv" -ne 0 ]; then
-        printf '%s\n' "failed to change $dev from ${current}kbit to ${new}kbit" > "$state_dir/error"
-        log "ERROR: adaptive $direction update failed on $dev; leaving the existing qdisc type unchanged"
-        return 0
+    lower_target="$(read_number "$state_dir/lower_target" "$current")"
+    lower_since="$(read_number "$state_dir/lower_since" 0)"
+    last_decrease="$(read_number "$state_dir/last_decrease" 0)"
+    last_increase="$(read_number "$state_dir/last_increase" 0)"
+    new="$current"
+    state=tracking
+
+    if [ "$delta_drops" -gt 0 ]; then
+        new=$((current + 250))
+        [ "$desired" -gt "$new" ] && new="$desired"
+        [ "$new" -gt "$MW_RT_CEILING" ] && new="$MW_RT_CEILING"
+        lower_since=0
+        last_increase="$now"
+        state=drop-increase
+    elif [ "$backlog_samples" -ge 2 ] && [ $((now - last_increase)) -ge 1000 ]; then
+        new=$((current + 100))
+        [ "$desired" -gt "$new" ] && new="$desired"
+        [ "$new" -gt "$MW_RT_CEILING" ] && new="$MW_RT_CEILING"
+        lower_since=0
+        last_increase="$now"
+        state=backlog-increase
+    elif [ "$window_complete" -eq 1 ] && [ "$desired" -ge $((current + 100)) ]; then
+        new="$desired"
+        lower_since=0
+        last_increase="$now"
+        state=demand-increase
+    elif [ "$window_complete" -eq 1 ] && [ "$backlog" -eq 0 ] && [ "$desired" -lt "$current" ]; then
+        if [ "$lower_target" -ne "$desired" ] || [ "$lower_since" -eq 0 ]; then
+            lower_target="$desired"
+            lower_since="$now"
+        elif [ $((now - lower_since)) -ge 30000 ] && [ $((now - last_decrease)) -ge 10000 ]; then
+            new=$((current - 100))
+            [ "$new" -lt "$desired" ] && new="$desired"
+            [ "$new" -lt "$MW_RT_FLOOR" ] && new="$MW_RT_FLOOR"
+            last_decrease="$now"
+            state=demand-decrease
+        fi
+    elif [ "$backlog" -gt 0 ] || [ "$desired" -ge "$current" ]; then
+        lower_since=0
+        lower_target="$current"
     fi
-    printf '%s\n' "$new" > "$state_dir/rate"
-    write_status "$state_dir" "$direction" "$dev" "$new" "$shaper" active
-    log "Adjusted $direction realtime queue budget on $dev: ${current}kbit -> ${new}kbit"
+
+    printf '%s\n' "$lower_target" > "$state_dir/lower_target"
+    printf '%s\n' "$lower_since" > "$state_dir/lower_since"
+    printf '%s\n' "$last_decrease" > "$state_dir/last_decrease"
+    printf '%s\n' "$last_increase" > "$state_dir/last_increase"
+
+    if [ "$new" -ne "$current" ]; then
+        if [ "$STRICT_REALTIME_PRIORITY" = 1 ]; then
+            printf '%s\n' "$new" > "$state_dir/rate"
+            rm -f "$state_dir/error"
+            log "Updated $direction realtime recommendation on $dev: ${current}kbit -> ${new}kbit (strict scheduler unchanged)"
+        else
+            apply_rate "$dev" "$new" "$shaper" "$mtu" "$FRESHNESS"
+            rv=$?
+            if [ "$rv" -eq 2 ]; then
+                state=lock-busy
+                new="$current"
+            elif [ "$rv" -ne 0 ]; then
+                printf '%s\n' "failed to change $dev from ${current}kbit to ${new}kbit" > "$state_dir/error"
+                log "ERROR: adaptive $direction class update failed on $dev; preserving ${current}kbit and the existing leaf qdisc"
+                state=degraded
+                new="$current"
+            else
+                printf '%s\n' "$new" > "$state_dir/rate"
+                rm -f "$state_dir/error"
+                log "Adjusted $direction realtime HFSC rate on $dev: ${current}kbit -> ${new}kbit"
+            fi
+        fi
+    fi
+
+    write_status "$state_dir" "$direction" "$dev" "$new" "$shaper" "$state" "$rolling_peak" "$desired" "$backlog" "$delta_drops"
 }
 
 process_interface() {
-    local section="$1" enabled device qdisc upload download mtu shaper
-    config_get_bool enabled "$section" enabled 1; [ "$enabled" -eq 1 ] || return 0
-    config_get device "$section" device; config_get qdisc "$section" qdisc hfsc
+    local section="$1" enabled device qdisc upload download wan_mtu ifb_mtu shaper ifb
+
+    config_get_bool enabled "$section" enabled 1
+    [ "$enabled" -eq 1 ] || return 0
+    config_get device "$section" device
+    config_get qdisc "$section" qdisc hfsc
     case "$qdisc" in hfsc|hybrid) ;; *) return 0 ;; esac
-    config_get upload "$section" upload; config_get download "$section" download
-    mtu="$(cat "/sys/class/net/$device/mtu" 2>/dev/null)"; : "${mtu:=1500}"
+    config_get upload "$section" upload
+    config_get download "$section" download
+
+    wan_mtu=1500
+    [ ! -r "/sys/class/net/$device/mtu" ] || IFS= read -r wan_mtu < "/sys/class/net/$device/mtu"
+    case "$wan_mtu" in ''|*[!0-9]*) wan_mtu=1500 ;; esac
     shaper="$upload"; [ "$qdisc" = hybrid ] && shaper=$((upload * 98 / 100))
-    process_direction "$device" "$upload" "$shaper" "$GAMEQDISC" "$GAMEQDISC_CHILD" "$mtu" wan
+    process_direction "$device" "$upload" "$shaper" "$wan_mtu" wan
+
+    ifb="ifb-$device"
+    ifb_mtu="$wan_mtu"
+    [ ! -r "/sys/class/net/$ifb/mtu" ] || IFS= read -r ifb_mtu < "/sys/class/net/$ifb/mtu"
+    case "$ifb_mtu" in ''|*[!0-9]*) ifb_mtu="$wan_mtu" ;; esac
     shaper="$download"; [ "$qdisc" = hybrid ] && shaper=$((download * 98 / 100))
-    process_direction "ifb-$device" "$download" "$shaper" "$GAMEQDISC" "$GAMEQDISC_CHILD" "$mtu" lan
+    process_direction "$ifb" "$download" "$shaper" "$ifb_mtu" lan
 }
 
 mkdir -p "$STATE_ROOT"
 while [ -f "$RESTARTING" ]; do sleep 1; done
+
+config_load multiwan-qos
+config_get RATE_MODE hfsc realtime_rate_mode auto
+[ "$RATE_MODE" = adaptive ] || exit 0
+config_get STRICT_REALTIME_PRIORITY hfsc strict_realtime_priority 0
+case "$STRICT_REALTIME_PRIORITY" in
+    0|1) ;;
+    *) log "ERROR: invalid strict_realtime_priority '$STRICT_REALTIME_PRIORITY'"; exit 1 ;;
+esac
+config_get FRESHNESS_MODE hfsc freshness_mode auto
+config_get FRESHNESS hfsc freshness_target_ms 18
+case "$FRESHNESS_MODE" in tight) FRESHNESS=14 ;; balanced|auto|'') FRESHNESS=18 ;; relaxed) FRESHNESS=24 ;; esac
+
 while true; do
     [ -f "$RESTARTING" ] && exit 0
-    config_load multiwan-qos
-    config_get RATE_MODE hfsc realtime_rate_mode auto
-    [ "$RATE_MODE" = adaptive ] || exit 0
-    config_get STRICT_REALTIME_PRIORITY hfsc strict_realtime_priority 0
-    case "$STRICT_REALTIME_PRIORITY" in
-        0|1) ;;
-        *) log "ERROR: invalid strict_realtime_priority '$STRICT_REALTIME_PRIORITY'"; exit 1 ;;
-    esac
-    config_get GAMEQDISC hfsc gameqdisc pfifo; config_get GAMEQDISC_CHILD hfsc gameqdisc_child red
-    config_get FRESHNESS_MODE hfsc freshness_mode auto; config_get FRESHNESS hfsc freshness_target_ms 18
-    case "$FRESHNESS_MODE" in tight) FRESHNESS=14 ;; balanced|auto|'') FRESHNESS=18 ;; relaxed) FRESHNESS=24 ;; esac
-    config_get PACKETSIZE hfsc PACKETSIZE 450; config_get PFIFOMIN hfsc PFIFOMIN 5
-    config_get NETEM_DIRECTION hfsc netem_direction both; config_get NETEM_DELAY hfsc netemdelayms 0
-    config_get NETEM_JITTER hfsc netemjitterms 0; config_get NETEM_DIST hfsc netemdist normal
-    config_get PACKET_LOSS hfsc pktlossp none
     config_foreach process_interface interface
-    sleep 1
+    sleep "$SAMPLE_INTERVAL"
 done
 
 exit 0

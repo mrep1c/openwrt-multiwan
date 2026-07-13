@@ -386,6 +386,178 @@ get_rule_counters() {
     jq -n --argjson rules "$rules_json" '{rule_counters: $rules}' 2>/dev/null || echo '{"rule_counters":[]}'
 }
 
+diag_monotonic_ms() {
+    awk '{ split($1, part, "."); frac = substr(part[2] "000", 1, 3); print (part[1] * 1000) + frac }' /proc/uptime 2>/dev/null
+}
+
+read_softirq_counter() {
+    local counter="$1"
+    awk -v counter="${counter}:" '$1 == counter { for (i = 2; i <= NF; i++) printf "%s%s", (i == 2 ? "" : " "), $i; print "" }' /proc/softirqs 2>/dev/null
+}
+
+softirq_delta_json() {
+    local before_rx="$1" after_rx="$2" before_tx="$3" after_tx="$4"
+    awk -v br="$before_rx" -v ar="$after_rx" -v bt="$before_tx" -v at="$after_tx" 'BEGIN {
+        nr = split(br, brv, " "); split(ar, arv, " ");
+        nt = split(bt, btv, " "); split(at, atv, " ");
+        count = nr > nt ? nr : nt;
+        printf "[";
+        for (i = 1; i <= count; i++) {
+            if (i > 1) printf ",";
+            rx = (arv[i] + 0) - (brv[i] + 0);
+            tx = (atv[i] + 0) - (btv[i] + 0);
+            printf "{\"cpu\":%d,\"net_rx_delta\":%.0f,\"net_tx_delta\":%.0f}", i - 1, rx, tx;
+        }
+        print "]";
+    }'
+}
+
+read_softnet_totals() {
+    local processed=0 dropped=0 squeezed=0 processed_hex dropped_hex squeezed_hex rest
+
+    while read -r processed_hex dropped_hex squeezed_hex rest; do
+        [ -n "$processed_hex" ] || continue
+        processed=$((processed + 0x$processed_hex))
+        dropped=$((dropped + 0x$dropped_hex))
+        squeezed=$((squeezed + 0x$squeezed_hex))
+    done < /proc/net/softnet_stat
+
+    printf '%s %s %s\n' "$processed" "$dropped" "$squeezed"
+}
+
+append_diag_device() {
+    local device="$1"
+    [ -n "$device" ] || return 0
+    [ -d "/sys/class/net/$device" ] || return 0
+    case " $DIAG_DEVICES " in
+        *" $device "*) ;;
+        *) DIAG_DEVICES="${DIAG_DEVICES:+$DIAG_DEVICES }$device" ;;
+    esac
+}
+
+collect_diag_interface() {
+    local section="$1" enabled device lower_path lower_device
+    config_get_bool enabled "$section" enabled 1
+    [ "$enabled" -eq 1 ] || return 0
+    config_get device "$section" device
+    append_diag_device "$device"
+    append_diag_device "ifb-$device"
+
+    for lower_path in "/sys/class/net/$device"/lower_*; do
+        [ -e "$lower_path" ] || continue
+        lower_device="$(basename "$(readlink -f "$lower_path" 2>/dev/null)")"
+        append_diag_device "$lower_device"
+    done
+}
+
+device_diag_json() {
+    local device="$1" mtu tx_queues rx_queues rps_masks xps_masks offloads errors mask
+    mtu="$(cat "/sys/class/net/$device/mtu" 2>/dev/null || echo 0)"
+    tx_queues="$(find "/sys/class/net/$device/queues" -maxdepth 1 -type d -name 'tx-*' 2>/dev/null | wc -l)"
+    rx_queues="$(find "/sys/class/net/$device/queues" -maxdepth 1 -type d -name 'rx-*' 2>/dev/null | wc -l)"
+    rps_masks="$(for mask in "/sys/class/net/$device"/queues/rx-*/rps_cpus; do
+        [ -f "$mask" ] || continue
+        printf '%s=%s\n' "$(basename "$(dirname "$mask")")" "$(cat "$mask" 2>/dev/null)"
+    done)"
+    xps_masks="$(for mask in "/sys/class/net/$device"/queues/tx-*/xps_cpus; do
+        [ -f "$mask" ] || continue
+        printf '%s=%s\n' "$(basename "$(dirname "$mask")")" "$(cat "$mask" 2>/dev/null)"
+    done)"
+    offloads="$(ethtool -k "$device" 2>/dev/null | awk -F: '/^(rx-checksumming|tx-checksumming|generic-segmentation-offload|generic-receive-offload|tcp-segmentation-offload|large-receive-offload|hw-tc-offload):/ { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $1 "=" $2 }')"
+    errors="$(ethtool -S "$device" 2>/dev/null | awk -F: 'BEGIN { IGNORECASE=1 } /drop|error|miss|timeout/ { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2); print $1 "=" $2; if (++count == 32) exit }')"
+
+    jq -n \
+        --arg name "$device" \
+        --argjson mtu "${mtu:-0}" \
+        --argjson txq "${tx_queues:-0}" \
+        --argjson rxq "${rx_queues:-0}" \
+        --arg rps "$rps_masks" \
+        --arg xps "$xps_masks" \
+        --arg offloads "$offloads" \
+        --arg errors "$errors" \
+        '{
+            name: $name,
+            mtu: $mtu,
+            tx_queues: $txq,
+            rx_queues: $rxq,
+            rps_masks: ($rps | split("\n") | map(select(length > 0))),
+            xps_masks: ($xps | split("\n") | map(select(length > 0))),
+            offloads: ($offloads | split("\n") | map(select(length > 0))),
+            error_counters: ($errors | split("\n") | map(select(length > 0)))
+        }' 2>/dev/null
+}
+
+get_cpu_nic_diagnostics() {
+    local enabled before_ms after_ms elapsed_ms before_rx after_rx before_tx after_tx
+    local before_softnet after_softnet before_processed before_dropped before_squeezed
+    local after_processed after_dropped after_squeezed softirq_json devices_json device_json device
+    local flow_offloading flow_offloading_hw extra_device
+
+    enabled="$(uci -q get multiwan-qos.advanced.ENABLE_CPU_NIC_DIAGNOSTICS || echo 0)"
+    if [ "$enabled" != 1 ]; then
+        echo '{"enabled":false,"error":"diagnostics_disabled"}'
+        return 0
+    fi
+
+    before_ms="$(diag_monotonic_ms)"
+    before_rx="$(read_softirq_counter NET_RX)"
+    before_tx="$(read_softirq_counter NET_TX)"
+    before_softnet="$(read_softnet_totals)"
+    sleep 1
+    after_ms="$(diag_monotonic_ms)"
+    after_rx="$(read_softirq_counter NET_RX)"
+    after_tx="$(read_softirq_counter NET_TX)"
+    after_softnet="$(read_softnet_totals)"
+
+    set -- $before_softnet
+    before_processed="${1:-0}"; before_dropped="${2:-0}"; before_squeezed="${3:-0}"
+    set -- $after_softnet
+    after_processed="${1:-0}"; after_dropped="${2:-0}"; after_squeezed="${3:-0}"
+    elapsed_ms=$((after_ms - before_ms))
+    [ "$elapsed_ms" -gt 0 ] 2>/dev/null || elapsed_ms=1000
+    softirq_json="$(softirq_delta_json "$before_rx" "$after_rx" "$before_tx" "$after_tx")"
+
+    DIAG_DEVICES=''
+    if config_load 'multiwan-qos' >/dev/null 2>&1; then
+        config_foreach collect_diag_interface interface
+    fi
+    for extra_device in $(uci -q get multiwan-qos.advanced.OFFLOAD_EXTRA_DEVICES); do
+        append_diag_device "$extra_device"
+    done
+
+    devices_json='[]'
+    for device in $DIAG_DEVICES; do
+        device_json="$(device_diag_json "$device")"
+        [ -n "$device_json" ] || continue
+        devices_json="$(printf '%s\n' "$devices_json" | jq -c --argjson item "$device_json" '. + [$item]' 2>/dev/null || printf '%s' "$devices_json")"
+    done
+
+    flow_offloading="$(uci -q get firewall.@defaults[0].flow_offloading || echo 0)"
+    flow_offloading_hw="$(uci -q get firewall.@defaults[0].flow_offloading_hw || echo 0)"
+    jq -n \
+        --argjson elapsed_ms "$elapsed_ms" \
+        --argjson softirqs "$softirq_json" \
+        --argjson processed_delta "$((after_processed - before_processed))" \
+        --argjson dropped_delta "$((after_dropped - before_dropped))" \
+        --argjson time_squeeze_delta "$((after_squeezed - before_squeezed))" \
+        --argjson devices "$devices_json" \
+        --arg flow_offloading "$flow_offloading" \
+        --arg flow_offloading_hw "$flow_offloading_hw" \
+        '{
+            enabled: true,
+            sample_ms: $elapsed_ms,
+            softirqs: $softirqs,
+            softnet: {
+                processed_delta: $processed_delta,
+                dropped_delta: $dropped_delta,
+                time_squeeze_delta: $time_squeeze_delta
+            },
+            flow_offloading: ($flow_offloading == "1"),
+            flow_offloading_hw: ($flow_offloading_hw == "1"),
+            devices: $devices
+        }' 2>/dev/null || echo '{"enabled":true,"error":"diagnostics_encoding_failed"}'
+}
+
 # Function to handle the call command
 handle_call() {
     local method="$1"
@@ -412,6 +584,9 @@ handle_call() {
                 printf '%s\n' "$result"
             }
             ;;
+        getCpuNicDiagnostics)
+            get_cpu_nic_diagnostics
+            ;;
         *)
             echo '{"error": "Method not found"}'
             ;;
@@ -422,7 +597,7 @@ handle_call() {
 case "$1" in
     list)
         # List available methods
-        echo '{"getStats": {}, "getRuleCounters": {}}'
+        echo '{"getStats": {}, "getRuleCounters": {}, "getCpuNicDiagnostics": {}}'
         ;;
     call)
         handle_call "$2"

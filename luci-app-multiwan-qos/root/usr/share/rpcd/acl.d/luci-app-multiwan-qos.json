@@ -4,7 +4,7 @@
         "read": {
             "ubus": {
                 "luci.multiwan_qos": [ "getConntrackDSCP", "getAgentStatus" ],
-                "luci.multiwan_qos_stats": [ "getStats", "getRuleCounters" ],
+                "luci.multiwan_qos_stats": [ "getStats", "getRuleCounters", "getCpuNicDiagnostics" ],
                 "luci": [ "getInitList", "getInitActionStatus" ]
             },
             "uci": [ "multiwan-qos" ],

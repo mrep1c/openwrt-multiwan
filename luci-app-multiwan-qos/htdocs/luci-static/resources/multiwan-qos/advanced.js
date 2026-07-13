@@ -4,6 +4,13 @@
 'require ui';
 'require uci';
 'require fs';
+'require rpc';
+
+var callCpuNicDiagnostics = rpc.declare({
+    object: 'luci.multiwan_qos_stats',
+    method: 'getCpuNicDiagnostics',
+    expect: {}
+});
 
 // SFO warning for dynamic rule parameters
 function addSfoWarning(description, paramName) {
@@ -111,6 +118,37 @@ return view.extend({
             o.placeholder = 'eth0 eth1 eth2';
             o.rmempty = true;
             o.depends('DISABLE_QOS_OFFLOADS', '1');
+
+            o = s.option(form.Flag, 'ENABLE_CPU_NIC_DIAGNOSTICS', _('CPU and NIC Diagnostics'), _('Allow an on-demand, read-only one-second sample of network softirqs, softnet pressure, queue masks, NIC offloads, and interface error counters.'));
+            o.rmempty = false;
+            o.default = '0';
+
+            o = s.option(form.Button, '_run_cpu_nic_diagnostics', _('Diagnostics Snapshot'));
+            o.inputstyle = 'action';
+            o.inputtitle = _('Run Snapshot');
+            o.depends('ENABLE_CPU_NIC_DIAGNOSTICS', '1');
+            o.onclick = function () {
+                ui.showModal(_('CPU and NIC Diagnostics'), [
+                    E('p', { 'class': 'spinning' }, _('Sampling for one second...'))
+                ]);
+
+                return callCpuNicDiagnostics().then(function (result) {
+                    ui.showModal(_('CPU and NIC Diagnostics'), [
+                        E('pre', {
+                            'style': 'max-height: 65vh; overflow: auto; white-space: pre-wrap;'
+                        }, [ JSON.stringify(result, null, 2) ]),
+                        E('div', { 'class': 'right' }, [
+                            E('button', {
+                                'class': 'btn',
+                                'click': ui.hideModal
+                            }, [ _('Close') ])
+                        ])
+                    ]);
+                }).catch(function (err) {
+                    ui.hideModal();
+                    ui.addNotification(null, E('p', _('Diagnostics failed: ') + err.message), 'error');
+                });
+            };
 
             createOption('BWMAXRATIO', _('Bandwidth Max Ratio'), _('Max download/upload ratio to prevent upstream congestion'), _('Default: 20'), 'uinteger');
             // Note: ACKRATE has been moved to per-interface settings

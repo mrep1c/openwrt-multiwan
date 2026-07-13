@@ -1147,14 +1147,21 @@ DYNAMIC_RULES=$(generate_dynamic_nft_rules)
 # Only created when agent is enabled in UCI config
 AGENT_CHAIN=""
 AGENT_JUMP=""
+AGENT_REAPPLY=""
 if [ "$AGENT_ENABLED" = "1" ] 2>/dev/null; then
     AGENT_CHAIN="
     # PC Agent dynamic chain â€” populated at runtime by the CGI endpoint
     chain multiwan_qos_agent {
+    }
+    # Counter-free mirror used to restore the agent DSCP after custom rules
+    chain multiwan_qos_agent_reapply {
     }"
     AGENT_JUMP="
-        # PC Agent: jump to dynamic game rules
+        # PC Agent: identify exact game flows before built-in classifiers
         counter jump multiwan_qos_agent"
+    AGENT_REAPPLY="
+        # PC Agent: restore its authoritative DSCP after custom classifiers
+        meta priority 1:11 counter jump multiwan_qos_agent_reapply"
 fi
 
 # Generate ingress netdev rules (pre-DNAT, port-based only â€” drives IFB classification)
@@ -1408,31 +1415,10 @@ ${SETS}
         ip6 dscp set af42
     }
 $AGENT_CHAIN
-    chain dscptag {
-        type filter hook $NFT_HOOK priority $NFT_PRIORITY; policy accept;
-
-        iif "lo" accept    
-        $(if [ "$WASHDSCPDOWN" -eq 1 ] 2>/dev/null; then
-            echo "# wash all the DSCP on ingress (packets from WAN) ... "
-            echo "        meta iifname \$wan counter jump mark_cs0"
-          fi
-        )
-        $(if [ "$WASHDSCPLAN" -eq 1 ] 2>/dev/null; then
-            echo "# wash all DSCP from LAN devices (prevents self-tagging as EF) ... "
-            echo "        meta iifname != \$wan meta iif != lo counter jump mark_cs0"
-          fi
-        )
-        
-        # Skip rule processing for ingress packets since they're already classified by tc-ctinfo
-        # MOVED: Process rules first, then store in conntrack, then accept
-
-        $NFT_TCPMSS_RULES
-
+    chain multiwan_qos_generic_classify {
         $udpbulkport_rules
 
         $tcpbulkport_rules
-
-        $NFT_ACK_RULES
 
         $vidconfports_rules
 
@@ -1445,18 +1431,47 @@ $AGENT_CHAIN
         $lowpriolan6_rules
 
         $NFT_UDP_RATE_RULES
-        
+
         # TCP down-prioritization (per-interface byte thresholds)
         $NFT_DOWNPRIO_RULES
 
         $NFT_TCP_UPGRADE_RULES
+    }
+
+    chain dscptag {
+        type filter hook $NFT_HOOK priority $NFT_PRIORITY; policy accept;
+
+        iif "lo" accept
+        $(if [ "$WASHDSCPDOWN" -eq 1 ] 2>/dev/null; then
+            echo "# wash all the DSCP on ingress (packets from WAN) ... "
+            echo "        meta iifname \$wan counter jump mark_cs0"
+          fi
+        )
+        $(if [ "$WASHDSCPLAN" -eq 1 ] 2>/dev/null; then
+            echo "# wash all DSCP from LAN devices (prevents self-tagging as EF) ... "
+            echo "        meta iifname != \$wan meta iif != lo counter jump mark_cs0"
+          fi
+        )
+
+        # Skip rule processing for ingress packets since they're already classified by tc-ctinfo
+        # MOVED: Process rules first, then store in conntrack, then accept
+
+        $NFT_TCPMSS_RULES
+
+        # Enforcement remains active for exact agent flows.
+        $NFT_ACK_RULES
+
+        # priority is a packet-local marker here and is finalized from DSCP below.
+        meta priority set 0
+$AGENT_JUMP
+        meta priority != 1:11 jump multiwan_qos_generic_classify
         
         # --- user inline rules begin ---
         $INLINE_INCLUDE
         # --- user inline rules end   ---
         
 ${DYNAMIC_RULES}
-$AGENT_JUMP
+$AGENT_REAPPLY
 
         ## classify for the HFSC queues:
         meta priority set ip dscp map @priomap counter
@@ -1622,7 +1637,7 @@ attach_classful_game_child_qdisc() {
         "fq_codel")
             tc qdisc add dev "$DEV" parent "$PARENT" handle "$HANDLE" fq_codel \
                 memory_limit "$(fq_codel_memory_limit "$GAMERATE")" \
-                interval "${INTVL}ms" target "${TARG}ms" quantum $((MTU * 2))
+                interval 100ms target 5ms quantum "$MTU" noecn
             ;;
         "red")
             tc qdisc add dev "$DEV" parent "$PARENT" handle "$HANDLE" red \
@@ -1717,11 +1732,8 @@ setup_game_qdisc() {
 
     print_msg "    Realtime queue: rate=${GAMERATE}kbit freshness=${realtime_target_ms}ms delay=${target_bytes}B burst-floor=${burst_floor_bytes}B limit=${bfifo_limit}B"
 
-    # for fq_codel
-    local INTVL=$((100+2*MTU*8/GAMERATE))
-    local TARG=$((540*8/GAMERATE+4))
-    [ "$TARG" -gt "$realtime_target_ms" ] && TARG="$realtime_target_ms"
-    [ "$TARG" -lt 4 ] && TARG=4
+    # Game FQ_CODEL is intentionally fixed and independent of the realtime rate.
+    local INTVL=100 TARG=5
 
     # Delete previous qdisc on this handle if it exists (optional, but good practice)
     tc qdisc del dev "$DEV" parent 1:11 handle 10: > /dev/null 2>&1
@@ -1763,7 +1775,9 @@ setup_game_qdisc() {
             ## send game packets to 10:, they're all treated the same
         ;;
         "fq_codel")
-            tc qdisc add dev "$DEV" parent "1:11" handle 10: fq_codel memory_limit "$(fq_codel_memory_limit "$GAMERATE")" interval "${INTVL}ms" target "${TARG}ms" quantum $((MTU * 2))
+            tc qdisc add dev "$DEV" parent "1:11" handle 10: fq_codel \
+                memory_limit "$(fq_codel_memory_limit "$GAMERATE")" \
+                interval 100ms target 5ms quantum "$MTU" noecn
         ;;
         "netem")
             # Only apply NETEM if this direction is enabled
@@ -1838,15 +1852,17 @@ setup_hfsc() {
     # Main link class
     tc class add dev "$DEV" parent 1: classid 1:1 hfsc ls m2 "${RATE}kbit" ul m2 "${RATE}kbit" ||
         qdisc_setup_failed "Failed to create HFSC root class 1:1 on $DEV."
-    # gameburst calculation
-    local gameburst=$((GAMERATE*10)); [ "$gameburst" -gt $((RATE*97/100)) ] && gameburst=$((RATE*97/100));
+    local realtime_target_ms
+    realtime_target_ms="$(realtime_freshness_target_ms "$freshness_mode" "$freshness_target_ms" "$MAXDEL")"
+    mw_realtime_curve "$GAMERATE" "$RATE" "$MTU" "$realtime_target_ms"
 
     # Define HFSC Classes
     if [ "$strict_realtime_priority" = 1 ]; then
-        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${RATE}kbit" d "${DUR}ms" m2 "${RATE}kbit" ||
+        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${RATE}kbit" d "${realtime_target_ms}ms" m2 "${RATE}kbit" ||
             qdisc_setup_failed "Failed to create strict HFSC realtime class 1:11 on $DEV."
     else
-        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${gameburst}kbit" d "${DUR}ms" m2 "${GAMERATE}kbit" ||
+        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt \
+            umax "${MW_RT_WORK_BYTES}b" dmax "${MW_RT_DMAX}ms" rate "${MW_RT_SCHEDULER_RATE}kbit" ||
             qdisc_setup_failed "Failed to create HFSC realtime class 1:11 on $DEV."
     fi
     tc class add dev "$DEV" parent 1:1 classid 1:12 hfsc ls m1 "$((RATE*70/100))kbit" d "${DUR}ms" m2 "$((RATE*30/100))kbit" ||
@@ -2071,7 +2087,9 @@ setup_hybrid() {
 
     # Calculate parameters
     local DUR=$((5*MTU*8/SHAPER_RATE)); [ "$DUR" -lt 25 ] && DUR=25
-    local gameburst=$((GAMERATE*10)); [ "$gameburst" -gt $((SHAPER_RATE*97/100)) ] && gameburst=$((SHAPER_RATE*97/100));
+    local realtime_target_ms
+    realtime_target_ms="$(realtime_freshness_target_ms "$freshness_mode" "$freshness_target_ms" "$MAXDEL")"
+    mw_realtime_curve "$GAMERATE" "$SHAPER_RATE" "$MTU" "$realtime_target_ms"
 
     # Setup root HFSC qdisc (default to 1:13 - CAKE class)
     local TC_OH_PARAMS
@@ -2095,10 +2113,11 @@ setup_hybrid() {
 
     # Class 1:11 - High priority realtime (HFSC RT + gameqdisc)
     if [ "$strict_realtime_priority" = 1 ]; then
-        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${SHAPER_RATE}kbit" d "${DUR}ms" m2 "${SHAPER_RATE}kbit" ||
+        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${SHAPER_RATE}kbit" d "${realtime_target_ms}ms" m2 "${SHAPER_RATE}kbit" ||
             qdisc_setup_failed "Failed to create strict Hybrid realtime class 1:11 on $DEV."
     else
-        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${gameburst}kbit" d "${DUR}ms" m2 "${GAMERATE}kbit" ||
+        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt \
+            umax "${MW_RT_WORK_BYTES}b" dmax "${MW_RT_DMAX}ms" rate "${MW_RT_SCHEDULER_RATE}kbit" ||
             qdisc_setup_failed "Failed to create Hybrid realtime class 1:11 on $DEV."
     fi
     # Attach game qdisc (using $gameqdisc from HFSC config)
@@ -2772,15 +2791,15 @@ setup_interface() {
         adaptive_up_floor="$MW_RT_FLOOR"; adaptive_up_start="$MW_RT_START"; adaptive_up_ceiling="$MW_RT_CEILING"
         mw_realtime_adaptive_range "$download"
         adaptive_down_floor="$MW_RT_FLOOR"; adaptive_down_start="$MW_RT_START"; adaptive_down_ceiling="$MW_RT_CEILING"
-        print_msg "  Adaptive upload queue budget: floor=${adaptive_up_floor}k start=${adaptive_up_start}k current=${game_up}k ceiling=${adaptive_up_ceiling}k"
-        print_msg "  Adaptive download queue budget: floor=${adaptive_down_floor}k start=${adaptive_down_start}k current=${game_down}k ceiling=${adaptive_down_ceiling}k"
+        print_msg "  Adaptive upload rate: floor=${adaptive_up_floor}k start=${adaptive_up_start}k current=${game_up}k ceiling=${adaptive_up_ceiling}k"
+        print_msg "  Adaptive download rate: floor=${adaptive_down_floor}k start=${adaptive_down_start}k current=${game_down}k ceiling=${adaptive_down_ceiling}k"
     fi
 
     if [ "$strict_realtime_priority" = 1 ]; then
         case "$qdisc" in
             hfsc|hybrid)
                 print_msg -warn "Strict realtime priority is enabled; continuously backlogged EF/CS5/CS6/CS7 traffic can starve other traffic."
-                print_msg "  Strict scheduler follows the shaped parent; queue budget UL/DL: ${game_up}k/${game_down}k"
+                print_msg "  Strict scheduler follows the shaped parent; Adaptive remains measurement-only."
                 ;;
         esac
     fi
