@@ -205,7 +205,7 @@ return view.extend({
         createOption('nongameqdiscoptions', _('Non-Game QDisc Options'), _('Cake options for non-realtime queueing discipline'), _('Default: besteffort ack-filter'));
 
         o = s.option(form.ListValue, 'freshness_mode', _('Realtime Freshness'),
-            addRelevanceInfo(_('HFSC work deadline for realtime traffic. Auto/Balanced: 18 ms, Tight: 14 ms, Relaxed: 24 ms, Custom: use the custom target below. Finite queues also use this target with a one-MTU floor; game FQ_CODEL keeps its independent 5 ms target.'), 'freshness_mode', rootQdisc, gameqdisc));
+            addRelevanceInfo(_('HFSC work deadline for realtime traffic. Auto/Balanced: 18 ms, Tight: 14 ms, Relaxed: 22 ms, Custom: use the custom target below. Finite queues also use this target with a one-MTU floor; game FQ_CODEL keeps its independent 5 ms target.'), 'freshness_mode', rootQdisc, gameqdisc));
         o.value('auto', _('Auto (Balanced)'));
         o.value('tight', _('Tight'));
         o.value('balanced', _('Balanced'));

@@ -7,7 +7,7 @@
 STATE_ROOT=/var/run/multiwan-qos/adaptive
 LOCK_DIR=/var/run/multiwan_qos-refresh.lock
 RESTARTING=/tmp/multiwan_qos_restarting
-SAMPLE_INTERVAL=0.25
+SAMPLE_INTERVAL=1
 
 log() { logger -t multiwan-qos-adaptive -- "$*"; }
 
@@ -100,7 +100,7 @@ reset_sample_state() {
 
 process_direction() {
     local dev="$1" line_rate="$2" shaper="$3" mtu="$4" direction="$5"
-    local key state_dir current stats bytes drops backlog now previous_bytes previous_drops previous_ms elapsed
+    local key state_dir current saved_current rate_needs_write stats bytes drops backlog now previous_bytes previous_drops previous_ms elapsed
     local delta_bytes delta_drops sample_rate window_ms peak rolling_peak desired window_complete
     local backlog_samples lower_target lower_since last_decrease last_increase new state rv
 
@@ -113,10 +113,25 @@ process_direction() {
     [ -d "$state_dir" ] || mkdir -p "$state_dir"
 
     mw_realtime_adaptive_range "$line_rate"
-    current="$(read_number "$state_dir/rate" "$MW_RT_START")"
-    [ "$current" -lt "$MW_RT_FLOOR" ] && current="$MW_RT_FLOOR"
-    [ "$current" -gt "$MW_RT_CEILING" ] && current="$MW_RT_CEILING"
-    printf '%s\n' "$current" > "$state_dir/rate"
+    rate_needs_write=0
+    if [ -r "$state_dir/rate" ]; then
+        IFS= read -r saved_current < "$state_dir/rate"
+        case "$saved_current" in
+            ''|*[!0-9]*) current="$MW_RT_START"; rate_needs_write=1 ;;
+            *) current="$saved_current" ;;
+        esac
+    else
+        current="$MW_RT_START"
+        rate_needs_write=1
+    fi
+    if [ "$current" -lt "$MW_RT_FLOOR" ]; then
+        current="$MW_RT_FLOOR"
+        rate_needs_write=1
+    elif [ "$current" -gt "$MW_RT_CEILING" ]; then
+        current="$MW_RT_CEILING"
+        rate_needs_write=1
+    fi
+    [ "$rate_needs_write" -eq 0 ] || printf '%s\n' "$current" > "$state_dir/rate"
 
     stats="$(read_realtime_stats "$dev")" || return 0
     set -- $stats
@@ -146,12 +161,13 @@ process_direction() {
     desired="$(read_number "$state_dir/desired" "$current")"
     window_complete=0
     if [ $((now - window_ms)) -ge 1000 ]; then
+        [ "$sample_rate" -gt "$peak" ] && peak="$sample_rate"
         rolling_peak="$peak"
         desired=$(((rolling_peak * 100 + 74) / 75))
         desired=$(((desired + 49) / 50 * 50))
         [ "$desired" -lt "$MW_RT_FLOOR" ] && desired="$MW_RT_FLOOR"
         [ "$desired" -gt "$MW_RT_CEILING" ] && desired="$MW_RT_CEILING"
-        peak="$sample_rate"
+        peak=0
         window_ms="$now"
         window_complete=1
     elif [ "$sample_rate" -gt "$peak" ]; then
@@ -184,7 +200,7 @@ process_direction() {
         lower_since=0
         last_increase="$now"
         state=drop-increase
-    elif [ "$backlog_samples" -ge 2 ] && [ $((now - last_increase)) -ge 1000 ]; then
+    elif [ "$backlog_samples" -ge 1 ] && [ $((now - last_increase)) -ge 1000 ]; then
         new=$((current + 100))
         [ "$desired" -gt "$new" ] && new="$desired"
         [ "$new" -gt "$MW_RT_CEILING" ] && new="$MW_RT_CEILING"
@@ -271,7 +287,7 @@ config_get RATE_MODE hfsc realtime_rate_mode auto
 [ "$RATE_MODE" = adaptive ] || exit 0
 config_get FRESHNESS_MODE hfsc freshness_mode auto
 config_get FRESHNESS hfsc freshness_target_ms 18
-case "$FRESHNESS_MODE" in tight) FRESHNESS=14 ;; balanced|auto|'') FRESHNESS=18 ;; relaxed) FRESHNESS=24 ;; esac
+case "$FRESHNESS_MODE" in tight) FRESHNESS=14 ;; balanced|auto|'') FRESHNESS=18 ;; relaxed) FRESHNESS=22 ;; esac
 
 while true; do
     [ -f "$RESTARTING" ] && exit 0

@@ -1666,7 +1666,7 @@ realtime_freshness_target_ms() {
             target=18
             ;;
         relaxed)
-            target=24
+            target=22
             ;;
         custom)
             case "$custom" in
