@@ -1,73 +1,151 @@
 #!/bin/sh
-# MultiWAN QoS hotplug common logic — sourced by 13-multiwan-qos-hotplug.
-# Single source of truth: the packaged hotplug script and the
-# generated one (init.d/multiwan_qos create_hotplug_script) both
-# source this file instead of embedding the logic inline.
+# Per-device MultiWAN QoS hotplug handling. This file is sourced by both the
+# packaged and generated hotplug entry points.
 
 [ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || exit 0
+/etc/init.d/multiwan-qos running >/dev/null 2>&1 || exit 0
 
 . /lib/functions.sh
+. /lib/functions/network.sh
 . /lib/multiwan-qos/process-lock.sh
 
-is_managed=0
+[ -n "$DEVICE" ] || {
+    network_flush_cache
+    network_get_device DEVICE "$INTERFACE" 2>/dev/null
+}
+case "$DEVICE" in ''|*[!A-Za-z0-9_.:@-]*) exit 0 ;; esac
 
+is_managed=0
 check_interface() {
-    local config="$1"
-    local device enabled
+    local config="$1" device enabled
     config_get device "$config" device
     config_get_bool enabled "$config" enabled 1
-
-    # Check if the event device matches AND interface is enabled
     if [ "$device" = "$DEVICE" ] && [ "$enabled" -eq 1 ]; then
         is_managed=1
-        return 1 # Break loop
+        return 1
     fi
 }
 
-config_load 'multiwan-qos'
+config_load multiwan-qos
 config_foreach check_interface interface
+[ "$is_managed" -eq 1 ] || exit 0
 
-if [ "$is_managed" -eq 1 ]; then
-    lockdir="/tmp/multiwan_qos-hotplug.lock"
-    pending_file="/tmp/multiwan_qos-hotplug.pending"
-    max_restarts=4
+state_root=/var/run/multiwan-qos/hotplug
+lockdir="/tmp/multiwan_qos-hotplug-$DEVICE.lock"
+pending_file="$state_root/$DEVICE.pending"
+status_file="$state_root/$DEVICE.status"
+mkdir -p "$state_root"
 
-    if ! mw_lock_acquire "$lockdir"; then
-        if mw_lock_owner_alive "$lockdir"; then
-            echo "$ACTION $INTERFACE $DEVICE" > "$pending_file"
-            logger -t multiwan_qos "Queued hotplug restart for $INTERFACE ($DEVICE); restart already running as pid $MW_LOCK_OWNER_PID"
-            exit 0
-        fi
-        echo "$ACTION $INTERFACE $DEVICE" > "$pending_file"
-        logger -t multiwan_qos "Queued hotplug restart for $INTERFACE ($DEVICE); restart lock is busy"
-        exit 0
+queue_event() {
+    local pending_tmp="$pending_file.$$"
+    printf '%s %s %s\n' "$ACTION" "$INTERFACE" "$DEVICE" > "$pending_tmp" &&
+        mv "$pending_tmp" "$pending_file"
+}
+
+write_status() {
+    local event_action="$1" result="$2" detail="$3"
+    local status_tmp="$status_file.$$" now
+    now="$(date +%s 2>/dev/null)" || now=0
+    printf 'device=%s interface=%s action=%s result=%s time=%s detail=%s\n' \
+        "$event_device" "$event_interface" "$event_action" "$result" "$now" "$detail" > "$status_tmp" &&
+        mv "$status_tmp" "$status_file"
+}
+
+queue_event || exit 1
+lock_acquired=0
+attempt=0
+while [ "$attempt" -lt 5 ]; do
+    if mw_lock_acquire "$lockdir"; then
+        lock_acquired=1
+        break
     fi
-    lock_token="$MW_LOCK_TOKEN"
-    release_hotplug_lock() {
-        mw_lock_release_for "$lockdir" "$lock_token"
-    }
-    trap release_hotplug_lock EXIT
-    trap 'exit 129' HUP
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
+    attempt=$((attempt + 1))
+    sleep 1
+done
+[ "$lock_acquired" -eq 1 ] || {
+    logger -t multiwan_qos "Queued $ACTION for $INTERFACE ($DEVICE); per-device hotplug worker is active"
+    exit 0
+}
 
-    restart_count=0
-    while :; do
-        restart_count=$((restart_count + 1))
+lock_token="$MW_LOCK_TOKEN"
+release_hotplug_lock() {
+    mw_lock_release_for "$lockdir" "$lock_token"
+}
+trap release_hotplug_lock EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-        # Debounce paired ifdown/ifup events; this restart covers events queued
-        # before it starts. Events queued while it runs trigger one more pass.
-        sleep 2
-        rm -f "$pending_file" 2>/dev/null
-        logger -t multiwan_qos "Restarting multiwan_qos due to $ACTION of $INTERFACE ($DEVICE)"
-        /etc/init.d/multiwan-qos restart || exit $?
-
-        [ -f "$pending_file" ] || break
-        if [ "$restart_count" -ge "$max_restarts" ]; then
-            rm -f "$pending_file" 2>/dev/null
-            logger -t multiwan_qos "Reached hotplug restart coalescing limit; future events will trigger a new restart"
-            break
+wait_for_l3_device() {
+    local waited=0 resolved_device mtu
+    while [ "$waited" -lt 30 ]; do
+        [ -f "$pending_file" ] && return 2
+        network_flush_cache
+        resolved_device=
+        network_get_device resolved_device "$event_interface" 2>/dev/null
+        mtu="$(cat "/sys/class/net/$event_device/mtu" 2>/dev/null)"
+        if network_is_up "$event_interface" &&
+            [ "$resolved_device" = "$event_device" ] &&
+            ip link show "$event_device" >/dev/null 2>&1; then
+            case "$mtu" in ''|*[!0-9]*|0) ;; *) return 0 ;; esac
         fi
-        logger -t multiwan_qos "Processing coalesced hotplug restart request"
+        waited=$((waited + 1))
+        sleep 1
     done
-fi
+    return 1
+}
+
+run_device_event() {
+    local operation="$1" device="$2" retry=0 rv
+    while [ "$retry" -lt 5 ]; do
+        /bin/sh /etc/multiwan-qos.sh device-event "$operation" "$device"
+        rv=$?
+        [ "$rv" -eq 75 ] || return "$rv"
+        retry=$((retry + 1))
+        sleep 1
+    done
+    return 75
+}
+
+processed=0
+while [ "$processed" -lt 8 ]; do
+    [ -f "$pending_file" ] || break
+    read -r event_action event_interface event_device < "$pending_file"
+    rm -f "$pending_file"
+    processed=$((processed + 1))
+
+    case "$event_action" in
+        ifdown)
+            if run_device_event detach "$event_device"; then
+                write_status "$event_action" detached "affected-device-only"
+                logger -t multiwan_qos "Detached QoS for $event_interface ($event_device); healthy WANs were untouched"
+            else
+                write_status "$event_action" failed "detach-error"
+                logger -t multiwan_qos "Failed to detach QoS for $event_interface ($event_device); healthy WANs were untouched"
+            fi
+            ;;
+        ifup)
+            wait_for_l3_device
+            ready_result=$?
+            if [ "$ready_result" -eq 2 ]; then
+                write_status "$event_action" superseded "newer-event-pending"
+                continue
+            elif [ "$ready_result" -ne 0 ]; then
+                write_status "$event_action" failed "l3-device-not-ready"
+                logger -t multiwan_qos "QoS attach timed out waiting for $event_interface ($event_device)"
+            elif run_device_event attach "$event_device"; then
+                write_status "$event_action" attached "affected-device-only"
+                logger -t multiwan_qos "Attached QoS for $event_interface ($event_device); healthy WANs were untouched"
+            else
+                write_status "$event_action" failed "attach-error"
+                logger -t multiwan_qos "Failed to attach QoS for $event_interface ($event_device); healthy WANs were untouched"
+            fi
+            ;;
+    esac
+
+    # Give a racing event time to publish its replacement request before this
+    # worker releases the per-device lock.
+    sleep 1
+done
+
+[ "$processed" -lt 8 ] || logger -t multiwan_qos "Hotplug coalescing limit reached for $DEVICE; the newest result is recorded in $status_file"

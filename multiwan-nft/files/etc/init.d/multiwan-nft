@@ -383,26 +383,6 @@ start_service() {
 	# Create routes for each interface (hotplug skips this during init)
 	config_foreach multiwan_nft_create_iface_route interface
 
-	# Ensure main-table default routes exist for all online interfaces.
-	# The hotplug ifup handler skips multiwan_nft_restore_iface_main_route during
-	# init (MULTIWAN_NFT_STARTUP=init guard), and tracking won't fire a 'connected'
-	# event for interfaces that start online (no offline->online transition).
-	# If a previous 'disconnected' event removed the main-table route,
-	# it would stay missing without this explicit restore.
-	multiwan_nft_restore_main_routes_init() {
-		local iface="$1" device status_file
-		network_get_device device "$iface" 2>/dev/null
-		[ -n "$device" ] || return 0
-		status_file="$MULTIWAN_NFT_TRACK_STATUS_DIR/$iface/STATUS"
-		# Only restore for interfaces that are (or will start as) online
-		local iface_status
-		iface_status=$(cat "$status_file" 2>/dev/null || echo "unknown")
-		if [ "$iface_status" = "online" ] || [ "$iface_status" = "unknown" ]; then
-			multiwan_nft_restore_iface_main_route "$iface" "$device"
-		fi
-	}
-	config_foreach multiwan_nft_restore_main_routes_init interface
-	
 	# Repopulate connected sets now that routes are available
 	multiwan_nft_set_connected_ipv4
 	[ "$NO_IPV6" -eq 0 ] && multiwan_nft_set_connected_ipv6

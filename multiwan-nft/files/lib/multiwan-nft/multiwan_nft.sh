@@ -24,6 +24,10 @@ DEFAULT_LOWEST_METRIC=256
 multiwan_nft_nft_init_table()
 {
 	$NFT list table $NFT_FAMILY $NFT_TABLE &>/dev/null && return 0
+	if [ -n "$NFT_BATCH_FILE" ]; then
+		LOG warn "nft: policy transaction requires existing table $NFT_FAMILY $NFT_TABLE"
+		return 1
+	fi
 	$NFT add table $NFT_FAMILY $NFT_TABLE || {
 		LOG warn "nft: failed to create table $NFT_FAMILY $NFT_TABLE"
 		return 1
@@ -96,6 +100,17 @@ multiwan_nft_nft_create_chain()
 {
 	local chain="$1"
 	local chaintype="$2"
+
+	if [ -n "$NFT_BATCH_FILE" ]; then
+		if $NFT list chain $NFT_FAMILY $NFT_TABLE "$chain" &>/dev/null; then
+			printf 'flush chain %s %s %s\n' "$NFT_FAMILY" "$NFT_TABLE" "$chain" >> "$NFT_BATCH_FILE"
+		elif [ -n "$chaintype" ]; then
+			printf 'add chain %s %s %s { %s; }\n' "$NFT_FAMILY" "$NFT_TABLE" "$chain" "$chaintype" >> "$NFT_BATCH_FILE"
+		else
+			printf 'add chain %s %s %s\n' "$NFT_FAMILY" "$NFT_TABLE" "$chain" >> "$NFT_BATCH_FILE"
+		fi
+		return 0
+	fi
 	
 	if $NFT list chain $NFT_FAMILY $NFT_TABLE "$chain" &>/dev/null; then
 		$NFT flush chain $NFT_FAMILY $NFT_TABLE "$chain" || {
@@ -122,6 +137,10 @@ multiwan_nft_nft_add_rule()
 {
 	local chain="$1"
 	shift
+	if [ -n "$NFT_BATCH_FILE" ]; then
+		printf 'add rule %s %s %s %s\n' "$NFT_FAMILY" "$NFT_TABLE" "$chain" "$*" >> "$NFT_BATCH_FILE"
+		return $?
+	fi
 	$NFT add rule $NFT_FAMILY $NFT_TABLE "$chain" "$@" || {
 		LOG warn "nft: failed to add rule to $chain"
 		return 1
@@ -133,6 +152,10 @@ multiwan_nft_nft_insert_rule()
 {
 	local chain="$1"
 	shift
+	if [ -n "$NFT_BATCH_FILE" ]; then
+		printf 'insert rule %s %s %s %s\n' "$NFT_FAMILY" "$NFT_TABLE" "$chain" "$*" >> "$NFT_BATCH_FILE"
+		return $?
+	fi
 	$NFT insert rule $NFT_FAMILY $NFT_TABLE "$chain" "$@" || {
 		LOG warn "nft: failed to insert rule into $chain"
 		return 1
@@ -761,6 +784,73 @@ multiwan_nft_create_iface_rules()
 	}
 }
 
+multiwan_nft_set_tracker_oif_rules()
+{
+	local iface="$1" device="$2" id family IP tracker_rule_count mark_val source
+
+	config_get family "$iface" family ipv4
+	multiwan_nft_get_iface_id id "$iface"
+	[ -n "$id" ] && [ -n "$device" ] || return 1
+	if [ "$family" = "ipv4" ]; then
+		IP="$IP4"
+	elif [ "$family" = "ipv6" ] && [ "$NO_IPV6" -eq 0 ]; then
+		IP="$IP6"
+	else
+		return 1
+	fi
+
+	# Make the failed mark unreachable first. Recovery-rule construction may
+	# fail, but that must never leave ordinary marked traffic routable.
+	mark_val="$(multiwan_nft_id2mask id MMX_MASK)"
+	while $IP rule del pref $((id+2000)) 2>/dev/null; do :; done
+	while $IP rule del pref $((id+3000)) 2>/dev/null; do :; done
+	$IP rule add pref $((id+3000)) fwmark "$mark_val/$MMX_MASK" unreachable || return 1
+
+	# Priority id+1000 is package-owned. Replace both online iif/oif rules with
+	# the iif rule plus exact local recovery-probe selectors.
+	while $IP rule del pref $((id+1000)) 2>/dev/null; do :; done
+	$IP rule add pref $((id+1000)) iif "$device" lookup "$id" ||
+		LOG warn "Could not restore the offline iif rule for $iface"
+	multiwan_nft_get_src_ip source "$iface"
+	[ -n "$source" ] || {
+		LOG warn "Could not resolve a tracker source address for $iface"
+		return 1
+	}
+	tracker_rule_count=0
+	add_tracker_rule() {
+		local target="$1" track_method httping_ssl protocol source_selector
+		if [ "$family" = "ipv4" ]; then
+			echo "$target" | grep -Eq "^${IPv4_REGEX}$" || return 0
+		else
+			echo "$target" | grep -Eq "^${IPv6_REGEX}$" || return 0
+		fi
+		config_get track_method "$iface" track_method ping
+		config_get_bool httping_ssl "$iface" httping_ssl 0
+		case "$track_method" in
+			ping|nping-icmp) [ "$family" = "ipv4" ] && protocol="ipproto icmp" || protocol="ipproto ipv6-icmp" ;;
+			nping-tcp) protocol="ipproto tcp" ;;
+			nping-udp) protocol="ipproto udp" ;;
+			httping) [ "$httping_ssl" -eq 1 ] && protocol="ipproto tcp dport 443" || protocol="ipproto tcp dport 80" ;;
+			*) return 0 ;;
+		esac
+		# ping/nping are bound to the L3 device. httping can bind only its
+		# source address, so its exact source+target+port tuple omits oif.
+		[ "$track_method" = httping ] && source_selector="from $source" || source_selector="from $source oif $device"
+		# shellcheck disable=SC2086
+		if $IP rule add pref $((id+1000)) $source_selector to "$target" $protocol lookup "$id"; then
+			tracker_rule_count=$((tracker_rule_count + 1))
+		else
+			LOG warn "rule: failed to add tracker-only oif rule for $iface target $target"
+		fi
+	}
+	config_list_foreach "$iface" track_ip add_tracker_rule
+	[ "$tracker_rule_count" -gt 0 ] || {
+		LOG warn "No valid tracker-only oif rules could be installed for $iface"
+		return 1
+	}
+	return 0
+}
+
 multiwan_nft_delete_iface_rules()
 {
 	local id family IP device mark_val
@@ -781,42 +871,91 @@ multiwan_nft_delete_iface_rules()
 	network_get_device device "$1"
 	mark_val="$(multiwan_nft_id2mask id MMX_MASK)"
 
-	if [ -n "$device" ]; then
-		while $IP rule del pref $((id+1000)) iif "$device" lookup "$id" 2>/dev/null; do :; done
-		while $IP rule del pref $((id+1000)) oif "$device" lookup "$id" 2>/dev/null; do :; done
-	fi
-	while $IP rule del pref $((id+2000)) fwmark "$mark_val/$MMX_MASK" lookup "$id" 2>/dev/null; do :; done
-	while $IP rule del pref $((id+3000)) fwmark "$mark_val/$MMX_MASK" unreachable 2>/dev/null; do :; done
+	# These priorities are allocated from this package's interface ID and are
+	# the complete owned rule identity, including tracker-only variants.
+	while $IP rule del pref $((id+1000)) 2>/dev/null; do :; done
+	while $IP rule del pref $((id+2000)) 2>/dev/null; do :; done
+	while $IP rule del pref $((id+3000)) 2>/dev/null; do :; done
 }
 
 multiwan_nft_delete_iface_set_entries()
 {
-	local id setname
+	local id setname mark_dec mark_hex batch_file set_json
+	local nft_entries nft_entry listed_name elem_keys elem_key
+	local element_addr element_mark element_mark_dec deleted
 
 	multiwan_nft_get_iface_id id "$1"
 
 	[ -n "$id" ] || return 0
 
-	local mark_hex=$(multiwan_nft_id2mask id MMX_MASK | awk '{ printf "0x%08x", $1; }')
-	
-	# Find and delete elements from sticky rule sets that contain this interface's mark
-	# Use nft -j for reliable JSON parsing instead of fragile grep on text output (#19)
+	mark_dec=$(multiwan_nft_id2mask id MMX_MASK)
+	mark_hex=$(printf '0x%08x' "$mark_dec")
+	batch_file=$(mktemp /tmp/multiwan-nft-sticky.XXXXXX) || return 1
+	deleted=0
+
+	# nft represents timed compound elements as nested JSON. Parse the key only;
+	# timeout/expiry metadata must never be copied into a delete command.
 	for setname in $($NFT list sets $NFT_FAMILY $NFT_TABLE 2>/dev/null | grep -oE 'set multiwan_nft_sticky_[^ ]+' | awk '{print $2}'); do
-		# List elements and filter by mark value
-		local elements
-		elements=$($NFT list set $NFT_FAMILY $NFT_TABLE "$setname" 2>/dev/null | \
-			sed -n '/elements/,/}/p' | tr ',' '\n' | grep "$mark_hex")
-		
-		local elem
-		for elem in $elements; do
-			# Clean up whitespace and extract the element expression
-			elem=$(echo "$elem" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | \
-				sed 's/.*elements = {//;s/}$//')
-			[ -z "$elem" ] && continue
-			$NFT delete element $NFT_FAMILY $NFT_TABLE "$setname" "{ $elem }" 2>/dev/null || \
-				LOG notice "failed to delete element from $setname"
+		set_json="$($NFT -j list set $NFT_FAMILY $NFT_TABLE "$setname" 2>/dev/null)" || {
+			rm -f "$batch_file"
+			LOG warn "Could not read sticky set $setname as JSON"
+			return 1
+		}
+		json_load "$set_json" || {
+			rm -f "$batch_file"
+			LOG warn "Could not parse sticky set $setname JSON"
+			return 1
+		}
+		json_select nftables 2>/dev/null || continue
+		json_get_keys nft_entries
+		for nft_entry in $nft_entries; do
+			json_select "$nft_entry" 2>/dev/null || continue
+			if json_select set 2>/dev/null; then
+				json_get_var listed_name name
+				if [ "$listed_name" = "$setname" ] && json_select elem 2>/dev/null; then
+					json_get_keys elem_keys
+					for elem_key in $elem_keys; do
+						element_addr=
+						element_mark=
+						json_select "$elem_key" 2>/dev/null || continue
+						if json_select elem 2>/dev/null && json_select val 2>/dev/null && json_select concat 2>/dev/null; then
+							json_get_var element_addr 1
+							json_get_var element_mark 2
+							json_select ..
+							json_select ..
+							json_select ..
+						fi
+						json_select ..
+						case "$element_mark" in
+							0x*|0X*) element_mark_dec=$((element_mark)) ;;
+							*[!0-9]*|'') continue ;;
+							*) element_mark_dec=$element_mark ;;
+						esac
+						[ "$element_mark_dec" -eq "$mark_dec" ] || continue
+						[ -n "$element_addr" ] || continue
+						printf 'delete element %s %s %s { %s . %s }\n' \
+							"$NFT_FAMILY" "$NFT_TABLE" "$setname" "$element_addr" "$mark_hex" >> "$batch_file"
+						deleted=$((deleted + 1))
+					done
+					json_select ..
+				fi
+				json_select ..
+			fi
+			json_select ..
 		done
 	done
+
+	MULTIWAN_NFT_STICKY_DELETED=$deleted
+	if [ "$deleted" -gt 0 ]; then
+		if ! $NFT -c -f "$batch_file" >/dev/null 2>&1 || ! $NFT -f "$batch_file" >/dev/null 2>&1; then
+			rm -f "$batch_file"
+			LOG warn "Failed to delete exact sticky entries for interface $1"
+			return 1
+		fi
+	fi
+	rm -f "$batch_file"
+	LOG info "Removed $deleted sticky entr$( [ "$deleted" -eq 1 ] && printf 'y' || printf 'ies' ) for interface $1"
+	return 0
 }
 
 
@@ -899,7 +1038,7 @@ multiwan_nft_set_policy_nft()
 			multiwan_nft_nft_add_rule "multiwan_nft_policy_$policy" \
 				$family_guard meta mark and $MMX_MASK == 0 \
 				meta mark set meta mark and $MMX_INVMASK or $mark_val return \
-				comment "\"$iface $weight $total_weight\""
+				comment "\"$iface $weight $total_weight\"" || policy_batch_failed=1
 			return
 		fi
 
@@ -909,14 +1048,53 @@ multiwan_nft_set_policy_nft()
 			$family_guard meta mark and $MMX_MASK == 0 \
 			numgen random mod $total_weight lt $weight \
 			meta mark set meta mark and $MMX_INVMASK or $mark_val return \
-			comment "\"$iface $weight $total_weight\""
+			comment "\"$iface $weight $total_weight\"" || policy_batch_failed=1
 	elif [ -n "$device" ]; then
-		# Offline but has device - use as fallback for direct output
-		multiwan_nft_nft_insert_rule "multiwan_nft_policy_$policy" \
-			$family_guard oifname "$device" meta mark and $MMX_MASK == 0 \
-			meta mark set meta mark and $MMX_INVMASK or $MMX_DEFAULT return \
-			comment "\"out $iface $device\""
+		# Keep only the configured health-probe tuple reachable on an offline
+		# interface. The former oifname-only rule admitted every bound process.
+		config_list_foreach "$iface" track_ip multiwan_nft_add_tracker_exception \
+			"$iface" "$family" "$device" "multiwan_nft_policy_$policy"
 	fi
+}
+
+multiwan_nft_add_tracker_exception()
+{
+	local target="$1" iface="$2" family="$3" device="$4" chain="$5"
+	local track_method httping_ssl protocol_match address_match source source_match
+
+	config_get track_method "$iface" track_method ping
+	config_get_bool httping_ssl "$iface" httping_ssl 0
+	multiwan_nft_get_src_ip source "$iface"
+	[ -n "$source" ] || return 0
+	if [ "$family" = "ipv4" ]; then
+		echo "$target" | grep -Eq "^${IPv4_REGEX}$" || return 0
+		address_match="ip daddr $target"
+		source_match="ip saddr $source"
+		case "$track_method" in
+			ping|nping-icmp) protocol_match="ip protocol icmp" ;;
+			nping-tcp) protocol_match="meta l4proto tcp" ;;
+			nping-udp) protocol_match="meta l4proto udp" ;;
+			httping) [ "$httping_ssl" -eq 1 ] && protocol_match="tcp dport 443" || protocol_match="tcp dport 80" ;;
+			*) return 0 ;;
+		esac
+	else
+		echo "$target" | grep -Eq "^${IPv6_REGEX}$" || return 0
+		address_match="ip6 daddr $target"
+		source_match="ip6 saddr $source"
+		case "$track_method" in
+			ping|nping-icmp) protocol_match="meta l4proto ipv6-icmp" ;;
+			nping-tcp) protocol_match="meta l4proto tcp" ;;
+			nping-udp) protocol_match="meta l4proto udp" ;;
+			httping) [ "$httping_ssl" -eq 1 ] && protocol_match="tcp dport 443" || protocol_match="tcp dport 80" ;;
+			*) return 0 ;;
+		esac
+	fi
+
+	multiwan_nft_nft_insert_rule "$chain" \
+		meta nfproto "$family" oifname "$device" $protocol_match $source_match $address_match \
+		meta mark and $MMX_MASK == 0 \
+		meta mark set meta mark and $MMX_INVMASK or $MMX_DEFAULT return \
+		comment "\"tracker $iface $target\"" || policy_batch_failed=1
 }
 
 multiwan_nft_create_policies_nft()
@@ -927,8 +1105,8 @@ multiwan_nft_create_policies_nft()
 
 	config_get last_resort "$1" last_resort unreachable
 
-	multiwan_nft_nft_init_table || return 1
-	multiwan_nft_nft_create_chain "multiwan_nft_policy_$1" || return 1
+	multiwan_nft_nft_init_table || { policy_batch_failed=1; return 1; }
+	multiwan_nft_nft_create_chain "multiwan_nft_policy_$1" || { policy_batch_failed=1; return 1; }
 
 	lowest_metric_v4=$DEFAULT_LOWEST_METRIC
 	total_weight_v4=0
@@ -949,17 +1127,17 @@ multiwan_nft_create_policies_nft()
 		blackhole)
 			multiwan_nft_nft_add_rule "multiwan_nft_policy_$1" \
 				meta mark and $MMX_MASK == 0 meta mark set meta mark and $MMX_INVMASK or $MMX_BLACKHOLE return \
-				comment "\"blackhole\"" || return 1
+				comment "\"blackhole\"" || { policy_batch_failed=1; return 1; }
 			;;
 		default)
 			multiwan_nft_nft_add_rule "multiwan_nft_policy_$1" \
 				meta mark and $MMX_MASK == 0 meta mark set meta mark and $MMX_INVMASK or $MMX_DEFAULT return \
-				comment "\"default\"" || return 1
+				comment "\"default\"" || { policy_batch_failed=1; return 1; }
 			;;
 		*)
 			multiwan_nft_nft_add_rule "multiwan_nft_policy_$1" \
 				meta mark and $MMX_MASK == 0 meta mark set meta mark and $MMX_INVMASK or $MMX_UNREACHABLE return \
-				comment "\"unreachable\"" || return 1
+				comment "\"unreachable\"" || { policy_batch_failed=1; return 1; }
 			;;
 	esac
 	
@@ -968,7 +1146,32 @@ multiwan_nft_create_policies_nft()
 
 multiwan_nft_set_policies_nft()
 {
+	local batch_file check_error apply_error
+
+	batch_file=$(mktemp /tmp/multiwan-nft-policy.XXXXXX) || return 1
+	NFT_BATCH_FILE="$batch_file"
+	policy_batch_failed=0
 	config_foreach multiwan_nft_create_policies_nft policy
+	NFT_BATCH_FILE=
+
+	if [ "$policy_batch_failed" -ne 0 ] || [ ! -s "$batch_file" ]; then
+		rm -f "$batch_file"
+		LOG warn "Policy batch generation failed; live policies were not changed"
+		return 1
+	fi
+	check_error="$($NFT -c -f "$batch_file" 2>&1)" || {
+		rm -f "$batch_file"
+		LOG warn "Policy batch validation failed; live policies were not changed: $check_error"
+		return 1
+	}
+	apply_error="$($NFT -f "$batch_file" 2>&1)" || {
+		rm -f "$batch_file"
+		LOG warn "Policy transaction failed; live policies were not changed: $apply_error"
+		return 1
+	}
+	rm -f "$batch_file"
+	multiwan_nft_nft_dump "set_policies_nft"
+	return 0
 }
 
 multiwan_nft_set_sticky_nft()
@@ -1109,7 +1312,7 @@ multiwan_nft_set_user_nft_rule()
 	fi
 
 	# Build match criteria
-	local family_guard match
+	local family_guard match sticky_base_match
 	[ "$ipv" = "ipv4" ] && family_guard="meta nfproto ipv4" || family_guard="meta nfproto ipv6"
 	match="$family_guard"
 	
@@ -1153,6 +1356,7 @@ multiwan_nft_set_user_nft_rule()
 			match="$match ip daddr @$nft_set"
 		fi
 	fi
+	sticky_base_match="$match"
 	
 	# Mark check - only process unmarked traffic
 	match="$match meta mark and $MMX_MASK == 0"
@@ -1194,11 +1398,9 @@ multiwan_nft_set_user_nft_rule()
 		# Add sticky refresh for ALL matching traffic (even established)
 		# This runs regardless of mark state to keep sticky timeout fresh
 		if [ "$sticky" -eq 1 ]; then
-			# Build base match without mark==0 check
-			local sticky_match="$family_guard"
-			[ -n "$proto" ] && [ "$proto" != "all" ] && sticky_match="$sticky_match meta l4proto $proto"
-			[ -n "$dest_port" ] && sticky_match="$sticky_match $proto dport $nft_dest_port"
-			# Only update if packet has valid tracking info (removed impossible mark!=0 check)
+			# Reuse the complete original match and accept only real interface marks.
+			# Default/failure marks must never pollute a sticky set.
+			local sticky_match="$sticky_base_match meta mark and $MMX_MASK != 0 meta mark and $MMX_MASK != $MMX_DEFAULT meta mark and $MMX_MASK != $MMX_BLACKHOLE meta mark and $MMX_MASK != $MMX_UNREACHABLE"
 			
 			if [ "$ipv" = "ipv4" ]; then
 				multiwan_nft_nft_add_rule multiwan_nft_rules $sticky_match \
@@ -1215,28 +1417,6 @@ multiwan_nft_set_user_nft_rule()
 		if ! multiwan_nft_nft_add_rule multiwan_nft_rules $match meta mark set meta mark and $MMX_INVMASK or $action_mark \
 			comment "\"$rule\""; then
 			LOG warn "Failed to add simple mark rule '$rule' to multiwan_nft_rules chain"
-		fi
-	fi
-	
-	# Flush matching conntrack entries so the rule takes effect immediately
-	# on existing connections. Only flush when specific (non-broad) IPs are
-	# configured to avoid disrupting all connections.
-	if command -v conntrack >/dev/null 2>&1; then
-		local src_broad=0 dest_broad=0
-		multiwan_nft_is_broad_address "$src_ip" && src_broad=1
-		multiwan_nft_is_broad_address "$dest_ip" && dest_broad=1
-
-		if [ "$src_broad" -eq 0 ] && [ "$dest_broad" -eq 0 ]; then
-			conntrack -D -s "$src_ip" -d "$dest_ip" 2>/dev/null && \
-				LOG notice "Flushed conntrack entries for rule $rule (src=$src_ip dst=$dest_ip)"
-		elif [ "$src_broad" -eq 0 ]; then
-			conntrack -D -s "$src_ip" 2>/dev/null && \
-				LOG notice "Flushed conntrack entries for rule $rule (src=$src_ip, dest broad)"
-		elif [ "$dest_broad" -eq 0 ]; then
-			conntrack -D -d "$dest_ip" 2>/dev/null && \
-				LOG notice "Flushed conntrack entries for rule $rule (dst=$dest_ip, src broad)"
-		else
-			LOG debug "Skipping conntrack flush for rule $rule: both endpoints broad"
 		fi
 	fi
 
@@ -1397,7 +1577,7 @@ multiwan_nft_get_iface_hotplug_state() {
 
 multiwan_nft_report_iface_status()
 {
-	local device result tracking IP error
+	local device result tracking IP error hotplug_state recovery_result
 
 	multiwan_nft_get_iface_id id "$1"
 	network_get_device device "$1"
@@ -1412,16 +1592,22 @@ multiwan_nft_report_iface_status()
 	if [ -z "$id" ] || [ -z "$device" ]; then
 		result="offline"
 	else
+		hotplug_state="$(multiwan_nft_get_iface_hotplug_state "$1")"
 		error=0
 		# Check iif rule at pref id+1000: must match device and lookup table (bit 0)
 		$IP rule list | grep -q "^$((id+1000)):.*iif $device.*lookup $id" ||
 			error=$((error+1))
-		# Check oif rule at pref id+1000: must match device and lookup table (bit 1)
-		$IP rule list | grep -q "^$((id+1000)):.*oif $device.*lookup $id" ||
-			error=$((error+2))
-		# Check fwmark lookup rule at pref id+2000 (bit 2)
-		[ -n "$($IP rule | awk -v pref="$((id+2000)):" '$1 == pref')" ] ||
-			error=$((error+4))
+		if [ "$hotplug_state" = offline ]; then
+			# Offline means exact tracker selectors at pref id+1000, no fwmark
+			# lookup, and the package-owned unreachable guard still present.
+			[ -z "$($IP rule | awk -v pref="$((id+2000)):" '$1 == pref')" ] ||
+				error=$((error+4))
+		else
+			$IP rule list | grep -q "^$((id+1000)):.*oif $device.*lookup $id" ||
+				error=$((error+2))
+			[ -n "$($IP rule | awk -v pref="$((id+2000)):" '$1 == pref')" ] ||
+				error=$((error+4))
+		fi
 		# Check fwmark unreachable rule at pref id+3000 (bit 3)
 		[ -n "$($IP rule | awk -v pref="$((id+3000)):" '$1 == pref')" ] ||
 			error=$((error+8))
@@ -1435,12 +1621,15 @@ multiwan_nft_report_iface_status()
 
 	if [ "$result" = "offline" ]; then
 		:
+	elif [ "$error" -eq 0 ] && [ "$hotplug_state" = offline ]; then
+		recovery_result="$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/$1/RECOVERY_RULE_RESULT" 2>/dev/null)"
+		result="offline (isolated, recovery=${recovery_result:-unknown})"
 	elif [ "$error" -eq 0 ]; then
 		online=$(get_online_time "$1")
 		network_get_uptime uptime "$1"
 		online="$(printf '%02dh:%02dm:%02ds\n' $((online/3600)) $((online%3600/60)) $((online%60)))"
 		uptime="$(printf '%02dh:%02dm:%02ds\n' $((uptime/3600)) $((uptime%3600/60)) $((uptime%60)))"
-		result="$(multiwan_nft_get_iface_hotplug_state $1) $online, uptime $uptime"
+		result="$hotplug_state $online, uptime $uptime"
 	elif [ "$error" -gt 0 ] && [ "$error" -ne 63 ]; then
 		result="error (${error})"
 	elif [ "$enabled" = "1" ]; then
@@ -1552,15 +1741,6 @@ multiwan_nft_report_rules_v6()
 	multiwan_nft_report_rules_v4
 }
 
-# Returns 0 if address is a broad/default address that should not trigger
-# conntrack flush. Used to skip flush for catch-all rules like 0.0.0.0/0.
-multiwan_nft_is_broad_address() {
-	case "$1" in
-		""|"0.0.0.0/0"|"0.0.0.0"|"::/0"|"::") return 0 ;;
-		*) return 1 ;;
-	esac
-}
-
 # Idempotent route replace: skip if exact route exists, handle "File exists"
 # gracefully. Only for add/replace paths — delete handling is separate.
 # Args: $1=ip_cmd, $2=table_id, $3=route_line (single string, expanded for ip cmd)
@@ -1589,77 +1769,48 @@ multiwan_nft_route_replace_idempotent() {
 	return 1
 }
 
-# Flush conntrack entries marked with a specific interface's fwmark.
-# This is an OPTIMIZATION — the default route removal in
-# multiwan_nft_delete_iface_default_route() is what actually forces failover.
-# This flush just speeds up the process by killing stale entries immediately
-# instead of waiting for each connection to hit the unreachable rule.
-#
-# Uses conntrack-tools if available. If not installed, failover still works
-# via the unreachable ip rule (pref 3xxx) once the default route is removed.
+# Purge TCP and UDP conntracks carrying one interface's exact MultiWAN mark.
+# The offline IP-rule state already makes the mark unreachable; this purge
+# forces applications to establish fresh sessions without touching traffic on
+# any other WAN.
 multiwan_nft_flush_conntrack_iface()
 {
 	local iface="$1"
-	local id mark_val
+	local id mark_val protocol entries protocol_count count delete_error
 
 	multiwan_nft_get_iface_id id "$iface"
 	[ -n "$id" ] || return 0
 
 	mark_val=$(multiwan_nft_id2mask id MMX_MASK)
+	MULTIWAN_NFT_CONNTRACK_PURGED=0
 
 	if command -v conntrack >/dev/null 2>&1; then
-		if multiwan_nft_debug_enabled; then
-			local count
-			count=$(conntrack -D -m "$mark_val/$MMX_MASK" 2>/dev/null | grep -c "flow" 2>/dev/null)
-			LOG notice "Flushed conntrack entries for interface $iface (mark=$mark_val/$MMX_MASK, entries=${count:-0})"
-		else
-			conntrack -D -m "$mark_val/$MMX_MASK" >/dev/null 2>&1
-			LOG notice "Flushed conntrack entries for interface $iface (mark=$mark_val/$MMX_MASK)"
-		fi
-	else
-		LOG notice "conntrack tool not found, skipping targeted flush for $iface (failover via route removal)"
-	fi
-}
-
-multiwan_nft_delete_iface_main_route()
-{
-	local iface="$1"
-	local device="$2"
-	local family IP route_line routes deleted
-
-	config_get family "$iface" family ipv4
-	[ -n "$device" ] || network_get_device device "$iface"
-	[ -n "$device" ] || return 0
-
-	if [ "$family" = "ipv4" ]; then
-		IP="$IP4"
-	elif [ "$family" = "ipv6" ] && [ "$NO_IPV6" -eq 0 ]; then
-		IP="$IP6"
-	else
-		return 0
+		count=0
+		delete_error=0
+		for protocol in tcp udp; do
+			entries="$(conntrack -L -p "$protocol" -m "$mark_val/$MMX_MASK" 2>/dev/null)" || {
+				LOG warn "Could not enumerate $protocol conntracks for interface $iface"
+				delete_error=1
+				continue
+			}
+			protocol_count=$(printf '%s\n' "$entries" | sed '/^[[:space:]]*$/d' | wc -l)
+			case "$protocol_count" in ''|*[!0-9]*) protocol_count=0 ;; esac
+			[ "$protocol_count" -gt 0 ] || continue
+			conntrack -D -p "$protocol" -m "$mark_val/$MMX_MASK" >/dev/null 2>&1 || {
+				LOG warn "Could not purge $protocol conntracks for interface $iface"
+				delete_error=1
+				continue
+			}
+			count=$((count + protocol_count))
+		done
+		MULTIWAN_NFT_CONNTRACK_PURGED=$count
+		LOG notice "Purged marked TCP/UDP conntracks for interface $iface (mark=$mark_val/$MMX_MASK, entries=$count)"
+		[ "$delete_error" -eq 0 ]
+		return
 	fi
 
-	routes="$($IP route show table main 2>/dev/null)"
-	while read -r route_line; do
-		[ -n "$route_line" ] || continue
-		[ "${route_line#default}" = "$route_line" ] && continue
-		case " $route_line " in
-			*" dev $device "*)
-				# shellcheck disable=SC2086
-				$IP route del table main $route_line 2>/dev/null && {
-					deleted=1
-					LOG notice "Removed main-table default route for $iface: $route_line"
-				}
-				;;
-		esac
-	done <<EOF
-$routes
-EOF
-
-	if [ "$deleted" = "1" ]; then
-		$IP route flush cache 2>/dev/null
-		LOG debug "Flushed route cache after removing main-table default route for $iface"
-	fi
+	LOG warn "conntrack tool not found; cannot purge sessions for failed interface $iface"
+	return 1
 }
 
 multiwan_nft_restore_iface_default_route()
@@ -1742,11 +1893,6 @@ multiwan_nft_restore_iface_default_route()
 	fi
 }
 
-multiwan_nft_restore_iface_main_route()
-{
-	multiwan_nft_restore_iface_default_route "$1" "$2" "main" "main-table"
-}
-
 multiwan_nft_restore_iface_table_default_route()
 {
 	local id
@@ -1754,31 +1900,6 @@ multiwan_nft_restore_iface_table_default_route()
 	multiwan_nft_get_iface_id id "$1"
 	[ -n "$id" ] || return 0
 	multiwan_nft_restore_iface_default_route "$1" "$2" "$id" "table $id"
-}
-
-# Remove the default route from an interface's routing table.
-# Called on 'disconnected' to prevent traffic from routing through a dead
-# upstream. The full route table is preserved — only the default route is
-# removed so that the unreachable ip rule (pref 3xxx) takes effect for
-# traffic still carrying this interface's fwmark.
-multiwan_nft_delete_iface_default_route()
-{
-	local id family IP
-
-	config_get family "$1" family ipv4
-	multiwan_nft_get_iface_id id "$1"
-	[ -n "$id" ] || return 0
-
-	if [ "$family" = "ipv4" ]; then
-		IP="$IP4"
-	elif [ "$family" = "ipv6" ] && [ "$NO_IPV6" -eq 0 ]; then
-		IP="$IP6"
-	else
-		return
-	fi
-
-	$IP route del default table "$id" 2>/dev/null && \
-		LOG notice "Removed default route from table $id for interface $1"
 }
 
 multiwan_nft_flush_conntrack()
@@ -1797,24 +1918,15 @@ multiwan_nft_flush_conntrack()
 				# NOTE: This is safe because the multiwan_qos ct_save_dscp chains no longer
 				# use "ct state established,related return" — DSCP is re-saved on the
 				# first egress packet after the flush regardless of conntrack state.
-				if command -v conntrack >/dev/null 2>&1; then
-					flush_other() {
-						[ "$1" != "$interface" ] && multiwan_nft_flush_conntrack_iface "$1"
-					}
-					config_foreach flush_other interface
-					# NOTE: Do NOT flush $MMX_DEFAULT conntrack entries here.
-					# $MMX_DEFAULT matches router-originated traffic (DNS, DoH,
-					# NTP) which should not be disrupted during failback.
-					# The per-interface flush_other loop above handles re-routing.
-					LOG info "Mwan3 failback connection tracking flushed on action '$action'"
-				else
-					echo f > "${CONNTRACK_FILE}"
-					LOG info "Global connection tracking flushed on action '$action'"
-				fi
+				flush_other() {
+					[ "$1" != "$interface" ] && multiwan_nft_flush_conntrack_iface "$1"
+				}
+				config_foreach flush_other interface
+				LOG info "Scoped failback connection tracking purge completed on action '$action'"
 			else
-				# For ifdown/disconnected, just flush the interface that went down
+				# For ifdown/disconnected, purge only the affected interface mark.
 				multiwan_nft_flush_conntrack_iface "$interface"
-				LOG info "Connection tracking flushed for interface '$interface' on action '$action'"
+				LOG info "Scoped connection tracking purge completed for interface '$interface' on action '$action'"
 			fi
 		fi
 	}

@@ -166,19 +166,22 @@ validate_wrap() {
 }
 
 disconnected() {
-	local status="$(cat ${MULTIWAN_NFT_TRACK_STATUS_DIR}/${INTERFACE}/STATUS)"
+	local status="$(cat ${MULTIWAN_NFT_TRACK_STATUS_DIR}/${INTERFACE}/STATUS 2>/dev/null)"
+	local quiet="${1:-0}"
+	local reason="${2:-probe}"
 
 	STATUS='offline'
 	echo "offline" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/STATUS
+	echo "$reason" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/OFFLINE_REASON
 	get_uptime > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/OFFLINE
 	echo "0" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/ONLINE
 	score=0
-	[ "$1" = 1 ] && return
+	[ "$quiet" = 1 ] && return
 
 	# Only execute disconnectd action if status was online or disconnecting
 	if [ "$status" = "online" ] || [ "$status" = "disconnecting" ]; then
 		LOG notice "Interface $INTERFACE ($DEVICE) is offline"
-		env -i ACTION="disconnected" INTERFACE="$INTERFACE" DEVICE="$DEVICE" /sbin/hotplug-call iface
+		env -i ACTION="disconnected" INTERFACE="$INTERFACE" DEVICE="$DEVICE" OFFLINE_REASON="$reason" /sbin/hotplug-call iface
 	else
 		LOG notice "Skip disconnected event for $INTERFACE ($DEVICE)"
 	fi
@@ -187,6 +190,7 @@ disconnected() {
 connected() {
 	STATUS='online'
 	echo "online" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/STATUS
+	echo "none" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/OFFLINE_REASON
 	echo "0" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/OFFLINE
 	get_uptime > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/ONLINE
 	score=$((down+up))
@@ -289,6 +293,7 @@ main() {
 	local recovery_latency failure_loss recovery_loss
 
 	local max_ttl httping_ssl track_ips do_log
+	local target_count host_down_count round_state max_failures
 
 	INTERFACE=$1
 	STATUS=""
@@ -331,22 +336,48 @@ main() {
 	config_get recovery_latency $INTERFACE recovery_latency 500
 	config_get failure_loss $INTERFACE failure_loss 40
 	config_get recovery_loss $INTERFACE recovery_loss 10
-	local sleep_time result ping_status loss latency
+	local sleep_time result ping_status loss latency quality_sample
+	target_count=0
 	multiwan_nft_list_track_ips()
 	{
 		track_ips="$track_ips $1"
+		target_count=$((target_count + 1))
 	}
 	config_list_foreach "$1" track_ip multiwan_nft_list_track_ips
 
+	case "$reliability:$count:$timeout:$interval:$down:$up:$failure_interval:$recovery_interval:$failure_latency:$recovery_latency:$failure_loss:$recovery_loss" in
+		*[!0-9:]*|:*|*::*)
+			LOG err "Invalid non-numeric tracking configuration for interface $INTERFACE"
+			exit 1
+			;;
+	esac
+	if [ "$target_count" -lt 1 ] || [ "$reliability" -lt 1 ] || [ "$reliability" -gt "$target_count" ]; then
+		LOG err "Invalid reliability $reliability for $target_count tracking target(s) on interface $INTERFACE"
+		exit 1
+	fi
+	if [ "$count" -lt 1 ] || [ "$timeout" -lt 1 ] || [ "$interval" -lt 1 ] ||
+		[ "$failure_interval" -lt 1 ] || [ "$recovery_interval" -lt 1 ] ||
+		[ "$down" -lt 1 ] || [ "$up" -lt 1 ] ||
+		[ "$failure_loss" -gt 100 ] || [ "$recovery_loss" -gt 100 ]; then
+		LOG err "Tracking counts, intervals and transition rounds must be positive; loss thresholds must be 0-100 on $INTERFACE"
+		exit 1
+	fi
+	if [ "$recovery_latency" -gt "$failure_latency" ] || [ "$recovery_loss" -gt "$failure_loss" ]; then
+		LOG err "Recovery quality thresholds must not exceed failure thresholds on interface $INTERFACE"
+		exit 1
+	fi
+	max_failures=$((target_count - reliability))
+
 	local score=$((down+up))
 	local host_up_count=0
+	local host_down_count=0
 	local lost=0
 	local turn=0
 
 	while true; do
 		if [ "${IFDOWN_EVENT}" -eq 1 ]; then
 			LOG debug "Register ifdown event on interface ${INTERFACE} (${DEVICE})"
-			disconnected
+			disconnected 0 ifdown
 			waiting "$INTERFACE"
 			IFDOWN_EVENT=0
 		fi
@@ -370,8 +401,13 @@ main() {
 		fi
 		sleep_time=$interval
 		last_failed_target=
+		round_state=neutral
 		for track_ip in $track_ips; do
 			if [ "$host_up_count" -lt "$reliability" ]; then
+				result=1
+				loss=
+				latency=
+				quality_sample=0
 				case "$track_method" in
 					ping)
 						if [ "$check_quality" -eq 0 ]; then
@@ -383,6 +419,7 @@ main() {
 							TRACK_PID=""
 							TRACK_START=""
 						else
+							quality_sample=1
 							WRAP $PING -n -c $count -W $timeout -s $size -t $max_ttl -q $track_ip 2>/dev/null > $TRACK_OUTPUT &
 							TRACK_PID=$!
 							TRACK_START="$(mw_process_start_time "$TRACK_PID")"
@@ -432,7 +469,7 @@ main() {
 					;;
 				esac
 				do_log=""
-				if [ "$check_quality" -eq 0 ]; then
+				if [ "$check_quality" -eq 0 ] || [ "$quality_sample" -eq 0 ]; then
 					if [ "$result" -eq 0 ]; then
 						let host_up_count++
 						update_status "$track_ip" "up"
@@ -440,6 +477,7 @@ main() {
 						[ "$score" -le "$up" ] && do_log="success"
 					else
 						let lost++
+						let host_down_count++
 						last_failed_target="$track_ip"
 						update_status "$track_ip" "down"
 
@@ -448,8 +486,12 @@ main() {
 					[ -n "$do_log" ] && LOG info "Check ($track_method) ${do_log} for target \"$track_ip\" on interface $INTERFACE ($DEVICE). Current score: $score"
 
 				else
+					case "$loss:$latency" in
+						*[!0-9:]*|:*|*::*) loss=100; latency=999999 ;;
+					esac
 					if [ "$loss" -ge "$failure_loss" ] || [ "$latency" -ge "$failure_latency" ]; then
 						let lost++
+						let host_down_count++
 						last_failed_target="$track_ip"
 						update_status "$track_ip" "down" $latency $loss
 
@@ -460,7 +502,7 @@ main() {
 
 						[ "$score" -le "$up" ] && do_log="success"
 					else
-						echo "skipped" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/TRACK_${track_ip}
+						update_status "$track_ip" "neutral" "$latency" "$loss"
 					fi
 					[ -n "$do_log" ] && LOG info "Check (${track_method}: latency=${latency}ms loss=${loss}%) ${do_log} for target \"$track_ip\" on interface $INTERFACE ($DEVICE). Current score: $score"
 				fi
@@ -469,7 +511,14 @@ main() {
 			fi
 		done
 
-		if [ "$host_up_count" -lt "$reliability" ]; then
+		if [ "$host_up_count" -ge "$reliability" ]; then
+			round_state=up
+		elif [ "$host_down_count" -gt "$max_failures" ]; then
+			round_state=down
+		fi
+		echo "$round_state" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/LAST_PROBE_RESULT
+
+		if [ "$round_state" = "down" ]; then
 			let score--
 
 			if [ "$score" -lt "$up" ]; then
@@ -479,13 +528,13 @@ main() {
 				log_tracking_failure_context "$last_failed_target" "offline" "$score" "$lost"
 				disconnecting
 				sleep_time=$failure_interval
-				disconnected
+				disconnected 0 probe
 			elif [ "$score" -gt "$up" ]; then
 				log_tracking_failure_context "$last_failed_target" "disconnecting" "$score" "$lost"
 				disconnecting
 				sleep_time=$failure_interval
 			fi
-		else
+		elif [ "$round_state" = "up" ]; then
 			if [ "$score" -lt $((down+up)) ] && [ "$lost" -gt 0 ]; then
 				LOG info "Lost $((lost*count)) ping(s) on interface $INTERFACE ($DEVICE). Current score: $score"
 			fi
@@ -504,6 +553,10 @@ main() {
 				echo "online" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/STATUS
 				score=$((down+up))
 			fi
+		else
+			case "$STATUS" in
+				offline|disconnecting|connecting) sleep_time=$failure_interval ;;
+			esac
 		fi
 
 		let turn++
@@ -514,6 +567,7 @@ main() {
 		get_uptime > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/TIME
 
 		host_up_count=0
+		host_down_count=0
 		if [ "${IFDOWN_EVENT}" -eq 0 ] && [ "${IFUP_EVENT}" -eq 0 ]; then
 			sleep "${sleep_time}" &
 			SLEEP_PID=$!

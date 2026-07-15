@@ -345,6 +345,10 @@ EOF
             }' 2>/dev/null)
     fi
 
+    local hotplug_status_file hotplug_status
+    hotplug_status_file="/var/run/multiwan-qos/hotplug/$wan_interface.status"
+    hotplug_status="$(cat "$hotplug_status_file" 2>/dev/null)"
+    result=$(printf '%s\n' "$result" | jq -c --arg value "$hotplug_status" '. + {hotplug_status: $value}' 2>/dev/null) || result='{}'
     echo "$result"
 }
 

@@ -2111,6 +2111,15 @@ status_service() {
         done
     fi
 
+    print_msg "Per-device QoS hotplug results:"
+    local hotplug_status hotplug_reported=0
+    for hotplug_status in /var/run/multiwan-qos/hotplug/*.status; do
+        [ -f "$hotplug_status" ] || continue
+        hotplug_reported=1
+        print_msg "  $(cat "$hotplug_status" 2>/dev/null)"
+    done
+    [ "$hotplug_reported" -eq 1 ] || print_msg "  No device event has been processed since boot."
+
     local active_qdisc='' active_device=''
     capture_active_interface() {
         local config="$1" enabled device qdisc

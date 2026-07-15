@@ -2592,12 +2592,6 @@ setup_interface() {
 
     [ "$enabled" -eq 1 ] && [ -n "$device" ] || return 0
 
-    # Check if device exists in the system (skip if offline)
-    if ! ip link show "$device" >/dev/null 2>&1; then
-        print_msg "Skipping interface $config - device $device not found (offline?)"
-        return 0
-    fi
-
     # Enforce minimum and maximum rate values to prevent divide-by-zero and misconfiguration
     # Max rate: 2.5 Gbps (2500000 kbps) - matches common max port speed
     if [ "$download" -lt 1000 ] 2>/dev/null; then
@@ -2617,9 +2611,10 @@ setup_interface() {
         upload=2500000
     fi
 
-    print_msg "Configuring interface $config ($device)..."
-
-    # Add to WAN list for nftables
+    # Keep every enabled configured name in the nft ruleset even if its PPP
+    # device is late at boot. Name matches remain dormant until that device
+    # exists, allowing hotplug to attach only its qdiscs without a firewall
+    # reload or a global QoS restart.
     WAN_INTERFACES="${WAN_INTERFACES}${WAN_INTERFACES:+, }\"$device\""
 
     # MSS Clamping Logic per interface
@@ -2725,6 +2720,14 @@ setup_interface() {
         meta oifname \"$device\" meta l4proto tcp ct bytes > ${first10s} jump mark_10s"
         fi
     fi
+
+
+    if ! ip link show "$device" >/dev/null 2>&1; then
+        print_msg "Skipping qdisc setup for $config - device $device is not ready; nft classifiers remain prepared."
+        return 0
+    fi
+
+    print_msg "Configuring interface $config ($device)..."
 
 
     # Read device MTU for correct qdisc calculations
@@ -2883,6 +2886,80 @@ if [ "$gameqdisc" = "qfq" ]; then
             exit 1
             ;;
     esac
+fi
+
+# Handle a physical device event without regenerating nftables or touching
+# any other WAN. Hotplug serializes each device; this shared lock also keeps
+# Adaptive from changing class 1:11 during attach/detach.
+if [ "$1" = "device-event" ]; then
+    device_action="$2"
+    target_device="$3"
+    case "$device_action" in attach|detach) ;; *) error_out "Usage: multiwan_qos.sh device-event <attach|detach> <device>"; exit 1 ;; esac
+    case "$target_device" in ''|*[!A-Za-z0-9_.:@-]*) error_out "Unsafe or empty QoS device name '$target_device'."; exit 1 ;; esac
+    [ -f "$MULTIWAN_QOS_RESTARTING_FILE" ] && {
+        error_out "MultiWAN QoS is restarting; the device event will be retried by hotplug."
+        exit 75
+    }
+
+    device_lock_acquired=0
+    device_lock_cleanup() {
+        [ "$device_lock_acquired" -eq 1 ] || return 0
+        mw_lock_release_for "$MULTIWAN_QOS_REFRESH_LOCK_DIR" "$device_lock_token"
+        device_lock_acquired=0
+    }
+    trap device_lock_cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    mw_lock_acquire "$MULTIWAN_QOS_REFRESH_LOCK_DIR" || {
+        error_out "QoS device event for $target_device could not acquire the refresh lock."
+        exit 75
+    }
+    device_lock_acquired=1
+    device_lock_token="$MW_LOCK_TOKEN"
+
+    device_found=0
+    process_device_event() {
+        local config="$1" device enabled lan_dev
+        config_get device "$config" device
+        [ "$device" = "$target_device" ] || return 0
+        config_get_bool enabled "$config" enabled 1
+        [ "$enabled" -eq 1 ] || return 0
+        device_found=1
+        lan_dev="ifb-$device"
+        if [ "$device_action" = detach ]; then
+            cleanup_interface_state "$device" "$lan_dev"
+            rm -rf "/var/run/multiwan-qos/adaptive/${device}-wan" \
+                "/var/run/multiwan-qos/adaptive/${lan_dev}-lan"
+            log_msg "Detached QoS state for $device; other WAN qdiscs and classifiers were preserved."
+            return 0
+        fi
+
+        ip link show "$device" >/dev/null 2>&1 || {
+            error_out "Cannot attach QoS to $device because the device is not present."
+            device_event_result=1
+            return 0
+        }
+        case "$(cat "/sys/class/net/$device/mtu" 2>/dev/null)" in
+            ''|*[!0-9]*|0) error_out "Cannot attach QoS to $device before a valid MTU is available."; device_event_result=1; return 0 ;;
+        esac
+        nft list table inet dscptag >/dev/null 2>&1 || {
+            error_out "Cannot attach $device because the existing MultiWAN QoS nft table is missing."
+            device_event_result=1
+            return 0
+        }
+        if setup_interface "$config"; then
+            log_msg "Attached QoS state for $device; other WAN qdiscs and classifiers were preserved."
+        else
+            error_out "Failed to attach QoS state for $device."
+            device_event_result=1
+        fi
+    }
+
+    device_event_result=0
+    config_foreach process_device_event interface
+    [ "$device_found" -eq 1 ] || { error_out "Enabled device '$target_device' is not configured in multiwan-qos."; exit 1; }
+    exit "$device_event_result"
 fi
 
 # Handle refresh-device mode: rebuild qdiscs for one device only, then exit.

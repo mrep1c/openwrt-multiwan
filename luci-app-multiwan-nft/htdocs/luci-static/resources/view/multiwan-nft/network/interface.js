@@ -16,7 +16,7 @@ return view.extend({
 	},
 
 	render: function (stats) {
-		let m, s, o;
+		let m, s, o, failureLatency, failureLoss, recoveryLatency, recoveryLoss;
 
 		m = new form.Map('multiwan-nft', _('MultiWAN Manager - Interfaces'),
 			_('Mwan3 requires that all interfaces have a unique metric configured in /etc/config/network.') + '<br />' +
@@ -141,7 +141,7 @@ return view.extend({
 		o.default = false;
 		o.modalonly = true;
 
-		o = s.option(form.Value, 'failure_latency', _('Failure latency [ms]'));
+		o = failureLatency = s.option(form.Value, 'failure_latency', _('Failure latency [ms]'));
 		o.depends('check_quality', '1');
 		o.default = '1000';
 		o.value('25');
@@ -152,9 +152,10 @@ return view.extend({
 		o.value('200');
 		o.value('250');
 		o.value('300');
+		o.datatype = 'uinteger';
 		o.modalonly = true;
 
-		o = s.option(form.Value, 'failure_loss', _('Failure packet loss [%]'));
+		o = failureLoss = s.option(form.Value, 'failure_loss', _('Failure packet loss [%]'));
 		o.depends('check_quality', '1');
 		o.default = '40';
 		o.value('2');
@@ -162,9 +163,10 @@ return view.extend({
 		o.value('10');
 		o.value('20');
 		o.value('25');
+		o.datatype = 'range(0, 100)';
 		o.modalonly = true;
 
-		o = s.option(form.Value, 'recovery_latency', _('Recovery latency [ms]'));
+		o = recoveryLatency = s.option(form.Value, 'recovery_latency', _('Recovery latency [ms]'));
 		o.depends('check_quality', '1');
 		o.default = '500';
 		o.value('25');
@@ -175,9 +177,10 @@ return view.extend({
 		o.value('200');
 		o.value('250');
 		o.value('300');
+		o.datatype = 'uinteger';
 		o.modalonly = true;
 
-		o = s.option(form.Value, 'recovery_loss', _('Recovery packet loss [%]'));
+		o = recoveryLoss = s.option(form.Value, 'recovery_loss', _('Recovery packet loss [%]'));
 		o.depends('check_quality', '1');
 		o.default = '10';
 		o.value('2');
@@ -185,7 +188,25 @@ return view.extend({
 		o.value('10');
 		o.value('20');
 		o.value('25');
+		o.datatype = 'range(0, 100)';
 		o.modalonly = true;
+
+		failureLatency.validate = function(sectionId, value) {
+			let recovery = recoveryLatency.formvalue(sectionId) || recoveryLatency.default;
+			return Number(recovery) <= Number(value) || _('Failure latency must be greater than or equal to recovery latency');
+		};
+		recoveryLatency.validate = function(sectionId, value) {
+			let failure = failureLatency.formvalue(sectionId) || failureLatency.default;
+			return Number(value) <= Number(failure) || _('Recovery latency must not exceed failure latency');
+		};
+		failureLoss.validate = function(sectionId, value) {
+			let recovery = recoveryLoss.formvalue(sectionId) || recoveryLoss.default;
+			return Number(recovery) <= Number(value) || _('Failure packet loss must be greater than or equal to recovery packet loss');
+		};
+		recoveryLoss.validate = function(sectionId, value) {
+			let failure = failureLoss.formvalue(sectionId) || failureLoss.default;
+			return Number(value) <= Number(failure) || _('Recovery packet loss must not exceed failure packet loss');
+		};
 
 		o = s.option(form.ListValue, "timeout", _("Ping timeout"));
 		o.default = '4';
@@ -276,8 +297,8 @@ return view.extend({
 		o.value('9');
 		o.value('10');
 
-		o = s.option(form.DynamicList, 'flush_conntrack', _('Flush conntrack table'),
-			_('Flush global firewall conntrack table on interface events'));
+		o = s.option(form.DynamicList, 'flush_conntrack', _('Reconnect affected sessions'),
+			_('Delete only connections assigned to the affected WAN mark on selected interface events'));
 		o.value('ifup', _('ifup (netifd)'));
 		o.value('ifdown', _('ifdown (netifd)'));
 		o.value('connected', _('connected (multiwan_nft)'));

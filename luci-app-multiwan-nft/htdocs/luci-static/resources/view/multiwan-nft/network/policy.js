@@ -15,6 +15,7 @@ return view.extend({
 		let m, s, o;
 
 		m = new form.Map('multiwan-nft', _('MultiWAN Manager - Policies'),
+			_('Warning: last resort "default" may use a main-table route whose tracker is offline. Use "unreachable" when no ordinary traffic may use an offline WAN.') + '<br />' +
 			_('Policies are profiles grouping one or more members controlling how Mwan3 distributes traffic.') + '<br />' +
 			_('Member interfaces with lower metrics are used first.') + '<br />' +
 			_('Member interfaces with the same metric will be load-balanced.') + '<br />' +
@@ -61,7 +62,7 @@ return view.extend({
 		o.default = 'unreachable';
 		o.value('unreachable', _('unreachable (reject)'));
 		o.value('blackhole', _('blackhole (drop)'));
-		o.value('default', _('default (use main routing table)'));
+		o.value('default', _('default (may use a tracker-offline main route)'));
 
 		return m.render();
 	}

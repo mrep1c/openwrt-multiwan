@@ -72,6 +72,19 @@ function renderMwan3Status(status) {
 		if (time)
 			statusview += '<div><strong>%h:&#160;</strong>%h</div>'.format(tname, time);
 
+		if (status.interfaces[iface].last_probe_result && status.interfaces[iface].last_probe_result != 'unknown')
+			statusview += '<div><strong>%h:&#160;</strong>%h</div>'.format(_('Last probe result'), status.interfaces[iface].last_probe_result);
+		if (status.interfaces[iface].offline_reason && status.interfaces[iface].offline_reason != 'none')
+			statusview += '<div><strong>%h:&#160;</strong>%h</div>'.format(_('Offline reason'), status.interfaces[iface].offline_reason);
+		if (status.interfaces[iface].policy_result && status.interfaces[iface].policy_result != 'unknown')
+			statusview += '<div><strong>%h:&#160;</strong>%h</div>'.format(_('Policy update'), status.interfaces[iface].policy_result);
+		if (status.interfaces[iface].recovery_rule_result && status.interfaces[iface].recovery_rule_result != 'unknown')
+			statusview += '<div><strong>%h:&#160;</strong>%h</div>'.format(_('Recovery routing'), status.interfaces[iface].recovery_rule_result);
+		if (status.interfaces[iface].sticky_result && status.interfaces[iface].sticky_result != 'unknown')
+			statusview += '<div><strong>%h:&#160;</strong>%h (%d)</div>'.format(_('Sticky cleanup'), status.interfaces[iface].sticky_result, status.interfaces[iface].sticky_removed || 0);
+		if (status.interfaces[iface].session_action && status.interfaces[iface].session_action != 'none')
+			statusview += '<div><strong>%h:&#160;</strong>%h (%d)</div>'.format(_('Session action'), status.interfaces[iface].session_action, status.interfaces[iface].session_count || 0);
+
 		statusview += '</div>';
 	}
 
