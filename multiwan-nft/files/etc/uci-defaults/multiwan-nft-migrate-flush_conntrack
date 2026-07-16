@@ -17,7 +17,6 @@ multiwan_nft_migrate_flush_conntrack() {
 		always)
 			uci -q delete "multiwan-nft.${iface}.flush_conntrack" 2>/dev/null || true
 			uci -q add_list "multiwan-nft.${iface}.flush_conntrack=ifup" 2>/dev/null || true
-			uci -q add_list "multiwan-nft.${iface}.flush_conntrack=ifdown" 2>/dev/null || true
 			changed=1
 			;;
 		never)
@@ -25,6 +24,13 @@ multiwan_nft_migrate_flush_conntrack() {
 			changed=1
 			;;
 	esac
+
+	if uci -q del_list "multiwan-nft.${iface}.flush_conntrack=ifdown" 2>/dev/null; then
+		changed=1
+	fi
+	if uci -q del_list "multiwan-nft.${iface}.flush_conntrack=disconnected" 2>/dev/null; then
+		changed=1
+	fi
 }
 
 config_load 'multiwan-nft' 2>/dev/null || exit 0

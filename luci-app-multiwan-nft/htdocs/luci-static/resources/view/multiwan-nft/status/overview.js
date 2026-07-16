@@ -74,6 +74,8 @@ function renderMwan3Status(status) {
 
 		if (status.interfaces[iface].last_probe_result && status.interfaces[iface].last_probe_result != 'unknown')
 			statusview += '<div><strong>%h:&#160;</strong>%h</div>'.format(_('Last probe result'), status.interfaces[iface].last_probe_result);
+		if (status.interfaces[iface].probe_transition && status.interfaces[iface].probe_transition != 'none')
+			statusview += '<div><strong>%h:&#160;</strong>%h</div>'.format(_('Last probe transition'), status.interfaces[iface].probe_transition);
 		if (status.interfaces[iface].offline_reason && status.interfaces[iface].offline_reason != 'none')
 			statusview += '<div><strong>%h:&#160;</strong>%h</div>'.format(_('Offline reason'), status.interfaces[iface].offline_reason);
 		if (status.interfaces[iface].policy_result && status.interfaces[iface].policy_result != 'unknown')
@@ -84,6 +86,10 @@ function renderMwan3Status(status) {
 			statusview += '<div><strong>%h:&#160;</strong>%h (%d)</div>'.format(_('Sticky cleanup'), status.interfaces[iface].sticky_result, status.interfaces[iface].sticky_removed || 0);
 		if (status.interfaces[iface].session_action && status.interfaces[iface].session_action != 'none')
 			statusview += '<div><strong>%h:&#160;</strong>%h (%d)</div>'.format(_('Session action'), status.interfaces[iface].session_action, status.interfaces[iface].session_count || 0);
+		if (status.interfaces[iface].last_transition && status.interfaces[iface].last_transition != 'none')
+			statusview += '<div><strong>%h:&#160;</strong>%h</div>'.format(_('Last failure transition'), status.interfaces[iface].last_transition);
+		if (status.interfaces[iface].last_qos_backlog && status.interfaces[iface].last_qos_backlog != 'unknown')
+			statusview += '<div><strong>%h:&#160;</strong>%h</div>'.format(_('Queue backlog at last failure'), status.interfaces[iface].last_qos_backlog);
 
 		statusview += '</div>';
 	}

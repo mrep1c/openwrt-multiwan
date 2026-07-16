@@ -1200,10 +1200,10 @@ multiwan_nft_set_sticky_nft()
 			# Insert rule: Query set for specific WAN mark, if found, apply it and return
 			if [ "$ipv" = "ipv4" ]; then
 				multiwan_nft_nft_insert_rule "multiwan_nft_rule_$rule" \
-					"ip saddr . $mark_val @multiwan_nft_sticky_${ipv}_${rule} meta mark set meta mark and $MMX_INVMASK or $mark_val return"
+					"fib saddr type != local ip saddr . $mark_val @multiwan_nft_sticky_${ipv}_${rule} meta mark set meta mark and $MMX_INVMASK or $mark_val return"
 			else
 				multiwan_nft_nft_insert_rule "multiwan_nft_rule_$rule" \
-					"ip6 saddr . $mark_val @multiwan_nft_sticky_${ipv}_${rule} meta mark set meta mark and $MMX_INVMASK or $mark_val return"
+					"fib saddr type != local ip6 saddr . $mark_val @multiwan_nft_sticky_${ipv}_${rule} meta mark set meta mark and $MMX_INVMASK or $mark_val return"
 			fi
 		fi
 	fi
@@ -1356,7 +1356,7 @@ multiwan_nft_set_user_nft_rule()
 			match="$match ip daddr @$nft_set"
 		fi
 	fi
-	sticky_base_match="$match"
+	sticky_base_match="$match fib saddr type != local"
 	
 	# Mark check - only process unmarked traffic
 	match="$match meta mark and $MMX_MASK == 0"
@@ -1906,27 +1906,19 @@ multiwan_nft_flush_conntrack()
 {
 	local interface="$1"
 	local action="$2"
+	MULTIWAN_NFT_FLUSH_MATCHED=0
+	MULTIWAN_NFT_FLUSH_FAILED=0
 
 	handle_flush() {
 		local flush_conntrack="$1"
 		local action="$2"
 
-		if [ "$action" = "$flush_conntrack" ]; then
-			if [ "$action" = "ifup" ] || [ "$action" = "connected" ]; then
-				# For failback, break existing connections routed on backup interfaces
-				# so they can be re-routed over the interface that just came up.
-				# NOTE: This is safe because the multiwan_qos ct_save_dscp chains no longer
-				# use "ct state established,related return" — DSCP is re-saved on the
-				# first egress packet after the flush regardless of conntrack state.
-				flush_other() {
-					[ "$1" != "$interface" ] && multiwan_nft_flush_conntrack_iface "$1"
-				}
-				config_foreach flush_other interface
-				LOG info "Scoped failback connection tracking purge completed on action '$action'"
-			else
-				# For ifdown/disconnected, purge only the affected interface mark.
-				multiwan_nft_flush_conntrack_iface "$interface"
+		if [ "$action" = "$flush_conntrack" ] && [ "$MULTIWAN_NFT_FLUSH_MATCHED" -eq 0 ]; then
+			MULTIWAN_NFT_FLUSH_MATCHED=1
+			if multiwan_nft_flush_conntrack_iface "$interface"; then
 				LOG info "Scoped connection tracking purge completed for interface '$interface' on action '$action'"
+			else
+				MULTIWAN_NFT_FLUSH_FAILED=1
 			fi
 		fi
 	}
@@ -1934,6 +1926,7 @@ multiwan_nft_flush_conntrack()
 	if [ -e "$CONNTRACK_FILE" ]; then
 		config_list_foreach "$interface" flush_conntrack handle_flush "$action"
 	fi
+	[ "$MULTIWAN_NFT_FLUSH_FAILED" -eq 0 ]
 }
 
 multiwan_nft_track_clean()

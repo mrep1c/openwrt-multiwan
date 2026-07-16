@@ -59,11 +59,85 @@ LOG notice "Execute $ACTION event on interface $INTERFACE (${DEVICE:-unknown})"
 status_dir="$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE"
 mkdir -p "$status_dir"
 old_state="$(multiwan_nft_get_iface_hotplug_state "$INTERFACE")"
+previous_session_action="$(cat "$status_dir/SESSION_ACTION" 2>/dev/null)"
+case "$previous_session_action" in
+	purged|already-purged) failure_already_purged=1 ;;
+	*) failure_already_purged=0 ;;
+esac
 record_transition() {
 	printf '%s\n' "$2" > "$status_dir/$1"
 }
+record_last_failure() {
+	printf '%s\n' "$2" > "$status_dir/LAST_$1"
+}
+capture_qos_snapshot() {
+	local snapshot_file="$status_dir/LAST_QOS_SNAPSHOT"
+	local qos_dev snapshot_devices=0
+
+	if ! command -v tc >/dev/null 2>&1 || [ -z "$DEVICE" ]; then
+		printf '%s\n' "tc or interface unavailable" > "$snapshot_file"
+		record_last_failure QOS_BACKLOG "unknown"
+		return 0
+	fi
+
+	{
+		date
+		for qos_dev in "$DEVICE" "ifb-$DEVICE"; do
+			ip link show dev "$qos_dev" >/dev/null 2>&1 || continue
+			snapshot_devices=$((snapshot_devices + 1))
+			printf '%s\n' "=== $qos_dev ==="
+			ip -s link show dev "$qos_dev" 2>/dev/null
+			tc -s qdisc show dev "$qos_dev" 2>/dev/null
+			tc -s class show dev "$qos_dev" 2>/dev/null | awk '
+				/^class hfsc 1:(11|13|15) / { selected = 1; print; next }
+				/^class / { selected = 0 }
+				selected { print }
+			'
+		done
+	} > "$snapshot_file"
+
+	if [ "$snapshot_devices" -eq 0 ]; then
+		record_last_failure QOS_BACKLOG "unknown"
+	elif grep -Eq 'backlog ([1-9][0-9]*[bKMG]|[0-9]+b [1-9][0-9]*p)' "$snapshot_file"; then
+		record_last_failure QOS_BACKLOG "present"
+	else
+		record_last_failure QOS_BACKLOG "none"
+	fi
+}
+record_failure_context() {
+	record_last_failure TRANSITION "$ACTION"
+	record_last_failure TRANSITION_AT "$(date +%s)"
+	record_last_failure OFFLINE_REASON "${OFFLINE_REASON:-$ACTION}"
+	capture_qos_snapshot
+}
+run_recovery_cleanup() {
+	local current_state
+	current_state="$(multiwan_nft_get_iface_hotplug_state "$INTERFACE")"
+	if [ "$old_state" != "offline" ] || [ "$current_state" != "online" ] || [ "$MULTIWAN_NFT_STARTUP" = "init" ]; then
+		record_transition SESSION_ACTION "not-required"
+		record_transition SESSION_COUNT "0"
+		return 0
+	fi
+
+	if multiwan_nft_flush_conntrack "$INTERFACE" "$ACTION"; then
+		if [ "${MULTIWAN_NFT_FLUSH_MATCHED:-0}" -eq 1 ]; then
+			record_transition SESSION_ACTION "purged"
+			record_transition SESSION_COUNT "${MULTIWAN_NFT_CONNTRACK_PURGED:-0}"
+		else
+			record_transition SESSION_ACTION "not-required"
+			record_transition SESSION_COUNT "0"
+		fi
+	else
+		record_transition SESSION_ACTION "purge-failed"
+		return 1
+	fi
+}
 case "$ACTION" in
-	disconnected) record_transition OFFLINE_REASON "${OFFLINE_REASON:-probe}" ;;
+	connected|disconnected)
+		record_transition PROBE_TRANSITION "$ACTION"
+		record_transition PROBE_TRANSITION_AT "$(date +%s)"
+		[ "$ACTION" = "disconnected" ] && record_transition OFFLINE_REASON "${OFFLINE_REASON:-probe}" || record_transition OFFLINE_REASON "none"
+		;;
 	ifdown) record_transition OFFLINE_REASON "ifdown" ;;
 	*) record_transition OFFLINE_REASON "none" ;;
 esac
@@ -125,62 +199,87 @@ case "$ACTION" in
 		;;
 	disconnected)
 		LOG debug "Processing disconnected: committing policy before scoped cleanup"
+		[ "$old_state" != "offline" ] && record_failure_context
 		multiwan_nft_set_iface_hotplug_state $INTERFACE "offline"
 		multiwan_nft_set_policies_nft || {
 			multiwan_nft_set_iface_hotplug_state "$INTERFACE" "$old_state"
 			record_transition POLICY_RESULT "failed"
 			record_transition SESSION_ACTION "preserved-policy-failure"
+			record_last_failure POLICY_RESULT "failed"
+			record_last_failure SESSION_ACTION "preserved-policy-failure"
 			LOG warn "disconnected event on $INTERFACE retained policy and conntrack state"
 			exit 1
 		}
 		record_transition POLICY_RESULT "applied"
+		record_last_failure POLICY_RESULT "applied"
 		if multiwan_nft_set_tracker_oif_rules $INTERFACE $DEVICE; then
 			record_transition RECOVERY_RULE_RESULT "tracker-only"
 		else
 			record_transition RECOVERY_RULE_RESULT "failed"
 			LOG warn "disconnected event on $INTERFACE blocked its mark but could not install every tracker-only recovery rule"
 		fi
-		if multiwan_nft_delete_iface_set_entries $INTERFACE; then
-			record_transition STICKY_RESULT "removed"
-			record_transition STICKY_REMOVED "${MULTIWAN_NFT_STICKY_DELETED:-0}"
+		if [ "$old_state" != "offline" ] || [ "$failure_already_purged" -ne 1 ]; then
+			if multiwan_nft_delete_iface_set_entries $INTERFACE; then
+				record_transition STICKY_RESULT "removed"
+				record_transition STICKY_REMOVED "${MULTIWAN_NFT_STICKY_DELETED:-0}"
+				record_last_failure STICKY_RESULT "removed"
+				record_last_failure STICKY_REMOVED "${MULTIWAN_NFT_STICKY_DELETED:-0}"
+			else
+				record_transition STICKY_RESULT "failed"
+				record_transition STICKY_REMOVED "failed"
+				record_last_failure STICKY_RESULT "failed"
+				record_last_failure STICKY_REMOVED "failed"
+				LOG warn "disconnected event on $INTERFACE could not remove all sticky entries; the offline mark remains unreachable"
+			fi
+			if multiwan_nft_flush_conntrack_iface $INTERFACE; then
+				record_transition SESSION_ACTION "purged"
+				record_transition SESSION_COUNT "${MULTIWAN_NFT_CONNTRACK_PURGED:-0}"
+				record_last_failure SESSION_ACTION "purged"
+				record_last_failure SESSION_COUNT "${MULTIWAN_NFT_CONNTRACK_PURGED:-0}"
+			else
+				record_transition SESSION_ACTION "purge-failed"
+				record_last_failure SESSION_ACTION "purge-failed"
+				exit 1
+			fi
 		else
-			record_transition STICKY_RESULT "failed"
-			record_transition STICKY_REMOVED "failed"
-			LOG warn "disconnected event on $INTERFACE could not remove all sticky entries; the offline mark remains unreachable"
-		fi
-		if multiwan_nft_flush_conntrack_iface $INTERFACE; then
-			record_transition SESSION_ACTION "purged"
-			record_transition SESSION_COUNT "${MULTIWAN_NFT_CONNTRACK_PURGED:-0}"
-		else
-			record_transition SESSION_ACTION "purge-failed"
-			exit 1
+			record_transition SESSION_ACTION "already-purged"
 		fi
 		;;
 	ifdown)
 		LOG debug "Processing ifdown: committing policy before physical cleanup"
+		[ "$old_state" != "offline" ] && record_failure_context
 		multiwan_nft_set_iface_hotplug_state $INTERFACE "offline"
 		multiwan_nft_set_policies_nft || {
 			multiwan_nft_set_iface_hotplug_state "$INTERFACE" "$old_state"
 			record_transition POLICY_RESULT "failed"
 			record_transition SESSION_ACTION "preserved-policy-failure"
+			record_last_failure POLICY_RESULT "failed"
+			record_last_failure SESSION_ACTION "preserved-policy-failure"
 			LOG warn "ifdown event on $INTERFACE retained previous MultiWAN state"
 			exit 1
 		}
 		record_transition POLICY_RESULT "applied"
-		previous_session_action="$(cat "$status_dir/SESSION_ACTION" 2>/dev/null)"
-		if [ "$old_state" != "offline" ] || [ "$previous_session_action" != "purged" ]; then
+		record_last_failure POLICY_RESULT "applied"
+		if [ "$old_state" != "offline" ] || [ "$failure_already_purged" -ne 1 ]; then
 			if multiwan_nft_delete_iface_set_entries $INTERFACE; then
 				record_transition STICKY_RESULT "removed"
 				record_transition STICKY_REMOVED "${MULTIWAN_NFT_STICKY_DELETED:-0}"
+				record_last_failure STICKY_RESULT "removed"
+				record_last_failure STICKY_REMOVED "${MULTIWAN_NFT_STICKY_DELETED:-0}"
 			else
 				record_transition STICKY_RESULT "failed"
 				record_transition STICKY_REMOVED "failed"
+				record_last_failure STICKY_RESULT "failed"
+				record_last_failure STICKY_REMOVED "failed"
 			fi
 			if multiwan_nft_flush_conntrack_iface $INTERFACE; then
 				record_transition SESSION_ACTION "purged"
 				record_transition SESSION_COUNT "${MULTIWAN_NFT_CONNTRACK_PURGED:-0}"
+				record_last_failure SESSION_ACTION "purged"
+				record_last_failure SESSION_COUNT "${MULTIWAN_NFT_CONNTRACK_PURGED:-0}"
 			else
 				record_transition SESSION_ACTION "purge-failed"
+				record_last_failure SESSION_ACTION "purge-failed"
 			fi
 		else
 			record_transition SESSION_ACTION "already-purged"
@@ -193,7 +292,7 @@ case "$ACTION" in
 esac
 
 case "$ACTION" in
-	connected|ifup) multiwan_nft_flush_conntrack "$INTERFACE" "$ACTION" ;;
+	connected|ifup) run_recovery_cleanup || exit 1 ;;
 esac
 
 LOG debug "multiwan_nft hotplug completed: ACTION=$ACTION INTERFACE=$INTERFACE"

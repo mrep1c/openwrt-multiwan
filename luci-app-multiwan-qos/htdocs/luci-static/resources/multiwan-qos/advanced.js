@@ -164,9 +164,9 @@ return view.extend({
             o.rmempty = false;
             o.default = '1';
 
-            o = s.option(form.Flag, 'TCP_DOWNPRIO_SUSTAINED_ENABLED', _('Enable Sustained TCP Down-Prioritization'), _(addSfoWarning('Moves TCP flows exceeding ~10 seconds worth of data transfer to CS1 (Bulk). Helps prevent large downloads from starving other traffic.', 'TCP_DOWNPRIO_SUSTAINED_ENABLED')));
+            o = s.option(form.Flag, 'TCP_DOWNPRIO_SUSTAINED_ENABLED', _('Enable Sustained TCP Down-Prioritization'), _(addSfoWarning('Moves TCP flows past a cumulative conntrack byte threshold to CS1 (Bulk). This threshold is not a direct congestion measurement and can demote long-lived connections even when the link is not congested.', 'TCP_DOWNPRIO_SUSTAINED_ENABLED')));
             o.rmempty = false;
-            o.default = '1';
+            o.default = '0';
 
             createOption('UDPBULKPORT', _('UDP Bulk Ports'), _('Specify UDP ports for bulk traffic'), _('Default: none'));
             createOption('TCPBULKPORT', _('TCP Bulk Ports'), _('Specify TCP ports for bulk traffic'), _('Default: none'));

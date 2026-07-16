@@ -87,6 +87,8 @@ log_msg() {
 fi # end of print_msg/log_msg guard
 
 config_load 'multiwan-qos' || { error_out "Failed to get UCI config."; exit 1; }
+[ "$TCP_DOWNPRIO_SUSTAINED_ENABLED" -eq 1 ] 2>/dev/null &&
+    print_msg -warn "Sustained TCP down-prioritization is enabled. Its cumulative conntrack byte threshold is not a direct congestion measurement."
 
 # Check if Software Flow Offloading is enabled
 SFO_ENABLED=0
@@ -150,6 +152,44 @@ fq_codel_memory_limit() {
 
     [ "$mem" -lt 4000000 ] && mem=4000000
     [ "$mem" -gt 16777216 ] && mem=16777216
+    printf '%s' "$mem"
+}
+
+qos_window_bytes() {
+    local rate="$1"
+    local window_ms="$2"
+
+    printf '%s' "$(((rate * window_ms + 7) / 8))"
+}
+
+fq_codel_bulk_packet_limit() {
+    local rate="$1"
+    local mtu="${2:-1500}"
+    local bytes limit
+
+    bytes="$(qos_window_bytes "$rate" 100)"
+    limit=$(((bytes + mtu - 1) / mtu))
+    [ "$limit" -lt 32 ] && limit=32
+    printf '%s' "$limit"
+}
+
+fq_codel_bulk_memory_limit() {
+    local rate="$1"
+    local mem
+
+    mem="$(qos_window_bytes "$rate" 200)"
+    [ "$mem" -lt 262144 ] && mem=262144
+    [ "$mem" -gt 4194304 ] && mem=4194304
+    printf '%s' "$mem"
+}
+
+cake_memory_limit() {
+    local rate="$1"
+    local mem
+
+    mem="$(qos_window_bytes "$rate" 200)"
+    [ "$mem" -lt 524288 ] && mem=524288
+    [ "$mem" -gt 4194304 ] && mem=4194304
     printf '%s' "$mem"
 }
 
@@ -2011,6 +2051,11 @@ select_cake_qdisc() {
 # Arguments: $1:WAN_DEV, $2:LAN_DEV, $3:UPRATE, $4:DOWNRATE, $5:PRESET, $6:OVERHEAD, $7:MPU
 setup_cake() {
     local WAN="$1" LAN="$2" UPRATE="$3" DOWNRATE="$4" PRESET="$5" OVERHEAD="$6" MPU="$7"
+    local upload_memlimit download_memlimit
+
+    upload_memlimit="$(cake_memory_limit "$UPRATE")"
+    download_memlimit="$(cake_memory_limit "$DOWNRATE")"
+    print_msg "  CAKE memory limits: upload=${upload_memlimit}B download=${download_memlimit}B"
 
     tc qdisc del dev "$WAN" root > /dev/null 2>&1
     tc qdisc del dev "$LAN" root > /dev/null 2>&1
@@ -2044,7 +2089,7 @@ setup_cake() {
     append_cake_opt "nat" "$NAT_EGRESS" &&
     append_cake_opt "wash" "$WASHDSCPUP" &&
     append_cake_opt "ack-filter" "$ack_filter_egress_val" &&
-    append_cake_opt "memlimit 16m" "1" &&
+    append_cake_opt "memlimit ${upload_memlimit}b" "1" &&
     tc qdisc add dev "$WAN" root handle 1: "$CAKE_QDISC_EGR" $CAKE_OPTS || qdisc_setup_failed
 record_cake_qdisc_type "$WAN" "$CAKE_QDISC_EGR"
 debug_log "EGRESS $CAKE_QDISC_EGR opts: '$CAKE_OPTS'"
@@ -2062,7 +2107,7 @@ debug_log "EGRESS $CAKE_QDISC_EGR opts: '$CAKE_OPTS'"
     append_cake_opt "$EXTRA_PARAMETERS_INGRESS" "1" &&
     append_cake_opt "nat" "$NAT_INGRESS" &&
     append_cake_opt "wash" "$WASHDSCPDOWN" &&
-    append_cake_opt "memlimit 16m" "1" &&
+    append_cake_opt "memlimit ${download_memlimit}b" "1" &&
     tc qdisc add dev "$LAN" root "$CAKE_QDISC_IGR" $CAKE_OPTS || qdisc_setup_failed
 record_cake_qdisc_type "$LAN" "$CAKE_QDISC_IGR"
 debug_log "INGRESS $CAKE_QDISC_IGR opts: '$CAKE_OPTS'"
@@ -2084,6 +2129,11 @@ setup_hybrid() {
     local bulk_rate_m2=$((SHAPER_RATE * 10 / 100)); [ "$bulk_rate_m2" -le 0 ] && bulk_rate_m2=1
     local default_rate_m1=$((SHAPER_RATE - bulk_rate_m1))
     local default_rate_m2=$((SHAPER_RATE - bulk_rate_m2))
+    local cake_memlimit bulk_packet_limit bulk_memlimit
+    cake_memlimit="$(cake_memory_limit "$SHAPER_RATE")"
+    bulk_packet_limit="$(fq_codel_bulk_packet_limit "$bulk_rate_m2" "$MTU")"
+    bulk_memlimit="$(fq_codel_bulk_memory_limit "$bulk_rate_m2")"
+    print_msg "  Hybrid queue limits on $DEV: cake=${cake_memlimit}B bulk=${bulk_packet_limit}p/${bulk_memlimit}B"
 
     # Calculate parameters
     local DUR=$((5*MTU*8/SHAPER_RATE)); [ "$DUR" -lt 25 ] && DUR=25
@@ -2155,7 +2205,7 @@ setup_hybrid() {
     append_cake_opt "rtt ${RTT}ms" "${RTT:+1}" &&
     append_cake_opt "$cake_link_params" "1" &&
     append_cake_opt "$LINK_COMPENSATION" "1" &&
-    append_cake_opt "memlimit 16m" "1" &&
+    append_cake_opt "memlimit ${cake_memlimit}b" "1" &&
     tc qdisc replace dev "$DEV" parent 1:13 handle 13: cake $CAKE_OPTS || qdisc_setup_failed
 debug_log "$DIR HYBRID cake opts: '$CAKE_OPTS'"
 
@@ -2163,11 +2213,9 @@ debug_log "$DIR HYBRID cake opts: '$CAKE_OPTS'"
     # Use complementary HFSC shares: m1 3%, m2 10%.
     tc class add dev "$DEV" parent 1:1 classid 1:15 hfsc ls m1 "${bulk_rate_m1}kbit" d "${DUR}ms" m2 "${bulk_rate_m2}kbit" ||
         qdisc_setup_failed "Failed to create Hybrid bulk class 1:15 on $DEV."
-    # Attach fq_codel (using calculations and options from HFSC config)
-    local INTVL=$((100+2*MTU*8/SHAPER_RATE))
-    local TARG=$((540*8/SHAPER_RATE+4))
+    # Bound the bulk queue to roughly 100 ms of packets and 200 ms of memory.
     tc qdisc del dev "$DEV" parent 1:15 handle 15: > /dev/null 2>&1
-    tc qdisc replace dev "$DEV" parent 1:15 handle 15: fq_codel memory_limit "$(fq_codel_memory_limit "$SHAPER_RATE")" interval "${INTVL}ms" target "${TARG}ms" quantum $((MTU * 2)) ||
+    tc qdisc replace dev "$DEV" parent 1:15 handle 15: fq_codel limit "$bulk_packet_limit" memory_limit "${bulk_memlimit}b" interval 100ms target 5ms quantum "$MTU" ||
         qdisc_setup_failed "Failed to attach Hybrid bulk fq_codel qdisc on $DEV."
 
     # Apply DSCP Filters (on ingress always, on egress only when SFO active)

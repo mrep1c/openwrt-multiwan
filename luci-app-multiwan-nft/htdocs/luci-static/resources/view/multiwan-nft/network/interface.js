@@ -298,11 +298,9 @@ return view.extend({
 		o.value('10');
 
 		o = s.option(form.DynamicList, 'flush_conntrack', _('Reconnect affected sessions'),
-			_('Delete only connections assigned to the affected WAN mark on selected interface events'));
+			_('On a real offline-to-online recovery, delete only connections assigned to the recovered WAN mark'));
 		o.value('ifup', _('ifup (netifd)'));
-		o.value('ifdown', _('ifdown (netifd)'));
 		o.value('connected', _('connected (multiwan_nft)'));
-		o.value('disconnected', _('disconnected (multiwan_nft)'));
 		o.modalonly = true;
 
 		o = s.option(form.DummyValue, 'metric', _('Metric'),
