@@ -69,22 +69,24 @@ mw_realtime_queue_budget() {
 }
 
 mw_realtime_curve() {
-    local rate="$1" shaper_rate="$2" mtu="$3" freshness="$4"
+    local rate="$1" shaper_rate="$2" burst_base_rate="${3:-$1}" burst_cap
 
     case "$rate" in ''|*[!0-9]*) rate=1 ;; esac
     case "$shaper_rate" in ''|*[!0-9]*) shaper_rate=1 ;; esac
-    case "$mtu" in ''|*[!0-9]*) mtu=1500 ;; esac
-    case "$freshness" in ''|*[!0-9]*) freshness=18 ;; esac
+    case "$burst_base_rate" in ''|*[!0-9]*) burst_base_rate="$rate" ;; esac
     [ "$rate" -gt 0 ] 2>/dev/null || rate=1
     [ "$shaper_rate" -gt 0 ] 2>/dev/null || shaper_rate=1
-    [ "$mtu" -gt 0 ] 2>/dev/null || mtu=1500
-    [ "$freshness" -gt 0 ] 2>/dev/null || freshness=18
+    [ "$burst_base_rate" -gt 0 ] 2>/dev/null || burst_base_rate="$rate"
 
-    MW_RT_PROFILE_RATE="$rate"
-    [ "$MW_RT_PROFILE_RATE" -lt 1000 ] && MW_RT_PROFILE_RATE=1000
-    MW_RT_WORK_BYTES=$(((MW_RT_PROFILE_RATE * freshness + 7) / 8))
-    [ "$MW_RT_WORK_BYTES" -lt "$mtu" ] && MW_RT_WORK_BYTES="$mtu"
-    MW_RT_DMAX="$freshness"
     MW_RT_SCHEDULER_RATE="$rate"
     [ "$MW_RT_SCHEDULER_RATE" -gt "$shaper_rate" ] && MW_RT_SCHEDULER_RATE="$shaper_rate"
+    MW_RT_BURST_DURATION=25
+    MW_RT_BURST_RATE=$((burst_base_rate * 10))
+    burst_cap=$((shaper_rate * 97 / 100))
+    [ "$burst_cap" -gt 0 ] || burst_cap=1
+    [ "$MW_RT_BURST_RATE" -gt "$burst_cap" ] && MW_RT_BURST_RATE="$burst_cap"
+
+    # Keep the realtime curve concave or linear; a lower m1 changes HFSC eligibility semantics.
+    [ "$MW_RT_BURST_RATE" -lt "$MW_RT_SCHEDULER_RATE" ] &&
+        MW_RT_BURST_RATE="$MW_RT_SCHEDULER_RATE"
 }

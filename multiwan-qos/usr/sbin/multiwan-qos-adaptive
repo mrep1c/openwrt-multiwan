@@ -59,18 +59,18 @@ read_realtime_stats() {
 }
 
 change_class() {
-    local dev="$1" rate="$2" shaper="$3" mtu="$4" freshness="$5"
+    local dev="$1" rate="$2" shaper="$3" burst_base_rate="$4"
 
-    mw_realtime_curve "$rate" "$shaper" "$mtu" "$freshness"
+    mw_realtime_curve "$rate" "$shaper" "$burst_base_rate"
     tc class change dev "$dev" parent 1:1 classid 1:11 hfsc rt \
-        umax "${MW_RT_WORK_BYTES}b" dmax "${MW_RT_DMAX}ms" rate "${MW_RT_SCHEDULER_RATE}kbit"
+        m1 "${MW_RT_BURST_RATE}kbit" d "${MW_RT_BURST_DURATION}ms" m2 "${MW_RT_SCHEDULER_RATE}kbit"
 }
 
 apply_rate() {
-    local dev="$1" rate="$2" shaper="$3" mtu="$4" freshness="$5" rv
+    local dev="$1" rate="$2" shaper="$3" burst_base_rate="$4" rv
 
     mw_lock_acquire "$LOCK_DIR" || return 2
-    change_class "$dev" "$rate" "$shaper" "$mtu" "$freshness"
+    change_class "$dev" "$rate" "$shaper" "$burst_base_rate"
     rv=$?
     mw_lock_release_for "$LOCK_DIR" "$MW_LOCK_TOKEN"
     return "$rv"
@@ -99,7 +99,7 @@ reset_sample_state() {
 }
 
 process_direction() {
-    local dev="$1" line_rate="$2" shaper="$3" mtu="$4" direction="$5"
+    local dev="$1" line_rate="$2" shaper="$3" direction="$4"
     local key state_dir current saved_current rate_needs_write stats bytes drops backlog now previous_bytes previous_drops previous_ms elapsed
     local delta_bytes delta_drops sample_rate window_ms peak rolling_peak desired window_complete
     local backlog_samples lower_target lower_since last_decrease last_increase new state rv
@@ -234,7 +234,7 @@ process_direction() {
     printf '%s\n' "$last_increase" > "$state_dir/last_increase"
 
     if [ "$new" -ne "$current" ]; then
-        apply_rate "$dev" "$new" "$shaper" "$mtu" "$FRESHNESS"
+        apply_rate "$dev" "$new" "$shaper" "$MW_RT_START"
         rv=$?
         if [ "$rv" -eq 2 ]; then
             state=lock-busy
@@ -255,7 +255,7 @@ process_direction() {
 }
 
 process_interface() {
-    local section="$1" enabled device qdisc upload download wan_mtu ifb_mtu shaper ifb
+    local section="$1" enabled device qdisc upload download shaper ifb
 
     config_get_bool enabled "$section" enabled 1
     [ "$enabled" -eq 1 ] || return 0
@@ -265,18 +265,12 @@ process_interface() {
     config_get upload "$section" upload
     config_get download "$section" download
 
-    wan_mtu=1500
-    [ ! -r "/sys/class/net/$device/mtu" ] || IFS= read -r wan_mtu < "/sys/class/net/$device/mtu"
-    case "$wan_mtu" in ''|*[!0-9]*) wan_mtu=1500 ;; esac
     shaper="$upload"; [ "$qdisc" = hybrid ] && shaper=$((upload * 98 / 100))
-    process_direction "$device" "$upload" "$shaper" "$wan_mtu" wan
+    process_direction "$device" "$upload" "$shaper" wan
 
     ifb="ifb-$device"
-    ifb_mtu="$wan_mtu"
-    [ ! -r "/sys/class/net/$ifb/mtu" ] || IFS= read -r ifb_mtu < "/sys/class/net/$ifb/mtu"
-    case "$ifb_mtu" in ''|*[!0-9]*) ifb_mtu="$wan_mtu" ;; esac
     shaper="$download"; [ "$qdisc" = hybrid ] && shaper=$((download * 98 / 100))
-    process_direction "$ifb" "$download" "$shaper" "$ifb_mtu" lan
+    process_direction "$ifb" "$download" "$shaper" lan
 }
 
 mkdir -p "$STATE_ROOT"
@@ -285,9 +279,6 @@ while [ -f "$RESTARTING" ]; do sleep 1; done
 config_load multiwan-qos
 config_get RATE_MODE hfsc realtime_rate_mode auto
 [ "$RATE_MODE" = adaptive ] || exit 0
-config_get FRESHNESS_MODE hfsc freshness_mode auto
-config_get FRESHNESS hfsc freshness_target_ms 18
-case "$FRESHNESS_MODE" in tight) FRESHNESS=14 ;; balanced|auto|'') FRESHNESS=18 ;; relaxed) FRESHNESS=22 ;; esac
 
 while true; do
     [ -f "$RESTARTING" ] && exit 0

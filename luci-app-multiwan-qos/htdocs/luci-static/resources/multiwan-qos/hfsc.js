@@ -205,7 +205,7 @@ return view.extend({
         createOption('nongameqdiscoptions', _('Non-Game QDisc Options'), _('Cake options for non-realtime queueing discipline'), _('Default: besteffort ack-filter'));
 
         o = s.option(form.ListValue, 'freshness_mode', _('Realtime Freshness'),
-            addRelevanceInfo(_('HFSC work deadline for realtime traffic. Auto/Balanced: 18 ms, Tight: 14 ms, Relaxed: 22 ms, Custom: use the custom target below. Finite queues also use this target with a one-MTU floor; game FQ_CODEL keeps its independent 5 ms target.'), 'freshness_mode', rootQdisc, gameqdisc));
+            addRelevanceInfo(_('Finite realtime queue budget. Auto/Balanced: 18 ms, Tight: 14 ms, Relaxed: 22 ms, Custom: use the custom target below. Queue capacity uses the detected MTU as its minimum; the HFSC burst segment remains fixed at 25 ms and game FQ_CODEL keeps its independent 5 ms target.'), 'freshness_mode', rootQdisc, gameqdisc));
         o.value('auto', _('Auto (Balanced)'));
         o.value('tight', _('Tight'));
         o.value('balanced', _('Balanced'));
@@ -213,7 +213,7 @@ return view.extend({
         o.value('custom', _('Custom'));
         o.default = 'auto';
 
-        o = createOption('freshness_target_ms', _('Custom Freshness Target (ms)'), _('Manual HFSC deadline and finite realtime queue target. Game FQ_CODEL keeps its independent 5 ms target.'), _('Default: 18'), 'uinteger');
+        o = createOption('freshness_target_ms', _('Custom Freshness Target (ms)'), _('Manual finite realtime queue target. The HFSC burst remains 25 ms and game FQ_CODEL keeps its independent 5 ms target.'), _('Default: 18'), 'uinteger');
         o.depends('freshness_mode', 'custom');
 
         createOption('PFIFOMIN', _('PFIFO Min'), _('Minimum packet count for PFIFO queue'), _('Default: 5'), 'uinteger');

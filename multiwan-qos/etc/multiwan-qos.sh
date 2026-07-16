@@ -1894,7 +1894,7 @@ setup_hfsc() {
         qdisc_setup_failed "Failed to create HFSC root class 1:1 on $DEV."
     local realtime_target_ms
     realtime_target_ms="$(realtime_freshness_target_ms "$freshness_mode" "$freshness_target_ms" "$MAXDEL")"
-    mw_realtime_curve "$GAMERATE" "$RATE" "$MTU" "$realtime_target_ms"
+    mw_realtime_curve "$GAMERATE" "$RATE" "$GAMERATE"
 
     # Define HFSC Classes
     if [ "$strict_realtime_priority" = 1 ] && [ "$realtime_rate_mode" != adaptive ]; then
@@ -1902,7 +1902,7 @@ setup_hfsc() {
             qdisc_setup_failed "Failed to create strict HFSC realtime class 1:11 on $DEV."
     else
         tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt \
-            umax "${MW_RT_WORK_BYTES}b" dmax "${MW_RT_DMAX}ms" rate "${MW_RT_SCHEDULER_RATE}kbit" ||
+            m1 "${MW_RT_BURST_RATE}kbit" d "${MW_RT_BURST_DURATION}ms" m2 "${MW_RT_SCHEDULER_RATE}kbit" ||
             qdisc_setup_failed "Failed to create HFSC realtime class 1:11 on $DEV."
     fi
     tc class add dev "$DEV" parent 1:1 classid 1:12 hfsc ls m1 "$((RATE*70/100))kbit" d "${DUR}ms" m2 "$((RATE*30/100))kbit" ||
@@ -2139,7 +2139,7 @@ setup_hybrid() {
     local DUR=$((5*MTU*8/SHAPER_RATE)); [ "$DUR" -lt 25 ] && DUR=25
     local realtime_target_ms
     realtime_target_ms="$(realtime_freshness_target_ms "$freshness_mode" "$freshness_target_ms" "$MAXDEL")"
-    mw_realtime_curve "$GAMERATE" "$SHAPER_RATE" "$MTU" "$realtime_target_ms"
+    mw_realtime_curve "$GAMERATE" "$SHAPER_RATE" "$GAMERATE"
 
     # Setup root HFSC qdisc (default to 1:13 - CAKE class)
     local TC_OH_PARAMS
@@ -2167,7 +2167,7 @@ setup_hybrid() {
             qdisc_setup_failed "Failed to create strict Hybrid realtime class 1:11 on $DEV."
     else
         tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt \
-            umax "${MW_RT_WORK_BYTES}b" dmax "${MW_RT_DMAX}ms" rate "${MW_RT_SCHEDULER_RATE}kbit" ||
+            m1 "${MW_RT_BURST_RATE}kbit" d "${MW_RT_BURST_DURATION}ms" m2 "${MW_RT_SCHEDULER_RATE}kbit" ||
             qdisc_setup_failed "Failed to create Hybrid realtime class 1:11 on $DEV."
     fi
     # Attach game qdisc (using $gameqdisc from HFSC config)
