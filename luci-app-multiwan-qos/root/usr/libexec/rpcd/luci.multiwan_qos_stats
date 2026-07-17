@@ -206,10 +206,9 @@ get_stats() {
         ingress_leaf_qdiscs=$(echo "$ingress_leaf_qdiscs" | jq -c '[.[] | select(.kind != "hfsc" and .parent != null)]' 2>/dev/null || echo "[]")
 
         # Get game qdisc type (used by both HFSC and hybrid)
-        local gameqdisc realtime_rate_mode strict_realtime_priority adaptive_state adaptive_errors adaptive_file adaptive_line
+        local gameqdisc realtime_rate_mode adaptive_state adaptive_errors adaptive_file adaptive_line
         gameqdisc=$(uci -q get multiwan-qos.hfsc.gameqdisc || echo "pfifo")
         realtime_rate_mode=$(uci -q get multiwan-qos.hfsc.realtime_rate_mode || echo "auto")
-        strict_realtime_priority=$(uci -q get multiwan-qos.hfsc.strict_realtime_priority || echo "0")
         adaptive_state='[]'
         adaptive_errors='[]'
         if [ "$realtime_rate_mode" = "adaptive" ]; then
@@ -255,7 +254,6 @@ EOF
             --arg ii "$ifb_interface" \
             --arg gq "$gameqdisc" \
             --arg rrm "$realtime_rate_mode" \
-            --arg srp "$strict_realtime_priority" \
             --argjson ars "$adaptive_state" \
             --argjson are "$adaptive_errors" \
             --argjson fs "$filtered_stats" \
@@ -273,7 +271,6 @@ EOF
                 ifb_interface: $ii,
                 gameqdisc: $gq,
                 realtime_rate_mode: $rrm,
-                strict_realtime_priority: ($srp == "1"),
                 adaptive_realtime_state: $ars,
                 adaptive_realtime_errors: $are,
                 qdisc_stats: $fs,

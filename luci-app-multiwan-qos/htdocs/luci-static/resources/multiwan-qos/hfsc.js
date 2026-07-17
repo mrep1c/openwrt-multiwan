@@ -179,13 +179,8 @@ return view.extend({
         o.value('netem', _('NETEM'));
         o.default = 'pfifo';
 
-        o = s.option(form.Flag, 'strict_realtime_priority', _('Strict Realtime Priority'),
-            addRelevanceInfo(_('WARNING: In Auto and Manual modes, this gives EF, CS5, CS6, and CS7 traffic the full shaped-link realtime curve. Continuously backlogged realtime traffic can starve every other queue. Adaptive mode ignores this toggle and controls the realtime curve itself. The selected game queue discipline remains in use.'), 'strict_realtime_priority', rootQdisc, gameqdisc));
-        o.rmempty = false;
-        o.default = '0';
-
         o = s.option(form.ListValue, 'realtime_rate_mode', _('Realtime Rate Mode'),
-            _('Auto uses a fixed 1500 kbit/s reserve capped at 25% of the link. Manual uses the overrides below. Adaptive starts at 1000 kbit/s and adjusts only the HFSC realtime service rate from 500 to 2000 kbit/s, capped at 25% of the link. Adaptive takes precedence over Strict Realtime Priority. The selected game queue is never rebuilt or resized.'));
+            _('Auto uses a fixed 1500 kbit/s reserve capped at 25% of the link. Manual uses the overrides below. Adaptive starts at 1000 kbit/s, uses the highest one-second demand sample from the last 3 seconds plus a 200 kbit/s reserve, and adjusts only the HFSC realtime service rate from 300 to 1800 kbit/s, capped at 25% of the link. The selected game queue is never rebuilt or resized.'));
         o.value('auto', _('Auto'));
         o.value('manual', _('Manual'));
         o.value('adaptive', _('Adaptive'));

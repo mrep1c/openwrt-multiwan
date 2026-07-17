@@ -31,4 +31,9 @@ fi
 # leftovers from older package versions without introducing a new daemon.
 rm -f /etc/multiwan-qos-agent-watchdog.lua
 
+if uci -q get multiwan-qos.hfsc.strict_realtime_priority >/dev/null 2>&1; then
+	uci -q delete multiwan-qos.hfsc.strict_realtime_priority
+	uci -q commit multiwan-qos
+fi
+
 exit 0

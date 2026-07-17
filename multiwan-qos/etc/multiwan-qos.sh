@@ -15,7 +15,6 @@ IFS="$DEFAULT_IFS"
 : "${gameqdisc:=pfifo}" "${gameqdisc_child:=red}" "${nongameqdisc:=fq_codel}" "${ACK_FILTER_EGRESS:=auto}"
 : "${freshness_mode:=auto}" "${freshness_target_ms:=18}"
 : "${realtime_rate_mode:=auto}"
-: "${strict_realtime_priority:=0}"
 : "${MAXDEL:=24}" "${PFIFOMIN:=5}" "${PACKETSIZE:=450}"
 : "${DOWNLOAD_IFB_STAB:=0}"
 : "${DISABLE_QOS_OFFLOADS:=1}"
@@ -1892,19 +1891,12 @@ setup_hfsc() {
     # Main link class
     tc class add dev "$DEV" parent 1: classid 1:1 hfsc ls m2 "${RATE}kbit" ul m2 "${RATE}kbit" ||
         qdisc_setup_failed "Failed to create HFSC root class 1:1 on $DEV."
-    local realtime_target_ms
-    realtime_target_ms="$(realtime_freshness_target_ms "$freshness_mode" "$freshness_target_ms" "$MAXDEL")"
     mw_realtime_curve "$GAMERATE" "$RATE" "$GAMERATE"
 
     # Define HFSC Classes
-    if [ "$strict_realtime_priority" = 1 ] && [ "$realtime_rate_mode" != adaptive ]; then
-        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${RATE}kbit" d "${realtime_target_ms}ms" m2 "${RATE}kbit" ||
-            qdisc_setup_failed "Failed to create strict HFSC realtime class 1:11 on $DEV."
-    else
-        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt \
-            m1 "${MW_RT_BURST_RATE}kbit" d "${MW_RT_BURST_DURATION}ms" m2 "${MW_RT_SCHEDULER_RATE}kbit" ||
-            qdisc_setup_failed "Failed to create HFSC realtime class 1:11 on $DEV."
-    fi
+    tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt \
+        m1 "${MW_RT_BURST_RATE}kbit" d "${MW_RT_BURST_DURATION}ms" m2 "${MW_RT_SCHEDULER_RATE}kbit" ||
+        qdisc_setup_failed "Failed to create HFSC realtime class 1:11 on $DEV."
     tc class add dev "$DEV" parent 1:1 classid 1:12 hfsc ls m1 "$((RATE*70/100))kbit" d "${DUR}ms" m2 "$((RATE*30/100))kbit" ||
         qdisc_setup_failed "Failed to create HFSC fast class 1:12 on $DEV."
     tc class add dev "$DEV" parent 1:1 classid 1:13 hfsc ls m1 "$((RATE*20/100))kbit" d "${DUR}ms" m2 "$((RATE*45/100))kbit" ||
@@ -2137,8 +2129,6 @@ setup_hybrid() {
 
     # Calculate parameters
     local DUR=$((5*MTU*8/SHAPER_RATE)); [ "$DUR" -lt 25 ] && DUR=25
-    local realtime_target_ms
-    realtime_target_ms="$(realtime_freshness_target_ms "$freshness_mode" "$freshness_target_ms" "$MAXDEL")"
     mw_realtime_curve "$GAMERATE" "$SHAPER_RATE" "$GAMERATE"
 
     # Setup root HFSC qdisc (default to 1:13 - CAKE class)
@@ -2162,14 +2152,9 @@ setup_hybrid() {
         qdisc_setup_failed "Failed to create Hybrid root class 1:1 on $DEV."
 
     # Class 1:11 - High priority realtime (HFSC RT + gameqdisc)
-    if [ "$strict_realtime_priority" = 1 ] && [ "$realtime_rate_mode" != adaptive ]; then
-        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt m1 "${SHAPER_RATE}kbit" d "${realtime_target_ms}ms" m2 "${SHAPER_RATE}kbit" ||
-            qdisc_setup_failed "Failed to create strict Hybrid realtime class 1:11 on $DEV."
-    else
-        tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt \
-            m1 "${MW_RT_BURST_RATE}kbit" d "${MW_RT_BURST_DURATION}ms" m2 "${MW_RT_SCHEDULER_RATE}kbit" ||
-            qdisc_setup_failed "Failed to create Hybrid realtime class 1:11 on $DEV."
-    fi
+    tc class add dev "$DEV" parent 1:1 classid 1:11 hfsc rt \
+        m1 "${MW_RT_BURST_RATE}kbit" d "${MW_RT_BURST_DURATION}ms" m2 "${MW_RT_SCHEDULER_RATE}kbit" ||
+        qdisc_setup_failed "Failed to create Hybrid realtime class 1:11 on $DEV."
     # Attach game qdisc (using $gameqdisc from HFSC config)
     setup_game_qdisc "$DEV" "$RATE" "$GAMERATE" "$gameqdisc" "$DIR" \
                      "$MTU" "$MAXDEL" "$PFIFOMIN" "$PACKETSIZE" \
@@ -2846,19 +2831,6 @@ setup_interface() {
         print_msg "  Adaptive download rate: floor=${adaptive_down_floor}k start=${adaptive_down_start}k current=${game_down}k ceiling=${adaptive_down_ceiling}k"
     fi
 
-    if [ "$strict_realtime_priority" = 1 ]; then
-        case "$qdisc" in
-            hfsc|hybrid)
-                if [ "$realtime_rate_mode" = adaptive ]; then
-                    print_msg -warn "Strict realtime priority is ignored in Adaptive mode; Adaptive controls the realtime HFSC curve."
-                else
-                    print_msg -warn "Strict realtime priority is enabled; continuously backlogged EF/CS5/CS6/CS7 traffic can starve other traffic."
-                    print_msg "  Strict scheduler follows the shaped parent."
-                fi
-                ;;
-        esac
-    fi
-    
     case "$qdisc" in
         hfsc)
             print_msg "  Applying HFSC (UL: ${upload}k, DL: ${download}k, game UL/DL: ${game_up}k/${game_down}k, MTU: ${dev_mtu})"
@@ -2919,11 +2891,6 @@ esac
 case "$realtime_rate_mode" in
     auto|manual|adaptive) ;;
     *) error_out "Unsupported realtime_rate_mode '$realtime_rate_mode'."; exit 1 ;;
-esac
-
-case "$strict_realtime_priority" in
-    0|1) ;;
-    *) error_out "Unsupported strict_realtime_priority '$strict_realtime_priority'; expected 0 or 1."; exit 1 ;;
 esac
 
 if [ "$gameqdisc" = "qfq" ]; then

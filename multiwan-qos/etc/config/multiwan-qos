@@ -49,7 +49,6 @@ config advanced 'advanced'
 
 config hfsc 'hfsc'
 	option gameqdisc 'pfifo'
-	option strict_realtime_priority '0'
 	option realtime_rate_mode 'auto'
 	option GAMEUP ''
 	option GAMEDOWN ''

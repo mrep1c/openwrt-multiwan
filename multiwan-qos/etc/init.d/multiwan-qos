@@ -2093,14 +2093,6 @@ status_service() {
     fi
     print_msg "multiwan_qos global:enabled is $config_enabled."
     print_msg "Realtime rate mode: ${realtime_rate_mode:-auto}"
-    if [ "${strict_realtime_priority:-0}" = 1 ] && [ "${realtime_rate_mode:-auto}" = adaptive ]; then
-        print_msg "Strict realtime priority: ignored (Adaptive controls the realtime HFSC curve)"
-    elif [ "${strict_realtime_priority:-0}" = 1 ]; then
-        print_msg "Strict realtime priority: enabled"
-        print_msg "  WARNING: continuously backlogged EF/CS5/CS6/CS7 traffic can starve other traffic."
-    else
-        print_msg "Strict realtime priority: disabled"
-    fi
     if [ "${realtime_rate_mode:-auto}" = adaptive ]; then
         local adaptive_status
         for adaptive_status in /var/run/multiwan-qos/adaptive/*/status; do
@@ -2235,7 +2227,7 @@ status_service() {
     print_msg "" "==== Configured Interfaces ===="
     local listed_interfaces=0
     print_configured_interface() {
-        local config="$1" enabled device qdisc upload download preset strict_upload strict_download
+        local config="$1" enabled device qdisc upload download preset
 
         config_get_bool enabled "$config" enabled 1
         config_get device "$config" device
@@ -2246,18 +2238,6 @@ status_service() {
 
         listed_interfaces=$((listed_interfaces + 1))
         print_msg "Interface $config: enabled=$enabled device=${device:-unset} qdisc=$qdisc upload=${upload:-unset} download=${download:-unset} preset=$preset"
-        if [ "${strict_realtime_priority:-0}" = 1 ] && [ "${realtime_rate_mode:-auto}" != adaptive ]; then
-            case "$qdisc" in
-                hfsc)
-                    print_msg "  Strict scheduler rate: upload=${upload:-unset}kbit download=${download:-unset}kbit"
-                    ;;
-                hybrid)
-                    strict_upload=$((upload * 98 / 100))
-                    strict_download=$((download * 98 / 100))
-                    print_msg "  Strict scheduler rate: upload=${strict_upload}kbit download=${strict_download}kbit"
-                    ;;
-            esac
-        fi
     }
     config_foreach print_configured_interface interface
     [ "$listed_interfaces" -gt 0 ] || print_msg "No interface sections configured."

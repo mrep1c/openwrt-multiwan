@@ -21,12 +21,12 @@ mw_realtime_adaptive_range() {
     cap=$((line_rate * 25 / 100))
     [ "$cap" -lt 1 ] && cap=1
 
-    MW_RT_FLOOR=500
+    MW_RT_FLOOR=300
     [ "$MW_RT_FLOOR" -gt "$cap" ] && MW_RT_FLOOR="$cap"
     MW_RT_START=1000
     [ "$MW_RT_START" -gt "$cap" ] && MW_RT_START="$cap"
     [ "$MW_RT_START" -lt "$MW_RT_FLOOR" ] && MW_RT_START="$MW_RT_FLOOR"
-    MW_RT_CEILING=2000
+    MW_RT_CEILING=1800
     [ "$MW_RT_CEILING" -gt "$cap" ] && MW_RT_CEILING="$cap"
     [ "$MW_RT_CEILING" -lt "$MW_RT_START" ] && MW_RT_CEILING="$MW_RT_START"
 }

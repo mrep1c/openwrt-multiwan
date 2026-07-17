@@ -8,6 +8,12 @@ STATE_ROOT=/var/run/multiwan-qos/adaptive
 LOCK_DIR=/var/run/multiwan_qos-refresh.lock
 RESTARTING=/tmp/multiwan_qos_restarting
 SAMPLE_INTERVAL=1
+DEMAND_WINDOW_SAMPLES=3
+TARGET_RESERVE_KBIT=200
+DROP_INCREASE_KBIT=150
+BACKLOG_INCREASE_KBIT=100
+DECREASE_HOLD_MS=20000
+DECREASE_INTERVAL_MS=5000
 
 log() { logger -t multiwan-qos-adaptive -- "$*"; }
 
@@ -80,9 +86,10 @@ write_status() {
     local state_dir="$1" direction="$2" dev="$3" current="$4" shaper="$5"
     local state="$6" peak="$7" desired="$8" backlog="$9" drop_delta="${10}"
     local priority_mode=adaptive scheduler_rate="$current"
-    printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s recommended_rate=%s queue_budget_rate=%s floor=%s start=%s ceiling=%s peak=%s desired=%s backlog=%s drop_delta=%s state=%s\n' \
+    printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s recommended_rate=%s queue_budget_rate=%s floor=%s start=%s ceiling=%s poll_interval=%ss demand_window=%ss reserve=%skbit peak=%s desired=%s backlog=%s drop_delta=%s state=%s\n' \
         "$priority_mode" "$direction" "$dev" "$scheduler_rate" "$current" "$MW_RT_START" \
-        "$MW_RT_FLOOR" "$MW_RT_START" "$MW_RT_CEILING" "$peak" "$desired" "$backlog" "$drop_delta" "$state" \
+        "$MW_RT_FLOOR" "$MW_RT_START" "$MW_RT_CEILING" "$SAMPLE_INTERVAL" "$DEMAND_WINDOW_SAMPLES" \
+        "$TARGET_RESERVE_KBIT" "$peak" "$desired" "$backlog" "$drop_delta" "$state" \
         > "$state_dir/status"
 }
 
@@ -94,15 +101,21 @@ reset_sample_state() {
     printf '%s\n' "$now" > "$state_dir/sample_ms"
     printf '%s\n' "$now" > "$state_dir/window_ms"
     printf '0\n' > "$state_dir/peak"
+    printf '0\n' > "$state_dir/peak_1"
+    printf '0\n' > "$state_dir/peak_2"
+    printf '0\n' > "$state_dir/rolling_peak"
     printf '%s\n' "$current" > "$state_dir/desired"
     printf '0\n' > "$state_dir/backlog_samples"
+    printf '0\n' > "$state_dir/lower_since"
+    printf '0\n' > "$state_dir/last_decrease"
+    printf '0\n' > "$state_dir/last_increase"
 }
 
 process_direction() {
     local dev="$1" line_rate="$2" shaper="$3" direction="$4"
     local key state_dir current saved_current rate_needs_write stats bytes drops backlog now previous_bytes previous_drops previous_ms elapsed
-    local delta_bytes delta_drops sample_rate window_ms peak rolling_peak desired window_complete
-    local backlog_samples lower_target lower_since last_decrease last_increase new state rv
+    local delta_bytes delta_drops sample_rate window_ms peak peak_1 peak_2 current_peak rolling_peak desired demand_input window_complete
+    local backlog_samples lower_since last_decrease last_increase drop_step new state rv
 
     [ -d "/sys/class/net/$dev" ] || return 0
     key="${dev}-${direction}"
@@ -150,6 +163,11 @@ process_direction() {
     [ "$elapsed" -gt 0 ] || return 0
     delta_bytes=$((bytes - previous_bytes))
     delta_drops=$((drops - previous_drops))
+    if [ "$bytes" -lt "$previous_bytes" ] || [ "$drops" -lt "$previous_drops" ]; then
+        reset_sample_state "$state_dir" "$bytes" "$drops" "$now" "$current"
+        write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" counter-reset 0 "$current" 0 0
+        return 0
+    fi
     sample_rate=$((delta_bytes * 8 / elapsed))
     printf '%s\n' "$bytes" > "$state_dir/bytes"
     printf '%s\n' "$drops" > "$state_dir/drops"
@@ -157,16 +175,24 @@ process_direction() {
 
     window_ms="$(read_number "$state_dir/window_ms" "$now")"
     peak="$(read_number "$state_dir/peak" 0)"
+    peak_1="$(read_number "$state_dir/peak_1" 0)"
+    peak_2="$(read_number "$state_dir/peak_2" 0)"
     rolling_peak="$(read_number "$state_dir/rolling_peak" 0)"
     desired="$(read_number "$state_dir/desired" "$current")"
     window_complete=0
     if [ $((now - window_ms)) -ge 1000 ]; then
-        [ "$sample_rate" -gt "$peak" ] && peak="$sample_rate"
-        rolling_peak="$peak"
-        desired=$(((rolling_peak * 100 + 74) / 75))
+        current_peak="$peak"
+        [ "$sample_rate" -gt "$current_peak" ] && current_peak="$sample_rate"
+        rolling_peak="$current_peak"
+        [ "$peak_1" -gt "$rolling_peak" ] && rolling_peak="$peak_1"
+        [ "$peak_2" -gt "$rolling_peak" ] && rolling_peak="$peak_2"
+        demand_input=$((rolling_peak + TARGET_RESERVE_KBIT))
+        desired=$(((demand_input * 100 + 74) / 75))
         desired=$(((desired + 49) / 50 * 50))
         [ "$desired" -lt "$MW_RT_FLOOR" ] && desired="$MW_RT_FLOOR"
         [ "$desired" -gt "$MW_RT_CEILING" ] && desired="$MW_RT_CEILING"
+        peak_2="$peak_1"
+        peak_1="$current_peak"
         peak=0
         window_ms="$now"
         window_complete=1
@@ -175,6 +201,8 @@ process_direction() {
     fi
     printf '%s\n' "$window_ms" > "$state_dir/window_ms"
     printf '%s\n' "$peak" > "$state_dir/peak"
+    printf '%s\n' "$peak_1" > "$state_dir/peak_1"
+    printf '%s\n' "$peak_2" > "$state_dir/peak_2"
     printf '%s\n' "$rolling_peak" > "$state_dir/rolling_peak"
     printf '%s\n' "$desired" > "$state_dir/desired"
 
@@ -186,7 +214,6 @@ process_direction() {
     fi
     printf '%s\n' "$backlog_samples" > "$state_dir/backlog_samples"
 
-    lower_target="$(read_number "$state_dir/lower_target" "$current")"
     lower_since="$(read_number "$state_dir/lower_since" 0)"
     last_decrease="$(read_number "$state_dir/last_decrease" 0)"
     last_increase="$(read_number "$state_dir/last_increase" 0)"
@@ -194,14 +221,17 @@ process_direction() {
     state=tracking
 
     if [ "$delta_drops" -gt 0 ]; then
-        new=$((current + 250))
+        drop_step="$DROP_INCREASE_KBIT"
+        [ "$delta_drops" -ge 10 ] && drop_step=200
+        [ "$delta_drops" -ge 50 ] && drop_step=250
+        new=$((current + drop_step))
         [ "$desired" -gt "$new" ] && new="$desired"
         [ "$new" -gt "$MW_RT_CEILING" ] && new="$MW_RT_CEILING"
         lower_since=0
         last_increase="$now"
         state=drop-increase
-    elif [ "$backlog_samples" -ge 1 ] && [ $((now - last_increase)) -ge 1000 ]; then
-        new=$((current + 100))
+    elif [ "$backlog_samples" -ge 2 ] && [ $((now - last_increase)) -ge 1000 ]; then
+        new=$((current + BACKLOG_INCREASE_KBIT))
         [ "$desired" -gt "$new" ] && new="$desired"
         [ "$new" -gt "$MW_RT_CEILING" ] && new="$MW_RT_CEILING"
         lower_since=0
@@ -212,23 +242,23 @@ process_direction() {
         lower_since=0
         last_increase="$now"
         state=demand-increase
-    elif [ "$window_complete" -eq 1 ] && [ "$backlog" -eq 0 ] && [ "$desired" -lt "$current" ]; then
-        if [ "$lower_target" -ne "$desired" ] || [ "$lower_since" -eq 0 ]; then
-            lower_target="$desired"
-            lower_since="$now"
-        elif [ $((now - lower_since)) -ge 30000 ] && [ $((now - last_decrease)) -ge 10000 ]; then
-            new=$((current - 100))
+    elif [ "$backlog" -gt 0 ]; then
+        lower_since=0
+    elif [ "$window_complete" -eq 1 ] && [ "$desired" -lt "$current" ]; then
+        [ "$lower_since" -eq 0 ] && lower_since="$now"
+        if [ $((now - lower_since)) -ge "$DECREASE_HOLD_MS" ] && [ $((now - last_decrease)) -ge "$DECREASE_INTERVAL_MS" ]; then
+            new=$((current - 50))
             [ "$new" -lt "$desired" ] && new="$desired"
             [ "$new" -lt "$MW_RT_FLOOR" ] && new="$MW_RT_FLOOR"
-            last_decrease="$now"
-            state=demand-decrease
+            if [ "$new" -lt "$current" ]; then
+                last_decrease="$now"
+                state=demand-decrease
+            fi
         fi
-    elif [ "$backlog" -gt 0 ] || [ "$desired" -ge "$current" ]; then
+    elif [ "$window_complete" -eq 1 ]; then
         lower_since=0
-        lower_target="$current"
     fi
 
-    printf '%s\n' "$lower_target" > "$state_dir/lower_target"
     printf '%s\n' "$lower_since" > "$state_dir/lower_since"
     printf '%s\n' "$last_decrease" > "$state_dir/last_decrease"
     printf '%s\n' "$last_increase" > "$state_dir/last_increase"
