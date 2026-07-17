@@ -2372,7 +2372,9 @@ restart() {
     rv=$?
     if [ "$rv" -eq 0 ]; then
         sleep 1 # Ensure all processes have been properly terminated
-        start_service_impl
+        # Use rc.common's procd-aware start wrapper so Adaptive is registered
+        # as a supervised instance after a custom restart.
+        start
         rv=$?
     fi
     clear_multiwan_qos_restarting
