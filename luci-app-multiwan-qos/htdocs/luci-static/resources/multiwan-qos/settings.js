@@ -137,7 +137,7 @@ return view.extend({
 
         m = new form.Map('multiwan-qos', _(''),
             _('For detailed setup instructions and advanced configuration options, please check the ') +
-            '<a href="https://github.com/mrep1c/openwrt-multiwan-qos/blob/main/README.md" target="_blank" style="color: #1976d2; text-decoration: none;">README</a>.');
+            '<a href="https://github.com/mrep1c/openwrt-multiwan/blob/main/README.md" target="_blank" style="color: #1976d2; text-decoration: none;">README</a>.');
 
         // Version and update section removed
 

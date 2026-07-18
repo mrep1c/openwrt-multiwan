@@ -43,11 +43,11 @@ MAIN_BRANCH_FRONTEND=main
 
 # GH API URLs (can be overridden)
 : "${MULTIWAN_QOS_GH_API_URL:="https://api.github.com/repos/${MULTIWAN_QOS_REPO_AUTHOR}"}"
-: "${MULTIWAN_QOS_GH_API_URL_BACKEND:="${MULTIWAN_QOS_GH_API_URL}/openwrt-multiwan-qos"}"
-: "${MULTIWAN_QOS_GH_API_URL_FRONTEND:="${MULTIWAN_QOS_GH_API_URL}/openwrt-multiwan-qos"}"
+: "${MULTIWAN_QOS_GH_API_URL_BACKEND:="${MULTIWAN_QOS_GH_API_URL}/openwrt-multiwan"}"
+: "${MULTIWAN_QOS_GH_API_URL_FRONTEND:="${MULTIWAN_QOS_GH_API_URL}/openwrt-multiwan"}"
 
 # GH raw backend URL (can be overridden)
-: "${MULTIWAN_QOS_GH_RAW_URL_BACKEND_MAIN:="https://raw.githubusercontent.com/${MULTIWAN_QOS_REPO_AUTHOR}/openwrt-multiwan-qos/${MAIN_BRANCH_BACKEND}/multiwan-qos"}"
+: "${MULTIWAN_QOS_GH_RAW_URL_BACKEND_MAIN:="https://raw.githubusercontent.com/${MULTIWAN_QOS_REPO_AUTHOR}/openwrt-multiwan/${MAIN_BRANCH_BACKEND}/multiwan-qos"}"
 
 
 ### Local paths
@@ -382,24 +382,24 @@ fetch_multiwan_qos_component() {
     [ -n "$1" ] && [ -n "$2" ] || { error_out "fetch_multiwan_qos_component: missing arguments."; return 1; }
 
     local component="$1" fetch_tarball_url="$2"
-    local fetch_rv extract_dir upd_dir="${MULTIWAN_QOS_UPD_DIR}/${component}"
+    local fetch_rv extract_dir repo_dir upd_dir="${MULTIWAN_QOS_UPD_DIR}/${component}"
     local tarball="${upd_dir}/remote_multiwan_qos.tar.gz" ucl_err_file="${upd_dir}/ucl_err"
 
     case "$component" in
-        BACKEND) repo_name=multiwan_qos ;;
-        FRONTEND) repo_name=luci-app-multiwan-qos ;;
+        BACKEND) repo_dir=multiwan-qos ;;
+        FRONTEND) repo_dir=luci-app-multiwan-qos ;;
         *) error_out "$me: invalid component '$component'."; return 1
     esac
 
     rm -f "$ucl_err_file" "${tarball}"
-    rm -rf "${upd_dir}/${MULTIWAN_QOS_REPO_AUTHOR}-${repo_name}-"*
+    rm -rf "${upd_dir}/${MULTIWAN_QOS_REPO_AUTHOR}-openwrt-multiwan-"*
     try_mkdir -p "$upd_dir" || return 1
 
     uclient-fetch "$fetch_tarball_url" -O "${tarball}" 2> "$ucl_err_file" &&
     grep -q "Download completed" "$ucl_err_file" &&
     tar -C "${upd_dir}" -xzf "${tarball}" &&
-    extract_dir="$(find "${upd_dir}/" -type d -name "${MULTIWAN_QOS_REPO_AUTHOR}-${repo_name}-*")" &&
-        [ -n "$extract_dir" ] && [ "$extract_dir" != "/" ]
+    extract_dir="$(find "${upd_dir}/" -type d -name "${MULTIWAN_QOS_REPO_AUTHOR}-openwrt-multiwan-*")" &&
+        [ -n "$extract_dir" ] && [ "$extract_dir" != "/" ] && [ -d "${extract_dir}/${repo_dir}" ]
     fetch_rv=${?}
     rm -f "${tarball}"
 
@@ -408,7 +408,7 @@ fetch_multiwan_qos_component() {
     rm -f "$ucl_err_file"
 
     [ "$fetch_rv" = 0 ] && {
-        mv "${extract_dir:-?}"/* "${upd_dir:-?}/" ||
+        mv "${extract_dir:-?}/${repo_dir}"/* "${upd_dir:-?}/" ||
             { rm -rf "${extract_dir:-?}"; error_out "Failed to move files to dist dir."; return 1; }
     }
     rm -rf "${extract_dir:-?}"

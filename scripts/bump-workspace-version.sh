@@ -19,29 +19,7 @@ case "$component" in
 	*) printf 'ERROR: invalid component: %s\n' "$component" >&2; exit 1 ;;
 esac
 
-workspace_root="$(CDPATH= cd "$(dirname "$0")/../.." && pwd)"
-combined="${workspace_root}/openwrt-multiwan"
-nft="${workspace_root}/openwrt-multiwan-nft"
-qos="${workspace_root}/openwrt-multiwan-qos"
+repo_root="$(CDPATH= cd "$(dirname "$0")/.." && pwd)"
+sh "$repo_root/scripts/bump-version.sh" --component "$component" "$@"
 
-run_bump() {
-	repo="$1"
-	shift
-	sh "$repo/scripts/bump-version.sh" "$@"
-}
-
-run_bump "$combined" --component "$component" "$@"
-case "$component" in
-	all)
-		[ -d "$nft" ] && run_bump "$nft" "$@"
-		[ -d "$qos" ] && run_bump "$qos" "$@"
-		;;
-	nft)
-		[ -d "$nft" ] && run_bump "$nft" "$@"
-		;;
-	qos)
-		[ -d "$qos" ] && run_bump "$qos" "$@"
-		;;
-esac
-
-printf 'Workspace package versions updated. Review, test, commit, and push separately.\n'
+printf 'Combined repository package versions updated. Review, test, commit, and push.\n'

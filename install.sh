@@ -2,7 +2,7 @@
 set -eu
 
 MODE="${1:-all}"
-RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/mrep1c}"
+RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/mrep1c/openwrt-multiwan/main}"
 
 fetch() {
 	local url="$1"
@@ -21,12 +21,12 @@ fetch() {
 }
 
 run_product_installer() {
-	local repo="$1"
+	local product="$1"
 	local mode="$2"
-	local tmp="/tmp/install-${repo}.sh"
+	local tmp="/tmp/install-multiwan-${product}.sh"
 
-	fetch "${RAW_BASE}/${repo}/main/install.sh" "$tmp"
-	sh "$tmp" "$mode"
+	fetch "${RAW_BASE}/scripts/install-${product}.sh" "$tmp"
+	RAW_BASE="$RAW_BASE" sh "$tmp" "$mode"
 }
 
 usage() {
@@ -52,34 +52,34 @@ EOF
 
 case "$MODE" in
 	all)
-		run_product_installer openwrt-multiwan-nft all
-		run_product_installer openwrt-multiwan-qos all
+		run_product_installer nft all
+		run_product_installer qos all
 		;;
 	main)
-		run_product_installer openwrt-multiwan-nft main
-		run_product_installer openwrt-multiwan-qos main
+		run_product_installer nft main
+		run_product_installer qos main
 		;;
 	luci)
-		run_product_installer openwrt-multiwan-nft luci
-		run_product_installer openwrt-multiwan-qos luci
+		run_product_installer nft luci
+		run_product_installer qos luci
 		;;
 	nft)
-		run_product_installer openwrt-multiwan-nft all
+		run_product_installer nft all
 		;;
 	nft-main)
-		run_product_installer openwrt-multiwan-nft main
+		run_product_installer nft main
 		;;
 	nft-luci)
-		run_product_installer openwrt-multiwan-nft luci
+		run_product_installer nft luci
 		;;
 	qos)
-		run_product_installer openwrt-multiwan-qos all
+		run_product_installer qos all
 		;;
 	qos-main)
-		run_product_installer openwrt-multiwan-qos main
+		run_product_installer qos main
 		;;
 	qos-luci)
-		run_product_installer openwrt-multiwan-qos luci
+		run_product_installer qos luci
 		;;
 	-h|--help|help)
 		usage
