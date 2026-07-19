@@ -27,13 +27,19 @@ if [ -d "$old_dir" ]; then
 	rm -rf "$old_dir"
 fi
 
-# The agent watchdog was never supervised or started by the service. Remove
-# leftovers from older package versions without introducing a new daemon.
+# Remove the obsolete, unsupervised Lua watchdog from older package versions.
 rm -f /etc/multiwan-qos-agent-watchdog.lua
+
+config_changed=0
+if [ "$(uci -q get multiwan-qos.agent.timeout)" = 300 ]; then
+	uci -q set multiwan-qos.agent.timeout='120'
+	config_changed=1
+fi
 
 if uci -q get multiwan-qos.hfsc.strict_realtime_priority >/dev/null 2>&1; then
 	uci -q delete multiwan-qos.hfsc.strict_realtime_priority
-	uci -q commit multiwan-qos
+	config_changed=1
 fi
+[ "$config_changed" -eq 0 ] || uci -q commit multiwan-qos
 
 exit 0

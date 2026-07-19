@@ -20,9 +20,9 @@ DECREASE_CONFIRM_MS=5000
 DECREASE_DROP_FREE_MS=30000
 DECREASE_INTERVAL_MS=10000
 DECREASE_REARM_MS=15000
-DECREASE_BACKLOG_FREE_SAMPLES=5
-SLOW_DEMAND_SAMPLES=30
-SESSION_IDLE_SAMPLES=10
+DECREASE_BACKLOG_FREE_MS=5000
+SLOW_DEMAND_WINDOW_MS=30000
+SESSION_IDLE_MS=10000
 
 log() { logger -t multiwan-qos-adaptive -- "$*"; }
 
@@ -170,10 +170,10 @@ reset_sample_state() {
     printf '0\n' > "$state_dir/lower_since"
     printf '0\n' > "$state_dir/last_decrease"
     printf '0\n' > "$state_dir/last_increase"
-    printf '0\n' > "$state_dir/idle_samples"
+    printf '0\n' > "$state_dir/idle_since"
     printf '0\n' > "$state_dir/slow_rate"
     printf '0\n' > "$state_dir/last_drop"
-    printf '0\n' > "$state_dir/backlog_free_samples"
+    printf '0\n' > "$state_dir/backlog_free_since"
     printf '0\n' > "$state_dir/peak_3"
     printf '0\n' > "$state_dir/peak_4"
     printf '0\n' > "$state_dir/rollback_rate"
@@ -185,7 +185,7 @@ process_direction() {
     local key state_dir current saved_current rate_needs_write stats bytes drops backlog now previous_bytes previous_drops previous_ms elapsed
     local monitor_pid force_start
     local delta_bytes delta_drops sample_rate window_ms peak peak_1 peak_2 peak_3 peak_4 current_peak rolling_peak recent_peak desired down_target demand_input window_complete
-    local backlog_samples backlog_free_samples lower_since last_decrease last_increase idle_samples new_session slow_rate last_drop rollback_rate rollback_until drop_step new state rv
+    local backlog_samples backlog_free_since lower_since last_decrease last_increase idle_since new_session slow_rate slow_weight last_drop rollback_rate rollback_until drop_step new state rv
     local mtu profile_rate saved_profile_rate profile_rate_needs_write profile_last_change profile_last_drop profile_drop_streak profile_new profile_state profile_rv
     local profile_deferred burst_drop rate_apply_ok
     local agent_session_id saved_agent_session_id agent_session_changed
@@ -343,7 +343,9 @@ process_direction() {
     if [ "$slow_rate" -le 0 ]; then
         slow_rate="$sample_rate"
     else
-        slow_rate=$(((slow_rate * (SLOW_DEMAND_SAMPLES - 1) + sample_rate + (SLOW_DEMAND_SAMPLES / 2)) / SLOW_DEMAND_SAMPLES))
+        slow_weight="$elapsed"
+        [ "$slow_weight" -gt "$SLOW_DEMAND_WINDOW_MS" ] && slow_weight="$SLOW_DEMAND_WINDOW_MS"
+        slow_rate=$(((slow_rate * (SLOW_DEMAND_WINDOW_MS - slow_weight) + sample_rate * slow_weight + (SLOW_DEMAND_WINDOW_MS / 2)) / SLOW_DEMAND_WINDOW_MS))
     fi
 
     last_drop="$(read_number "$state_dir/last_drop" 0)"
@@ -354,13 +356,13 @@ process_direction() {
     fi
     printf '%s\n' "$last_drop" > "$state_dir/last_drop"
 
-    backlog_free_samples="$(read_number "$state_dir/backlog_free_samples" 0)"
+    backlog_free_since="$(read_number "$state_dir/backlog_free_since" 0)"
     if [ "$backlog" -gt 0 ]; then
-        backlog_free_samples=0
-    else
-        backlog_free_samples=$((backlog_free_samples + 1))
+        backlog_free_since=0
+    elif [ "$backlog_free_since" -eq 0 ]; then
+        backlog_free_since="$now"
     fi
-    printf '%s\n' "$backlog_free_samples" > "$state_dir/backlog_free_samples"
+    printf '%s\n' "$backlog_free_since" > "$state_dir/backlog_free_since"
 
     saved_agent_session_id=""
     if [ -r "$state_dir/agent_session_id" ]; then
@@ -373,22 +375,23 @@ process_direction() {
         printf '%s\n' "$agent_session_id" > "$state_dir/agent_session_id"
     fi
 
-    idle_samples="$(read_number "$state_dir/idle_samples" 0)"
+    idle_since="$(read_number "$state_dir/idle_since" 0)"
     new_session=0
     if [ "$agent_session_changed" -eq 1 ]; then
         new_session=1
         ADAPTIVE_SESSION_SOURCE=agent-flow
     fi
     if [ "$delta_bytes" -gt 0 ] || [ "$backlog" -gt 0 ]; then
-        if [ "$new_session" -eq 0 ] && [ "$idle_samples" -ge "$SESSION_IDLE_SAMPLES" ]; then
+        if [ "$new_session" -eq 0 ] && [ "$idle_since" -gt 0 ] &&
+            [ $((now - idle_since)) -ge "$SESSION_IDLE_MS" ]; then
             new_session=1
             ADAPTIVE_SESSION_SOURCE=idle
         fi
-        idle_samples=0
-    else
-        idle_samples=$((idle_samples + 1))
+        idle_since=0
+    elif [ "$idle_since" -eq 0 ]; then
+        idle_since="$now"
     fi
-    printf '%s\n' "$idle_samples" > "$state_dir/idle_samples"
+    printf '%s\n' "$idle_since" > "$state_dir/idle_since"
 
     window_ms="$(read_number "$state_dir/window_ms" "$now")"
     peak="$(read_number "$state_dir/peak" 0)"
@@ -579,7 +582,8 @@ process_direction() {
         lower_since=0
     elif [ "$window_complete" -eq 1 ] && [ "$down_target" -lt "$current" ]; then
         [ "$lower_since" -eq 0 ] && lower_since="$now"
-        if [ "$backlog_free_samples" -ge "$DECREASE_BACKLOG_FREE_SAMPLES" ] &&
+        if [ "$backlog_free_since" -gt 0 ] &&
+            [ $((now - backlog_free_since)) -ge "$DECREASE_BACKLOG_FREE_MS" ] &&
             [ $((now - last_drop)) -ge "$DECREASE_DROP_FREE_MS" ] &&
             [ $((now - last_increase)) -ge "$DECREASE_REARM_MS" ] &&
             [ $((now - lower_since)) -ge "$DECREASE_CONFIRM_MS" ] &&

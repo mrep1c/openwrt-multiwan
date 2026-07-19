@@ -1,0 +1,63 @@
+#!/bin/sh
+
+. /lib/functions.sh
+. /lib/multiwan-qos/process-lock.sh
+
+CHECK_INTERVAL=5
+LOCK_DIR=/tmp/multiwan_qos_agent.lock
+TIMESTAMP_FILE=/tmp/multiwan_qos_agent_last_seen
+STATE_FILE=/tmp/multiwan_qos_agent_state.json
+SESSION_EVENT_FILE=/var/run/multiwan-qos/agent-session
+RESTARTING_FILE=/tmp/multiwan_qos_restarting
+
+log() { logger -t multiwan-qos-agent-watchdog -- "$*"; }
+
+read_timestamp() {
+    local value=""
+
+    [ -r "$TIMESTAMP_FILE" ] || return 1
+    IFS= read -r value < "$TIMESTAMP_FILE" || return 1
+    case "$value" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s' "$value"
+}
+
+expire_stale_rules() {
+    local timeout="$1" timestamp now age lock_token
+
+    timestamp="$(read_timestamp)" || return 0
+    now="$(date +%s)"
+    age=$((now - timestamp))
+    [ "$age" -gt "$timeout" ] || return 0
+
+    mw_lock_acquire "$LOCK_DIR" || return 0
+    lock_token="$MW_LOCK_TOKEN"
+
+    timestamp="$(read_timestamp)" || {
+        mw_lock_release "$LOCK_DIR" "$lock_token"
+        return 0
+    }
+    now="$(date +%s)"
+    age=$((now - timestamp))
+    if [ "$age" -gt "$timeout" ]; then
+        nft flush chain inet dscptag multiwan_qos_agent 2>/dev/null || true
+        nft flush chain inet dscptag multiwan_qos_agent_reapply 2>/dev/null || true
+        rm -f "$TIMESTAMP_FILE" "$STATE_FILE" "$SESSION_EVENT_FILE"
+        log "Expired dynamic agent rules after ${age}s without a heartbeat"
+    fi
+
+    mw_lock_release "$LOCK_DIR" "$lock_token"
+}
+
+trap 'mw_lock_release >/dev/null 2>&1; exit 0' INT TERM
+
+while true; do
+    if [ ! -f "$RESTARTING_FILE" ]; then
+        config_load multiwan-qos
+        config_get_bool enabled agent enabled 0
+        config_get timeout agent timeout 120
+        case "$timeout" in ''|*[!0-9]*) timeout=120 ;; esac
+        [ "$timeout" -ge 5 ] 2>/dev/null || timeout=5
+        [ "$enabled" -eq 1 ] && expire_stale_rules "$timeout"
+    fi
+    sleep "$CHECK_INTERVAL"
+done

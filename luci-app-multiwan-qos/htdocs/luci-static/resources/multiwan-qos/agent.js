@@ -381,9 +381,9 @@ return view.extend({
 
             o = s.option(form.Value, 'timeout', _('Watchdog Timeout (seconds)'),
                 _('If the Windows agent stops sending heartbeats for this long, all dynamic game rules are automatically cleared. ') +
-                _('Default: 300 seconds (5 minutes).'));
+                _('A supervised router check enforces this independently of the PC agent. Default: 120 seconds.'));
             o.datatype = 'uinteger';
-            o.placeholder = '300';
+            o.placeholder = '120';
             o.depends('enabled', '1');
 
             s = m.section(form.NamedSection, 'agent', 'agent', _('Agent Status'));

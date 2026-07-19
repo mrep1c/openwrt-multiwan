@@ -201,7 +201,7 @@ local function is_agent_enabled()
 end
 
 local function get_agent_timeout()
-    return tonumber(read_uci("multiwan-qos.agent.timeout", "300")) or 300
+    return tonumber(read_uci("multiwan-qos.agent.timeout", "120")) or 120
 end
 
 local function agent_chain_exists()
@@ -224,12 +224,11 @@ local function get_agent_pc_state(enabled, chain_exists, has_rules)
         return "waiting", nil, "missing_table"
     end
 
-    if has_rules then
-        return "connected", nil, "active_rules"
-    end
-
     local f = io.open("/tmp/multiwan_qos_agent_last_seen", "r")
     if not f then
+        if has_rules then
+            return "connected", nil, "active_rules"
+        end
         return "ready", nil, "no_last_seen"
     end
 
@@ -241,11 +240,14 @@ local function get_agent_pc_state(enabled, chain_exists, has_rules)
     end
 
     local age = os.time() - last_seen
-    if age <= get_agent_timeout() then
-        return "connected", age, "fresh_heartbeat"
+    if age > get_agent_timeout() then
+        return "stale", age, "stale_heartbeat"
     end
 
-    return "stale", age, "stale_heartbeat"
+    if has_rules then
+        return "connected", age, "active_rules"
+    end
+    return "connected", age, "fresh_heartbeat"
 end
 
 local function read_agent_state()

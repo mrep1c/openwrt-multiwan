@@ -179,7 +179,7 @@ end
 
 local function get_timeout()
     local val = get_uci_value("multiwan-qos.agent.timeout")
-    return tonumber(val) or 300
+    return tonumber(val) or 120
 end
 
 -- Rate limiter: reject requests faster than MIN_REQUEST_INTERVAL_SEC
@@ -219,6 +219,7 @@ end
 
 local function clear_agent_state()
     os.remove(STATE_FILE)
+    os.remove(SESSION_EVENT_FILE)
 end
 
 local function write_agent_state(state)

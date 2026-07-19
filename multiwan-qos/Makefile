@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=multiwan-qos
-PKG_VERSION:=1.0.40
+PKG_VERSION:=1.0.41
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=Markus Hütter <mh@hudra.net>
@@ -53,6 +53,7 @@ define Package/multiwan-qos/install
 	$(INSTALL_DATA) ./lib/multiwan-qos/process-lock.sh $(1)/lib/multiwan-qos/
 	$(INSTALL_DATA) ./lib/multiwan-qos/realtime.sh $(1)/lib/multiwan-qos/
 	$(INSTALL_BIN) ./usr/sbin/multiwan-qos-adaptive $(1)/usr/sbin/
+	$(INSTALL_BIN) ./usr/sbin/multiwan-qos-agent-watchdog $(1)/usr/sbin/
 	$(INSTALL_CONF) ./etc/hotplug.d/iface/13-multiwan-qos-hotplug $(1)/etc/hotplug.d/iface/
 	$(INSTALL_CONF) ./etc/config/multiwan-qos $(1)/etc/config/
 	$(INSTALL_BIN) ./etc/uci-defaults/10-multiwan-qos-migrate-config $(1)/etc/uci-defaults/
@@ -67,6 +68,7 @@ define Package/multiwan-qos/install
 			etc/multiwan-qos.d/multiwan-qos-defaults \
 			lib/multiwan-qos/hotplug-common.sh \
 			lib/multiwan-qos/process-lock.sh \
+			usr/sbin/multiwan-qos-agent-watchdog \
 			usr/lib/tc/experimental.dist \
 			usr/lib/tc/normal.dist \
 			usr/lib/tc/normmix20-64.dist \
