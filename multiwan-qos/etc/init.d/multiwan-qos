@@ -98,7 +98,9 @@ MULTIWAN_QOS_GEN_FILES_BACKEND="
     /usr/lib/tc/paretonormal.dist"
 MULTIWAN_QOS_EXEC_FILES_BACKEND="
     $MULTIWAN_QOS_SERVICE_PATH
-    $MULTIWAN_QOS_MAIN_SCRIPT"
+    $MULTIWAN_QOS_MAIN_SCRIPT
+    /usr/sbin/multiwan-qos-adaptive
+    /usr/sbin/multiwan-qos-agent-watchdog"
 MULTIWAN_QOS_EXTRA_FILES_BACKEND="" # might be useful in the future?
 
 

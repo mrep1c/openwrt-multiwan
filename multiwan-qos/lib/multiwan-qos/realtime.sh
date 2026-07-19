@@ -2,6 +2,56 @@
 
 # Shared realtime rate and finite-queue calculations.
 
+mw_realtime_resolve_freshness() {
+    local mode="${1:-auto}" custom="$2" legacy="$3" target
+
+    case "$legacy" in
+        ''|*[!0-9]*) legacy=24 ;;
+    esac
+    [ "$legacy" -gt 0 ] 2>/dev/null || legacy=24
+
+    case "$mode" in
+        tight)
+            target=14
+            ;;
+        balanced|auto|'')
+            target=18
+            ;;
+        relaxed)
+            target=22
+            ;;
+        custom)
+            case "$custom" in
+                ''|*[!0-9]*) target="$legacy" ;;
+                *) target="$custom" ;;
+            esac
+            ;;
+        *)
+            target="$legacy"
+            ;;
+    esac
+
+    [ "$target" -gt 0 ] 2>/dev/null || target="$legacy"
+    [ "$target" -gt 0 ] 2>/dev/null || target=18
+    MW_RT_FRESHNESS_MS="$target"
+}
+
+mw_realtime_resolve_packet_size() {
+    local packet_size="$1" mtu="$2"
+
+    case "$packet_size" in
+        ''|*[!0-9]*) packet_size=450 ;;
+    esac
+    case "$mtu" in
+        ''|*[!0-9]*) mtu=1500 ;;
+    esac
+    [ "$mtu" -gt 0 ] 2>/dev/null || mtu=1500
+
+    [ "$packet_size" -gt "$mtu" ] 2>/dev/null && packet_size="$mtu"
+    [ "$packet_size" -lt 64 ] 2>/dev/null && packet_size=64
+    MW_RT_RESOLVED_PACKET_SIZE="$packet_size"
+}
+
 mw_realtime_auto_rate() {
     local line_rate="$1" cap
 

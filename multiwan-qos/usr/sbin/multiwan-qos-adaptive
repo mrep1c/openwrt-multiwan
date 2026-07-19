@@ -34,26 +34,26 @@ read_number() {
         value="$2"
     fi
     case "$value" in ''|*[!0-9]*) value="$2" ;; esac
-    printf '%s' "$value"
+    MW_ADAPTIVE_NUMBER="$value"
 }
 
 read_agent_session_id() {
     local key value session_id=""
 
+    MW_ADAPTIVE_AGENT_SESSION_ID=""
     [ -r "$AGENT_SESSION_FILE" ] || return 0
     while IFS='=' read -r key value; do
         [ "$key" = session_id ] && { session_id="$value"; break; }
     done < "$AGENT_SESSION_FILE"
     [ "${#session_id}" -eq 32 ] 2>/dev/null || return 0
     case "$session_id" in *[!0-9a-f]*) return 0 ;; esac
-    printf '%s' "$session_id"
+    MW_ADAPTIVE_AGENT_SESSION_ID="$session_id"
 }
 
 read_realtime_stats() {
-    local dev="$1" stats
+    local dev="$1"
 
-    stats="$(tc -s class show dev "$dev" classid 1:11 2>/dev/null)" || return 1
-    printf '%s\n' "$stats" | awk '
+    MW_ADAPTIVE_STATS="$(tc -s class show dev "$dev" classid 1:11 2>/dev/null | awk '
         BEGIN {
             if ((getline uptime < "/proc/uptime") > 0) {
                 split(uptime, field, " ")
@@ -82,7 +82,38 @@ read_realtime_stats() {
             else
                 exit 1
         }
-    '
+    ')" || {
+        MW_ADAPTIVE_STATS=""
+        return 1
+    }
+}
+
+record_tc_failure() {
+    local count retry
+
+    read_number "$state_dir/tc_failures" 0
+    count=$((MW_ADAPTIVE_NUMBER + 1))
+    case "$count" in
+        1) retry=1 ;;
+        2) retry=2 ;;
+        3) retry=4 ;;
+        *) retry=5 ;;
+    esac
+    tc_failures="$count"
+    tc_retry_after="$retry"
+    printf '%s\n' "$count" > "$state_dir/tc_failures"
+    printf '%s\n' "$retry" > "$state_dir/tc_retry_after"
+    case "$count" in
+        1|5|12|24|36) log "ERROR: adaptive $direction tc update failed on $dev; retrying with bounded backoff" ;;
+    esac
+}
+
+clear_tc_failure() {
+    [ "${tc_failures:-0}" -eq 0 ] && [ "${tc_retry_after:-0}" -eq 0 ] && return 0
+    tc_failures=0
+    tc_retry_after=0
+    printf '0\n' > "$state_dir/tc_failures"
+    printf '0\n' > "$state_dir/tc_retry_after"
 }
 
 change_class() {
@@ -106,8 +137,10 @@ apply_rate() {
 profile_params() {
     local rate="$1" mtu="$2" packet_size realtime_target_ms
 
-    realtime_target_ms="$(realtime_freshness_target_ms "$FRESHNESS_MODE" "$FRESHNESS_TARGET_MS" "$MAXDEL")"
-    packet_size="$(realtime_packet_size_bytes "$PACKETSIZE" "$mtu")"
+    mw_realtime_resolve_freshness "$FRESHNESS_MODE" "$FRESHNESS_TARGET_MS" "$MAXDEL"
+    realtime_target_ms="$MW_RT_FRESHNESS_MS"
+    mw_realtime_resolve_packet_size "$PACKETSIZE" "$mtu"
+    packet_size="$MW_RT_RESOLVED_PACKET_SIZE"
     mw_realtime_queue_budget "$rate" "$realtime_target_ms" "$mtu" "$packet_size" "$PFIFOMIN"
     case "$ADAPTIVE_PROFILE_MODE" in
         bfifo) ADAPTIVE_PROFILE_LIMIT="$MW_RT_QUEUE_BYTES" ;;
@@ -145,12 +178,14 @@ write_status() {
     local state_dir="$1" direction="$2" dev="$3" current="$4" shaper="$5"
     local state="$6" peak="$7" desired="$8" backlog="$9" drop_delta="${10}"
     local priority_mode=adaptive scheduler_rate="$current"
-    printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s recommended_rate=%s queue_budget_rate=%s profile_mode=%s profile_rate=%s profile_limit=%s profile_drop_streak=%s profile_state=%s session_source=%s floor=%s start=%s ceiling=%s poll_interval=%ss demand_window=%ss reserve=%skbit peak=%s desired=%s backlog=%s drop_delta=%s state=%s\n' \
+    printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s recommended_rate=%s queue_budget_rate=%s profile_mode=%s profile_rate=%s profile_limit=%s profile_drop_streak=%s profile_state=%s session_source=%s floor=%s start=%s ceiling=%s poll_interval=%ss demand_window=%ss reserve=%skbit peak=%s desired=%s backlog=%s drop_delta=%s stats_last_ok_ms=%s stats_failures=%s stats_retry=%s tc_failures=%s tc_retry=%s state=%s\n' \
         "$priority_mode" "$direction" "$dev" "$scheduler_rate" "$desired" "${ADAPTIVE_PROFILE_RATE:-$MW_RT_START}" \
         "${ADAPTIVE_PROFILE_MODE:-static}" "${ADAPTIVE_PROFILE_RATE:-$MW_RT_START}" "${ADAPTIVE_PROFILE_LIMIT:-0}" "${ADAPTIVE_PROFILE_DROP_STREAK:-0}" "${ADAPTIVE_PROFILE_STATE:-tracking}" \
         "${ADAPTIVE_SESSION_SOURCE:-none}" \
         "$MW_RT_FLOOR" "$MW_RT_START" "$MW_RT_CEILING" "$SAMPLE_INTERVAL" "$DEMAND_WINDOW_SAMPLES" \
-        "$TARGET_RESERVE_KBIT" "$peak" "$desired" "$backlog" "$drop_delta" "$state" \
+        "$TARGET_RESERVE_KBIT" "$peak" "$desired" "$backlog" "$drop_delta" \
+        "${ADAPTIVE_STATS_LAST_OK:-0}" "${ADAPTIVE_STATS_FAILURES:-0}" "${ADAPTIVE_STATS_RETRY:-0}" \
+        "${ADAPTIVE_TC_FAILURES:-0}" "${ADAPTIVE_TC_RETRY:-0}" "$state" \
         > "$state_dir/status"
 }
 
@@ -186,8 +221,9 @@ process_direction() {
     local monitor_pid force_start
     local delta_bytes delta_drops sample_rate window_ms peak peak_1 peak_2 peak_3 peak_4 current_peak rolling_peak recent_peak desired down_target demand_input window_complete
     local backlog_samples backlog_free_since lower_since last_decrease last_increase idle_since new_session slow_rate slow_weight last_drop rollback_rate rollback_until drop_step new state rv
-    local mtu profile_rate saved_profile_rate profile_rate_needs_write profile_last_change profile_last_drop profile_drop_streak profile_new profile_state profile_rv
-    local profile_deferred burst_drop rate_apply_ok
+    local mtu profile_rate profile_target_rate saved_profile_rate profile_rate_needs_write profile_last_change profile_last_drop profile_drop_streak profile_new profile_state profile_rv
+    local profile_deferred burst_drop rate_apply_ok profile_pending
+    local stats_last_ok stats_failures stats_retry_after tc_failures tc_retry_after tc_backoff startup_state
     local agent_session_id saved_agent_session_id agent_session_changed
 
     [ -d "/sys/class/net/$dev" ] || return 0
@@ -209,14 +245,15 @@ process_direction() {
             ADAPTIVE_PROFILE_RATE="$MW_RT_START"
             ;;
     esac
-    mtu="$(cat "/sys/class/net/$dev/mtu" 2>/dev/null)"
+    mtu=""
+    [ ! -r "/sys/class/net/$dev/mtu" ] || IFS= read -r mtu < "/sys/class/net/$dev/mtu"
     case "$mtu" in ''|*[!0-9]*) mtu=1500 ;; esac
-    profile_params "$ADAPTIVE_PROFILE_RATE" "$mtu"
     ADAPTIVE_PROFILE_STATE=tracking
     ADAPTIVE_SESSION_SOURCE=none
-    agent_session_id="$(read_agent_session_id)"
+    agent_session_id="$MW_ADAPTIVE_AGENT_SESSION_ID"
 
-    monitor_pid="$(read_number "$state_dir/monitor_pid" 0)"
+    read_number "$state_dir/monitor_pid" 0
+    monitor_pid="$MW_ADAPTIVE_NUMBER"
     force_start=0
     [ "$monitor_pid" -eq "$$" ] || force_start=1
 
@@ -270,55 +307,174 @@ process_direction() {
     else
         profile_rate="$MW_RT_START"
     fi
+    profile_target_rate="$profile_rate"
+    if [ "$ADAPTIVE_PROFILE_MODE" != static ] && [ -r "$state_dir/profile_pending_rate" ]; then
+        IFS= read -r saved_profile_rate < "$state_dir/profile_pending_rate"
+        case "$saved_profile_rate" in
+            ''|*[!0-9]*) rm -f "$state_dir/profile_pending_rate" ;;
+            *) profile_target_rate="$saved_profile_rate"; profile_rate_needs_write=1 ;;
+        esac
+    fi
+    if [ "$ADAPTIVE_PROFILE_MODE" != static ]; then
+        if [ "$profile_target_rate" -lt "$MW_RT_PROFILE_FLOOR" ]; then
+            profile_target_rate="$MW_RT_PROFILE_FLOOR"
+        elif [ "$profile_target_rate" -gt "$MW_RT_PROFILE_CEILING" ]; then
+            profile_target_rate="$MW_RT_PROFILE_CEILING"
+        fi
+    fi
     ADAPTIVE_PROFILE_RATE="$profile_rate"
     profile_params "$profile_rate" "$mtu"
-    [ "$profile_rate_needs_write" -eq 0 ] || printf '%s\n' "$profile_rate" > "$state_dir/profile_rate"
 
-    stats="$(read_realtime_stats "$dev")" || return 0
-    set -- $stats
+    read_number "$state_dir/stats_last_ok" 0
+    stats_last_ok="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/stats_failures" 0
+    stats_failures="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/stats_retry_after" 0
+    stats_retry_after="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/tc_failures" 0
+    tc_failures="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/tc_retry_after" 0
+    tc_retry_after="$MW_ADAPTIVE_NUMBER"
+    tc_backoff=0
+    if [ "$tc_retry_after" -gt 0 ]; then
+        tc_retry_after=$((tc_retry_after - 1))
+        printf '%s\n' "$tc_retry_after" > "$state_dir/tc_retry_after"
+        tc_backoff=1
+    fi
+    ADAPTIVE_STATS_LAST_OK="$stats_last_ok"
+    ADAPTIVE_STATS_FAILURES="$stats_failures"
+    ADAPTIVE_STATS_RETRY="$stats_retry_after"
+    ADAPTIVE_TC_FAILURES="$tc_failures"
+    ADAPTIVE_TC_RETRY="$tc_retry_after"
+
+    if [ "$stats_retry_after" -gt 0 ]; then
+        stats_retry_after=$((stats_retry_after - 1))
+        printf '%s\n' "$stats_retry_after" > "$state_dir/stats_retry_after"
+        ADAPTIVE_STATS_RETRY="$stats_retry_after"
+        write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" stats-unavailable 0 "$current" 0 0
+        return 0
+    fi
+
+    if ! read_realtime_stats "$dev"; then
+        stats_failures=$((stats_failures + 1))
+        case "$stats_failures" in
+            1) stats_retry_after=1 ;;
+            2) stats_retry_after=2 ;;
+            3) stats_retry_after=4 ;;
+            *) stats_retry_after=5 ;;
+        esac
+        printf '%s\n' "$stats_failures" > "$state_dir/stats_failures"
+        printf '%s\n' "$stats_retry_after" > "$state_dir/stats_retry_after"
+        ADAPTIVE_STATS_FAILURES="$stats_failures"
+        ADAPTIVE_STATS_RETRY="$stats_retry_after"
+        case "$stats_failures" in
+            1|5|12|24|36) log "ERROR: adaptive $direction statistics unavailable on $dev; retrying with bounded backoff" ;;
+        esac
+        write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" stats-unavailable 0 "$current" 0 0
+        return 0
+    fi
+    set -- $MW_ADAPTIVE_STATS
     bytes="$1"; drops="$2"; backlog="$3"; now="$4"
+    stats_last_ok="$now"
+    stats_failures=0
+    stats_retry_after=0
+    printf '%s\n' "$stats_last_ok" > "$state_dir/stats_last_ok"
+    printf '0\n' > "$state_dir/stats_failures"
+    printf '0\n' > "$state_dir/stats_retry_after"
+    ADAPTIVE_STATS_LAST_OK="$stats_last_ok"
+    ADAPTIVE_STATS_FAILURES=0
+    ADAPTIVE_STATS_RETRY=0
+
+    if [ "$tc_backoff" -eq 1 ]; then
+        ADAPTIVE_TC_FAILURES="$tc_failures"
+        ADAPTIVE_TC_RETRY="$tc_retry_after"
+        write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" tc-backoff 0 "$current" "$backlog" 0
+        return 0
+    fi
 
     if [ "$force_start" -eq 1 ]; then
         profile_rv=0
         if [ "$ADAPTIVE_PROFILE_MODE" != static ]; then
-            apply_profile "$dev" "$profile_rate" "$mtu"
+            apply_profile "$dev" "$profile_target_rate" "$mtu"
             profile_rv=$?
             if [ "$profile_rv" -eq 2 ]; then
                 ADAPTIVE_PROFILE_STATE=lock-busy
+                record_tc_failure
             elif [ "$profile_rv" -ne 0 ]; then
                 ADAPTIVE_PROFILE_STATE=degraded
-                log "ERROR: adaptive $direction $ADAPTIVE_PROFILE_MODE profile update failed on $dev; preserving the existing leaf qdisc"
+                record_tc_failure
             fi
         fi
         apply_rate "$dev" "$current" "$shaper" "$MW_RT_START"
         rv=$?
         if [ "$rv" -eq 2 ]; then
+            record_tc_failure
             write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" lock-busy 0 "$current" "$backlog" 0
             return 0
         elif [ "$rv" -ne 0 ]; then
+            record_tc_failure
             printf '%s\n' "failed to initialize $dev at ${current}kbit" > "$state_dir/error"
-            log "ERROR: adaptive $direction startup initialization failed on $dev; preserving the existing qdisc"
+            ADAPTIVE_TC_FAILURES="$tc_failures"
+            ADAPTIVE_TC_RETRY="$tc_retry_after"
             write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" degraded 0 "$current" "$backlog" 0
             return 0
         fi
         printf '%s\n' "$$" > "$state_dir/monitor_pid"
         printf '%s\n' "$current" > "$state_dir/rate"
         if [ "$ADAPTIVE_PROFILE_MODE" != static ] && [ "$profile_rv" -eq 0 ]; then
+            profile_rate="$profile_target_rate"
             printf '%s\n' "$profile_rate" > "$state_dir/profile_rate"
+            rm -f "$state_dir/profile_pending_rate"
             printf '%s\n' "$now" > "$state_dir/profile_last_change"
             printf '%s\n' "$now" > "$state_dir/profile_last_drop"
             printf '0\n' > "$state_dir/profile_drop_streak"
+            clear_tc_failure
+            ADAPTIVE_TC_FAILURES=0
+            ADAPTIVE_TC_RETRY=0
+        elif [ "$ADAPTIVE_PROFILE_MODE" = static ]; then
+            clear_tc_failure
+            ADAPTIVE_TC_FAILURES=0
+            ADAPTIVE_TC_RETRY=0
         fi
-        rm -f "$state_dir/error"
+        if [ "$profile_rv" -ne 0 ]; then
+            printf '%s\n' "failed to initialize $dev ${ADAPTIVE_PROFILE_MODE} profile" > "$state_dir/error"
+            startup_state=profile-degraded
+        else
+            rm -f "$state_dir/error"
+            startup_state=initializing
+        fi
         reset_sample_state "$state_dir" "$bytes" "$drops" "$now" "$current"
         [ -z "$agent_session_id" ] || printf '%s\n' "$agent_session_id" > "$state_dir/agent_session_id"
-        write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" initializing 0 "$current" "$backlog" 0
+        ADAPTIVE_TC_FAILURES="$tc_failures"
+        ADAPTIVE_TC_RETRY="$tc_retry_after"
+        write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" "$startup_state" 0 "$current" "$backlog" 0
         return 0
     fi
 
-    previous_bytes="$(read_number "$state_dir/bytes" 0)"
-    previous_drops="$(read_number "$state_dir/drops" 0)"
-    previous_ms="$(read_number "$state_dir/sample_ms" 0)"
+    profile_pending=0
+    if [ "$ADAPTIVE_PROFILE_MODE" != static ] && [ "$profile_rate_needs_write" -eq 1 ]; then
+        apply_profile "$dev" "$profile_target_rate" "$mtu"
+        profile_rv=$?
+        if [ "$profile_rv" -eq 0 ]; then
+            profile_rate="$profile_target_rate"
+            profile_rate_needs_write=0
+            rm -f "$state_dir/profile_pending_rate"
+            clear_tc_failure
+            rm -f "$state_dir/error"
+        else
+            profile_pending=1
+            ADAPTIVE_PROFILE_STATE=degraded
+            record_tc_failure
+            printf '%s\n' "$profile_target_rate" > "$state_dir/profile_pending_rate"
+        fi
+    fi
+
+    read_number "$state_dir/bytes" 0
+    previous_bytes="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/drops" 0
+    previous_drops="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/sample_ms" 0
+    previous_ms="$MW_ADAPTIVE_NUMBER"
     if [ "$previous_ms" -eq 0 ] || [ "$bytes" -lt "$previous_bytes" ] || [ "$drops" -lt "$previous_drops" ]; then
         reset_sample_state "$state_dir" "$bytes" "$drops" "$now" "$current"
         write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" initializing 0 "$current" "$backlog" 0
@@ -339,7 +495,8 @@ process_direction() {
     printf '%s\n' "$drops" > "$state_dir/drops"
     printf '%s\n' "$now" > "$state_dir/sample_ms"
 
-    slow_rate="$(read_number "$state_dir/slow_rate" 0)"
+    read_number "$state_dir/slow_rate" 0
+    slow_rate="$MW_ADAPTIVE_NUMBER"
     if [ "$slow_rate" -le 0 ]; then
         slow_rate="$sample_rate"
     else
@@ -348,7 +505,8 @@ process_direction() {
         slow_rate=$(((slow_rate * (SLOW_DEMAND_WINDOW_MS - slow_weight) + sample_rate * slow_weight + (SLOW_DEMAND_WINDOW_MS / 2)) / SLOW_DEMAND_WINDOW_MS))
     fi
 
-    last_drop="$(read_number "$state_dir/last_drop" 0)"
+    read_number "$state_dir/last_drop" 0
+    last_drop="$MW_ADAPTIVE_NUMBER"
     if [ "$delta_drops" -gt 0 ]; then
         last_drop="$now"
     elif [ "$last_drop" -eq 0 ]; then
@@ -356,7 +514,8 @@ process_direction() {
     fi
     printf '%s\n' "$last_drop" > "$state_dir/last_drop"
 
-    backlog_free_since="$(read_number "$state_dir/backlog_free_since" 0)"
+    read_number "$state_dir/backlog_free_since" 0
+    backlog_free_since="$MW_ADAPTIVE_NUMBER"
     if [ "$backlog" -gt 0 ]; then
         backlog_free_since=0
     elif [ "$backlog_free_since" -eq 0 ]; then
@@ -375,7 +534,8 @@ process_direction() {
         printf '%s\n' "$agent_session_id" > "$state_dir/agent_session_id"
     fi
 
-    idle_since="$(read_number "$state_dir/idle_since" 0)"
+    read_number "$state_dir/idle_since" 0
+    idle_since="$MW_ADAPTIVE_NUMBER"
     new_session=0
     if [ "$agent_session_changed" -eq 1 ]; then
         new_session=1
@@ -393,14 +553,22 @@ process_direction() {
     fi
     printf '%s\n' "$idle_since" > "$state_dir/idle_since"
 
-    window_ms="$(read_number "$state_dir/window_ms" "$now")"
-    peak="$(read_number "$state_dir/peak" 0)"
-    peak_1="$(read_number "$state_dir/peak_1" 0)"
-    peak_2="$(read_number "$state_dir/peak_2" 0)"
-    peak_3="$(read_number "$state_dir/peak_3" 0)"
-    peak_4="$(read_number "$state_dir/peak_4" 0)"
-    rolling_peak="$(read_number "$state_dir/rolling_peak" 0)"
-    desired="$(read_number "$state_dir/desired" "$current")"
+    read_number "$state_dir/window_ms" "$now"
+    window_ms="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/peak" 0
+    peak="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/peak_1" 0
+    peak_1="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/peak_2" 0
+    peak_2="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/peak_3" 0
+    peak_3="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/peak_4" 0
+    peak_4="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/rolling_peak" 0
+    rolling_peak="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/desired" "$current"
+    desired="$MW_ADAPTIVE_NUMBER"
     window_complete=0
     if [ $((now - window_ms)) -ge 1000 ]; then
         current_peak="$peak"
@@ -456,9 +624,12 @@ process_direction() {
         window_complete=0
     fi
 
-    profile_last_change="$(read_number "$state_dir/profile_last_change" "$now")"
-    profile_last_drop="$(read_number "$state_dir/profile_last_drop" "$now")"
-    profile_drop_streak="$(read_number "$state_dir/profile_drop_streak" 0)"
+    read_number "$state_dir/profile_last_change" "$now"
+    profile_last_change="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/profile_last_drop" "$now"
+    profile_last_drop="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/profile_drop_streak" 0
+    profile_drop_streak="$MW_ADAPTIVE_NUMBER"
     profile_new="$profile_rate"
     profile_state=tracking
     burst_drop=0
@@ -500,7 +671,8 @@ process_direction() {
     printf '%s\n' "$rolling_peak" > "$state_dir/rolling_peak"
     printf '%s\n' "$desired" > "$state_dir/desired"
 
-    backlog_samples="$(read_number "$state_dir/backlog_samples" 0)"
+    read_number "$state_dir/backlog_samples" 0
+    backlog_samples="$MW_ADAPTIVE_NUMBER"
     if [ "$backlog" -gt 0 ]; then
         backlog_samples=$((backlog_samples + 1))
     else
@@ -508,11 +680,16 @@ process_direction() {
     fi
     printf '%s\n' "$backlog_samples" > "$state_dir/backlog_samples"
 
-    lower_since="$(read_number "$state_dir/lower_since" 0)"
-    last_decrease="$(read_number "$state_dir/last_decrease" 0)"
-    last_increase="$(read_number "$state_dir/last_increase" 0)"
-    rollback_rate="$(read_number "$state_dir/rollback_rate" 0)"
-    rollback_until="$(read_number "$state_dir/rollback_until" 0)"
+    read_number "$state_dir/lower_since" 0
+    lower_since="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/last_decrease" 0
+    last_decrease="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/last_increase" 0
+    last_increase="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/rollback_rate" 0
+    rollback_rate="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/rollback_until" 0
+    rollback_until="$MW_ADAPTIVE_NUMBER"
     if [ "$rollback_until" -gt 0 ] && [ "$now" -gt "$rollback_until" ]; then
         rollback_rate=0
         rollback_until=0
@@ -606,33 +783,46 @@ process_direction() {
 
     profile_deferred=0
     rate_apply_ok=1
-    if [ "$profile_new" -gt "$profile_rate" ]; then
+    if [ "$profile_pending" -eq 1 ]; then
+        rate_apply_ok=0
+        state=profile-degraded
+    elif [ "$profile_new" -gt "$profile_rate" ]; then
         apply_profile "$dev" "$profile_new" "$mtu"
         profile_rv=$?
         if [ "$profile_rv" -eq 0 ]; then
             profile_rate="$profile_new"
             profile_last_change="$now"
             ADAPTIVE_PROFILE_STATE="$profile_state"
+            rm -f "$state_dir/profile_pending_rate"
             log "Adjusted $direction realtime $ADAPTIVE_PROFILE_MODE profile on $dev: ${ADAPTIVE_PROFILE_RATE}kbit -> ${profile_rate}kbit"
         elif [ "$profile_rv" -eq 2 ]; then
             ADAPTIVE_PROFILE_STATE=lock-busy
+            rate_apply_ok=0
+            profile_pending=1
+            printf '%s\n' "$profile_new" > "$state_dir/profile_pending_rate"
+            record_tc_failure
         else
             ADAPTIVE_PROFILE_STATE=degraded
-            log "ERROR: adaptive $direction $ADAPTIVE_PROFILE_MODE profile update failed on $dev; preserving ${profile_rate}kbit"
+            rate_apply_ok=0
+            profile_pending=1
+            printf '%s\n' "$profile_new" > "$state_dir/profile_pending_rate"
+            record_tc_failure
         fi
     elif [ "$profile_new" -lt "$profile_rate" ]; then
         profile_deferred=1
     fi
 
-    if [ "$new" -ne "$current" ]; then
+    if [ "$new" -ne "$current" ] && [ "$rate_apply_ok" -eq 1 ]; then
         apply_rate "$dev" "$new" "$shaper" "$MW_RT_START"
         rv=$?
         if [ "$rv" -eq 2 ]; then
             state=lock-busy
             new="$current"
+            rate_apply_ok=0
+            record_tc_failure
         elif [ "$rv" -ne 0 ]; then
             printf '%s\n' "failed to change $dev from ${current}kbit to ${new}kbit" > "$state_dir/error"
-            log "ERROR: adaptive $direction class update failed on $dev; preserving ${current}kbit and the existing leaf qdisc"
+            record_tc_failure
             state=degraded
             new="$current"
             rate_apply_ok=0
@@ -647,6 +837,7 @@ process_direction() {
                 printf '0\n' > "$state_dir/rollback_until"
             fi
             log "Adjusted $direction realtime HFSC rate on $dev: ${current}kbit -> ${new}kbit"
+            clear_tc_failure
         fi
     fi
 
@@ -657,12 +848,18 @@ process_direction() {
             profile_rate="$profile_new"
             profile_last_change="$now"
             ADAPTIVE_PROFILE_STATE="$profile_state"
+            rm -f "$state_dir/profile_pending_rate"
             log "Adjusted $direction realtime $ADAPTIVE_PROFILE_MODE profile on $dev: ${ADAPTIVE_PROFILE_RATE}kbit -> ${profile_rate}kbit"
         elif [ "$profile_rv" -eq 2 ]; then
             ADAPTIVE_PROFILE_STATE=lock-busy
+            profile_pending=1
+            printf '%s\n' "$profile_new" > "$state_dir/profile_pending_rate"
+            record_tc_failure
         else
             ADAPTIVE_PROFILE_STATE=degraded
-            log "ERROR: adaptive $direction $ADAPTIVE_PROFILE_MODE profile update failed on $dev; preserving ${profile_rate}kbit"
+            profile_pending=1
+            printf '%s\n' "$profile_new" > "$state_dir/profile_pending_rate"
+            record_tc_failure
         fi
     fi
 
@@ -676,6 +873,8 @@ process_direction() {
     fi
 
     ADAPTIVE_PROFILE_DROP_STREAK="$profile_drop_streak"
+    ADAPTIVE_TC_FAILURES="$tc_failures"
+    ADAPTIVE_TC_RETRY="$tc_retry_after"
     write_status "$state_dir" "$direction" "$dev" "$new" "$shaper" "$state" "$rolling_peak" "$desired" "$backlog" "$delta_drops"
 }
 
@@ -713,6 +912,7 @@ config_get PACKETSIZE hfsc PACKETSIZE 450
 
 while true; do
     [ -f "$RESTARTING" ] && exit 0
+    read_agent_session_id
     config_foreach process_interface interface
     sleep "$SAMPLE_INTERVAL"
 done

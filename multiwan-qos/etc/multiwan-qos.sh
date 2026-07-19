@@ -1689,56 +1689,6 @@ attach_classful_game_child_qdisc() {
     esac
 }
 
-realtime_freshness_target_ms() {
-    local mode="${1:-auto}" custom="$2" legacy="$3" target
-
-    case "$legacy" in
-        ''|*[!0-9]*) legacy=24 ;;
-    esac
-    [ "$legacy" -gt 0 ] 2>/dev/null || legacy=24
-
-    case "$mode" in
-        tight)
-            target=14
-            ;;
-        balanced|auto|'')
-            target=18
-            ;;
-        relaxed)
-            target=22
-            ;;
-        custom)
-            case "$custom" in
-                ''|*[!0-9]*) target="$legacy" ;;
-                *) target="$custom" ;;
-            esac
-            ;;
-        *)
-            target="$legacy"
-            ;;
-    esac
-
-    [ "$target" -gt 0 ] 2>/dev/null || target="$legacy"
-    [ "$target" -gt 0 ] 2>/dev/null || target=18
-    printf '%s' "$target"
-}
-
-realtime_packet_size_bytes() {
-    local packet_size="$1" mtu="$2"
-
-    case "$packet_size" in
-        ''|*[!0-9]*) packet_size=450 ;;
-    esac
-    case "$mtu" in
-        ''|*[!0-9]*) mtu=1500 ;;
-    esac
-    [ "$mtu" -gt 0 ] 2>/dev/null || mtu=1500
-
-    [ "$packet_size" -gt "$mtu" ] 2>/dev/null && packet_size="$mtu"
-    [ "$packet_size" -lt 64 ] 2>/dev/null && packet_size=64
-    printf '%s' "$packet_size"
-}
-
 # Function to setup the specific game qdisc (pfifo, red, fq_codel, netem, etc.)
 # Arguments: $1:DEV, $2:RATE, $3:GAMERATE, $4:QDISC_TYPE, $5:DIR, $6:MTU, ... HFSC params ... $17: FIFO profile rate
 setup_game_qdisc() {
@@ -1759,8 +1709,10 @@ setup_game_qdisc() {
     [ "$PFIFOMIN" -lt 0 ] && PFIFOMIN=5
 
     local realtime_target_ms
-    realtime_target_ms="$(realtime_freshness_target_ms "$FRESHNESS_MODE" "$FRESHNESS_TARGET_MS" "$MAXDEL")"
-    PACKETSIZE="$(realtime_packet_size_bytes "$PACKETSIZE" "$MTU")"
+    mw_realtime_resolve_freshness "$FRESHNESS_MODE" "$FRESHNESS_TARGET_MS" "$MAXDEL"
+    realtime_target_ms="$MW_RT_FRESHNESS_MS"
+    mw_realtime_resolve_packet_size "$PACKETSIZE" "$MTU"
+    PACKETSIZE="$MW_RT_RESOLVED_PACKET_SIZE"
 
     # Adaptive FIFO leaves use a separate burst profile. Other leaves retain
     # their existing rate-derived parameters and are adjusted only by their

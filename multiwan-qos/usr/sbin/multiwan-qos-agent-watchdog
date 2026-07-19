@@ -18,13 +18,14 @@ read_timestamp() {
     [ -r "$TIMESTAMP_FILE" ] || return 1
     IFS= read -r value < "$TIMESTAMP_FILE" || return 1
     case "$value" in ''|*[!0-9]*) return 1 ;; esac
-    printf '%s' "$value"
+    MW_AGENT_TIMESTAMP="$value"
 }
 
 expire_stale_rules() {
     local timeout="$1" timestamp now age lock_token
 
-    timestamp="$(read_timestamp)" || return 0
+    read_timestamp || return 0
+    timestamp="$MW_AGENT_TIMESTAMP"
     now="$(date +%s)"
     age=$((now - timestamp))
     [ "$age" -gt "$timeout" ] || return 0
@@ -32,10 +33,11 @@ expire_stale_rules() {
     mw_lock_acquire "$LOCK_DIR" || return 0
     lock_token="$MW_LOCK_TOKEN"
 
-    timestamp="$(read_timestamp)" || {
+    read_timestamp || {
         mw_lock_release "$LOCK_DIR" "$lock_token"
         return 0
     }
+    timestamp="$MW_AGENT_TIMESTAMP"
     now="$(date +%s)"
     age=$((now - timestamp))
     if [ "$age" -gt "$timeout" ]; then

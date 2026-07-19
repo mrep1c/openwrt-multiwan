@@ -68,6 +68,8 @@ define Package/multiwan-qos/install
 			etc/multiwan-qos.d/multiwan-qos-defaults \
 			lib/multiwan-qos/hotplug-common.sh \
 			lib/multiwan-qos/process-lock.sh \
+			lib/multiwan-qos/realtime.sh \
+			usr/sbin/multiwan-qos-adaptive \
 			usr/sbin/multiwan-qos-agent-watchdog \
 			usr/lib/tc/experimental.dist \
 			usr/lib/tc/normal.dist \
