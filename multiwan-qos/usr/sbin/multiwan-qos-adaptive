@@ -7,6 +7,7 @@
 STATE_ROOT=/var/run/multiwan-qos/adaptive
 LOCK_DIR=/var/run/multiwan_qos-refresh.lock
 RESTARTING=/tmp/multiwan_qos_restarting
+AGENT_SESSION_FILE=/var/run/multiwan-qos/agent-session
 SAMPLE_INTERVAL=1
 DEMAND_WINDOW_SAMPLES=3
 TARGET_RESERVE_KBIT=200
@@ -34,6 +35,18 @@ read_number() {
     fi
     case "$value" in ''|*[!0-9]*) value="$2" ;; esac
     printf '%s' "$value"
+}
+
+read_agent_session_id() {
+    local key value session_id=""
+
+    [ -r "$AGENT_SESSION_FILE" ] || return 0
+    while IFS='=' read -r key value; do
+        [ "$key" = session_id ] && { session_id="$value"; break; }
+    done < "$AGENT_SESSION_FILE"
+    [ "${#session_id}" -eq 32 ] 2>/dev/null || return 0
+    case "$session_id" in *[!0-9a-f]*) return 0 ;; esac
+    printf '%s' "$session_id"
 }
 
 read_realtime_stats() {
@@ -132,9 +145,10 @@ write_status() {
     local state_dir="$1" direction="$2" dev="$3" current="$4" shaper="$5"
     local state="$6" peak="$7" desired="$8" backlog="$9" drop_delta="${10}"
     local priority_mode=adaptive scheduler_rate="$current"
-    printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s recommended_rate=%s queue_budget_rate=%s profile_mode=%s profile_rate=%s profile_limit=%s profile_drop_streak=%s profile_state=%s floor=%s start=%s ceiling=%s poll_interval=%ss demand_window=%ss reserve=%skbit peak=%s desired=%s backlog=%s drop_delta=%s state=%s\n' \
+    printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s recommended_rate=%s queue_budget_rate=%s profile_mode=%s profile_rate=%s profile_limit=%s profile_drop_streak=%s profile_state=%s session_source=%s floor=%s start=%s ceiling=%s poll_interval=%ss demand_window=%ss reserve=%skbit peak=%s desired=%s backlog=%s drop_delta=%s state=%s\n' \
         "$priority_mode" "$direction" "$dev" "$scheduler_rate" "$desired" "${ADAPTIVE_PROFILE_RATE:-$MW_RT_START}" \
         "${ADAPTIVE_PROFILE_MODE:-static}" "${ADAPTIVE_PROFILE_RATE:-$MW_RT_START}" "${ADAPTIVE_PROFILE_LIMIT:-0}" "${ADAPTIVE_PROFILE_DROP_STREAK:-0}" "${ADAPTIVE_PROFILE_STATE:-tracking}" \
+        "${ADAPTIVE_SESSION_SOURCE:-none}" \
         "$MW_RT_FLOOR" "$MW_RT_START" "$MW_RT_CEILING" "$SAMPLE_INTERVAL" "$DEMAND_WINDOW_SAMPLES" \
         "$TARGET_RESERVE_KBIT" "$peak" "$desired" "$backlog" "$drop_delta" "$state" \
         > "$state_dir/status"
@@ -174,6 +188,7 @@ process_direction() {
     local backlog_samples backlog_free_samples lower_since last_decrease last_increase idle_samples new_session slow_rate last_drop rollback_rate rollback_until drop_step new state rv
     local mtu profile_rate saved_profile_rate profile_rate_needs_write profile_last_change profile_last_drop profile_drop_streak profile_new profile_state profile_rv
     local profile_deferred burst_drop rate_apply_ok
+    local agent_session_id saved_agent_session_id agent_session_changed
 
     [ -d "/sys/class/net/$dev" ] || return 0
     key="${dev}-${direction}"
@@ -198,6 +213,8 @@ process_direction() {
     case "$mtu" in ''|*[!0-9]*) mtu=1500 ;; esac
     profile_params "$ADAPTIVE_PROFILE_RATE" "$mtu"
     ADAPTIVE_PROFILE_STATE=tracking
+    ADAPTIVE_SESSION_SOURCE=none
+    agent_session_id="$(read_agent_session_id)"
 
     monitor_pid="$(read_number "$state_dir/monitor_pid" 0)"
     force_start=0
@@ -294,6 +311,7 @@ process_direction() {
         fi
         rm -f "$state_dir/error"
         reset_sample_state "$state_dir" "$bytes" "$drops" "$now" "$current"
+        [ -z "$agent_session_id" ] || printf '%s\n' "$agent_session_id" > "$state_dir/agent_session_id"
         write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" initializing 0 "$current" "$backlog" 0
         return 0
     fi
@@ -344,10 +362,28 @@ process_direction() {
     fi
     printf '%s\n' "$backlog_free_samples" > "$state_dir/backlog_free_samples"
 
+    saved_agent_session_id=""
+    if [ -r "$state_dir/agent_session_id" ]; then
+        IFS= read -r saved_agent_session_id < "$state_dir/agent_session_id"
+    fi
+    agent_session_changed=0
+    if [ -n "$agent_session_id" ] && [ "$agent_session_id" != "$saved_agent_session_id" ] &&
+        { [ "$delta_bytes" -gt 0 ] || [ "$backlog" -gt 0 ]; }; then
+        agent_session_changed=1
+        printf '%s\n' "$agent_session_id" > "$state_dir/agent_session_id"
+    fi
+
     idle_samples="$(read_number "$state_dir/idle_samples" 0)"
     new_session=0
+    if [ "$agent_session_changed" -eq 1 ]; then
+        new_session=1
+        ADAPTIVE_SESSION_SOURCE=agent-flow
+    fi
     if [ "$delta_bytes" -gt 0 ] || [ "$backlog" -gt 0 ]; then
-        [ "$idle_samples" -ge "$SESSION_IDLE_SAMPLES" ] && new_session=1
+        if [ "$new_session" -eq 0 ] && [ "$idle_samples" -ge "$SESSION_IDLE_SAMPLES" ]; then
+            new_session=1
+            ADAPTIVE_SESSION_SOURCE=idle
+        fi
         idle_samples=0
     else
         idle_samples=$((idle_samples + 1))

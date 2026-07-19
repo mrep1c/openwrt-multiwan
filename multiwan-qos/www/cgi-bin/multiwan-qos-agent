@@ -16,6 +16,7 @@ local jsonc = require "luci.jsonc"
 local TIMESTAMP_FILE = "/tmp/multiwan_qos_agent_last_seen"
 local RATE_LIMIT_FILE = "/tmp/multiwan_qos_agent_rate_limit"
 local STATE_FILE = "/tmp/multiwan_qos_agent_state.json"
+local SESSION_EVENT_FILE = "/var/run/multiwan-qos/agent-session"
 local RESTARTING_FILE = "/tmp/multiwan_qos_restarting"
 local NFT_TABLE = "inet dscptag"
 local NFT_CHAIN = "multiwan_qos_agent"
@@ -24,7 +25,7 @@ local LOCK_DIR = "/tmp/multiwan_qos_agent.lock"
 local LOCK_HELPER = "/lib/multiwan-qos/process-lock.sh"
 local MIN_REQUEST_INTERVAL_SEC = 1  -- minimum seconds between requests
 local DEFAULT_DSCP = 46
-local AGENT_ENDPOINT_VERSION = 4
+local AGENT_ENDPOINT_VERSION = 5
 local lock_token = nil
 local lock_owned = false
 local response_sent = false
@@ -231,6 +232,27 @@ local function write_agent_state(state)
     return true
 end
 
+local function write_session_event(session_id, pc_ip)
+    if not command_ok("mkdir -p /var/run/multiwan-qos") then
+        return false
+    end
+
+    local tmp_file = SESSION_EVENT_FILE .. ".tmp"
+    local f = io.open(tmp_file, "w")
+    if not f then
+        return false
+    end
+    f:write("session_id=", session_id, "\n")
+    f:write("pc_ip=", pc_ip, "\n")
+    f:write("updated_at=", tostring(os.time()), "\n")
+    f:close()
+    if not os.rename(tmp_file, SESSION_EVENT_FILE) then
+        os.remove(tmp_file)
+        return false
+    end
+    return true
+end
+
 local function read_agent_state()
     local f = io.open(STATE_FILE, "r")
     if not f then
@@ -325,6 +347,13 @@ local function validate_game_name(name)
     -- Allow alphanumeric, spaces, hyphens, underscores, colons, dots (max 64 chars)
     if #name > 64 or #name < 1 then return false end
     return name:match("^[%w%s%-_:%.]+$") ~= nil
+end
+
+local function validate_session_id(session_id)
+    if type(session_id) ~= "string" or #session_id ~= 32 then
+        return false
+    end
+    return session_id:match("^[0-9a-f]+$") ~= nil
 end
 
 local function conntrack_paths()
@@ -1004,6 +1033,15 @@ local function main()
             return
         end
 
+        local session_id = nil
+        if data.session_id ~= nil then
+            session_id = tostring(data.session_id):lower()
+            if not validate_session_id(session_id) then
+                send_response(400, "Invalid session_id")
+                return
+            end
+        end
+
         -- Validate connections array
         if not data.connections or type(data.connections) ~= "table" then
             send_response(400, "Missing connections array")
@@ -1033,13 +1071,24 @@ local function main()
             return
         end
         cleanup_stale_rules()
+        local previous_state = read_agent_state()
+        local previous_session_id = type(previous_state) == "table" and previous_state.session_id or nil
+        local session_changed = session_id ~= nil and previous_session_id ~= session_id
         local rules_added, err, verification, rules_meta, ignored_connections, conntrack_resolved, conntrack_unmatched, rules_reused =
             apply_connection_rules(data.pc_ip, data.connections, dscp_class, dscp_value)
         touch_last_seen()
         local state_written = false
         local cleared_after_failure = false
+        local session_event_written = not session_changed
         if rules_added and verification and verification.ok then
             if rules_added > 0 then
+                if session_changed then
+                    session_event_written = write_session_event(session_id, data.pc_ip)
+                end
+                local state_session_id = session_id
+                if session_changed and not session_event_written then
+                    state_session_id = previous_session_id
+                end
                 state_written = write_agent_state({
                     endpoint_version = AGENT_ENDPOINT_VERSION,
                     updated_at = os.time(),
@@ -1057,6 +1106,7 @@ local function main()
                     conntrack_resolved = conntrack_resolved or 0,
                     conntrack_unmatched = conntrack_unmatched or 0,
                     rules_reused = rules_reused and true or false,
+                    session_id = state_session_id,
                     rule_shape = "dscp_only"
                 })
             else
@@ -1070,6 +1120,10 @@ local function main()
         release_lock()
         if not rules_added then
             send_response(500, err or "Failed to apply rules")
+            return
+        end
+        if session_changed and not session_event_written then
+            send_response(500, "Failed to publish agent session transition")
             return
         end
 
@@ -1093,6 +1147,8 @@ local function main()
             verification_status = verification and verification.status or "not_run",
             ignored_connections = ignored_connections or 0,
             rules_reused = rules_reused and true or false,
+            session_changed = session_changed and true or false,
+            session_event_written = session_event_written,
             state_written = state_written,
             cleared_after_failure = cleared_after_failure
         }
