@@ -31,6 +31,26 @@ mw_realtime_adaptive_range() {
     [ "$MW_RT_CEILING" -lt "$MW_RT_START" ] && MW_RT_CEILING="$MW_RT_START"
 }
 
+mw_realtime_adaptive_profile_range() {
+    local line_rate="$1" cap
+
+    case "$line_rate" in ''|*[!0-9]*) line_rate=1 ;; esac
+    [ "$line_rate" -gt 0 ] 2>/dev/null || line_rate=1
+    cap=$((line_rate * 25 / 100))
+    [ "$cap" -lt 1 ] && cap=1
+
+    MW_RT_PROFILE_FLOOR=1500
+    [ "$MW_RT_PROFILE_FLOOR" -gt "$cap" ] && MW_RT_PROFILE_FLOOR="$cap"
+    MW_RT_PROFILE_START=1500
+    [ "$MW_RT_PROFILE_START" -gt "$cap" ] && MW_RT_PROFILE_START="$cap"
+    [ "$MW_RT_PROFILE_START" -lt "$MW_RT_PROFILE_FLOOR" ] &&
+        MW_RT_PROFILE_START="$MW_RT_PROFILE_FLOOR"
+    MW_RT_PROFILE_CEILING=2000
+    [ "$MW_RT_PROFILE_CEILING" -gt "$cap" ] && MW_RT_PROFILE_CEILING="$cap"
+    [ "$MW_RT_PROFILE_CEILING" -lt "$MW_RT_PROFILE_START" ] &&
+        MW_RT_PROFILE_CEILING="$MW_RT_PROFILE_START"
+}
+
 mw_realtime_queue_budget() {
     local rate="$1" freshness="$2" mtu="$3" packet_size="$4" pfifo_min="$5"
     case "$rate" in ''|*[!0-9]*) rate=1 ;; esac

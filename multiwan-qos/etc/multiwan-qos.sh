@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC3043,SC1091,SC2155,SC3020,SC3010,SC2016,SC2317,SC3060,SC3057,SC3003
 
-VERSION="1.0.38"  # Official OpenWrt package version
+VERSION="1.0.39" # will become obsolete in future releases as version string is now in the init script
 
 # uncomment to enable debug messages
 # MULTIWAN_QOS_DEBUG=1
@@ -1740,12 +1740,13 @@ realtime_packet_size_bytes() {
 }
 
 # Function to setup the specific game qdisc (pfifo, red, fq_codel, netem, etc.)
-# Arguments: $1:DEV, $2:RATE, $3:GAMERATE, $4:QDISC_TYPE, $5:DIR, $6:MTU, ... HFSC params ...
+# Arguments: $1:DEV, $2:RATE, $3:GAMERATE, $4:QDISC_TYPE, $5:DIR, $6:MTU, ... HFSC params ... $17: FIFO profile rate
 setup_game_qdisc() {
     local DEV="$1" RATE="$2" GAMERATE="$3" QDISC_TYPE="$4" DIR="$5" MTU="$6"
     local MAXDEL="$7" PFIFOMIN="$8" PACKETSIZE="$9"
     local FRESHNESS_MODE="${10:-auto}" FRESHNESS_TARGET_MS="${11:-18}"
     local netemdelayms="${12}" netemjitterms="${13}" netemdist="${14}" NETEM_DIRECTION="${15}" pktlossp="${16}"
+    local queue_budget_rate="${17:-$GAMERATE}"
 
     # Ensure numeric inputs are non-zero to avoid errors in calculations.
     case "$RATE" in ''|*[!0-9]*) RATE=1 ;; esac
@@ -1761,7 +1762,14 @@ setup_game_qdisc() {
     realtime_target_ms="$(realtime_freshness_target_ms "$FRESHNESS_MODE" "$FRESHNESS_TARGET_MS" "$MAXDEL")"
     PACKETSIZE="$(realtime_packet_size_bytes "$PACKETSIZE" "$MTU")"
 
-    mw_realtime_queue_budget "$GAMERATE" "$realtime_target_ms" "$MTU" "$PACKETSIZE" "$PFIFOMIN"
+    # Adaptive FIFO leaves use a separate burst profile. Other leaves retain
+    # their existing rate-derived parameters and are adjusted only by their
+    # own qdisc semantics.
+    local budget_rate="$GAMERATE"
+    case "$QDISC_TYPE" in
+        bfifo|pfifo) budget_rate="$queue_budget_rate" ;;
+    esac
+    mw_realtime_queue_budget "$budget_rate" "$realtime_target_ms" "$MTU" "$PACKETSIZE" "$PFIFOMIN"
     local target_bytes="$MW_RT_DELAY_BYTES" burst_floor_bytes="$MW_RT_BURST_FLOOR"
     local bfifo_limit="$MW_RT_QUEUE_BYTES" pfifo_limit="$MW_RT_PFIFO_LIMIT"
     local netem_limit="$MW_RT_NETEM_LIMIT"
@@ -1769,7 +1777,7 @@ setup_game_qdisc() {
     local REDLIMIT="$MW_RT_RED_LIMIT" BURST="$MW_RT_RED_BURST"
     PACKETSIZE="$MW_RT_PACKET_SIZE"
 
-    print_msg "    Realtime queue: rate=${GAMERATE}kbit freshness=${realtime_target_ms}ms delay=${target_bytes}B burst-floor=${burst_floor_bytes}B limit=${bfifo_limit}B"
+    print_msg "    Realtime queue: rate=${GAMERATE}kbit profile=${budget_rate}kbit freshness=${realtime_target_ms}ms delay=${target_bytes}B burst-floor=${burst_floor_bytes}B limit=${bfifo_limit}B"
 
     # Game FQ_CODEL is intentionally fixed and independent of the realtime rate.
     local INTVL=100 TARG=5
@@ -1868,6 +1876,12 @@ setup_hfsc() {
     local DEV="$1" RATE="$2" GAMERATE="$3" GAME_QDISC_TYPE="$4" DIR="$5" PRESET="$6" OVERHEAD="$7"
     local MTU="${8:-1500}"
     local MPU="$9"
+    local queue_budget_rate="$GAMERATE"
+
+    if [ "$realtime_rate_mode" = adaptive ]; then
+        mw_realtime_adaptive_profile_range "$RATE"
+        queue_budget_rate="$MW_RT_PROFILE_START"
+    fi
 
     tc qdisc del dev "$DEV" root > /dev/null 2>&1
 
@@ -1910,7 +1924,8 @@ setup_hfsc() {
     setup_game_qdisc "$DEV" "$RATE" "$GAMERATE" "$GAME_QDISC_TYPE" "$DIR" \
                      "$MTU" "$MAXDEL" "$PFIFOMIN" "$PACKETSIZE" \
                      "$freshness_mode" "$freshness_target_ms" \
-                     "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp" ||
+                     "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp" \
+                     "$queue_budget_rate" ||
         qdisc_setup_failed "Failed to set up $GAME_QDISC_TYPE game qdisc on $DEV."
 
     # Attach non-game qdiscs
@@ -2111,6 +2126,12 @@ setup_hybrid() {
     local DEV="$1" RATE="$2" GAMERATE="$3" DIR="$4" PRESET="$5" OVERHEAD="$6" MPU="$7"
     local MTU="${8:-1500}"
     local SHAPER_RATE=$((RATE * 98 / 100)); [ "$SHAPER_RATE" -le 0 ] && SHAPER_RATE=1
+    local queue_budget_rate="$GAMERATE"
+
+    if [ "$realtime_rate_mode" = adaptive ]; then
+        mw_realtime_adaptive_profile_range "$RATE"
+        queue_budget_rate="$MW_RT_PROFILE_START"
+    fi
 
     [ "$GAMERATE" -lt "$SHAPER_RATE" ] 2>/dev/null ||
         qdisc_setup_failed "Hybrid realtime rate ${GAMERATE}kbit must be lower than the ${SHAPER_RATE}kbit shaped rate on $DEV."
@@ -2159,7 +2180,8 @@ setup_hybrid() {
     setup_game_qdisc "$DEV" "$RATE" "$GAMERATE" "$gameqdisc" "$DIR" \
                      "$MTU" "$MAXDEL" "$PFIFOMIN" "$PACKETSIZE" \
                      "$freshness_mode" "$freshness_target_ms" \
-                     "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp" ||
+                     "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp" \
+                     "$queue_budget_rate" ||
         qdisc_setup_failed "Failed to set up $gameqdisc game qdisc on $DEV."
 
     # Class 1:13 - CAKE class (most traffic - default). These rates are the
