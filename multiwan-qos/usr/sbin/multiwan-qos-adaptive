@@ -10,8 +10,8 @@ RESTARTING=/tmp/multiwan_qos_restarting
 AGENT_SESSION_FILE=/var/run/multiwan-qos/agent-session
 SAMPLE_INTERVAL=1
 IDLE_POLL_INTERVAL=5
-IDLE_POLL_AFTER_MS=15000
-ACTIVE_HOLD_MS=20000
+SESSION_GRACE_MS=20000
+IDLE_POLL_AFTER_MS="$SESSION_GRACE_MS"
 DEMAND_WINDOW_SAMPLES=3
 TARGET_RESERVE_KBIT=200
 DROP_INCREASE_KBIT=150
@@ -22,7 +22,7 @@ DECREASE_INTERVAL_MS=10000
 DECREASE_REARM_MS=15000
 DECREASE_BACKLOG_FREE_MS=5000
 SLOW_DEMAND_WINDOW_MS=30000
-SESSION_IDLE_MS=10000
+SESSION_IDLE_MS="$SESSION_GRACE_MS"
 
 log() { logger -t multiwan-qos-adaptive -- "$*"; }
 
@@ -114,6 +114,8 @@ record_tc_failure() {
     esac
     tc_failures="$count"
     tc_retry_after="$retry"
+    ADAPTIVE_TC_FAILURES="$count"
+    ADAPTIVE_TC_RETRY="$retry"
     printf '%s\n' "$count" > "$state_dir/tc_failures"
     printf '%s\n' "$retry" > "$state_dir/tc_retry_after"
     case "$count" in
@@ -125,6 +127,8 @@ clear_tc_failure() {
     [ "${tc_failures:-0}" -eq 0 ] && [ "${tc_retry_after:-0}" -eq 0 ] && return 0
     tc_failures=0
     tc_retry_after=0
+    ADAPTIVE_TC_FAILURES=0
+    ADAPTIVE_TC_RETRY=0
     printf '0\n' > "$state_dir/tc_failures"
     printf '0\n' > "$state_dir/tc_retry_after"
 }
@@ -166,11 +170,11 @@ write_status() {
     local state_dir="$1" direction="$2" dev="$3" current="$4" shaper="$5"
     local state="$6" peak="$7" desired="$8" backlog="$9" drop_delta="${10}"
     local priority_mode=adaptive scheduler_rate="$current"
-    printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s recommended_rate=%s queue_budget_rate=%s profile_mode=%s profile_rate=%s profile_limit=%s profile_drop_streak=%s profile_state=%s session_source=%s activity=%s activity_source=%s idle_rate=%skbit activity_grace=%ss floor=%s start=%s ceiling=%s poll_interval=%ss idle_poll_interval=%ss poll_state=%s demand_window=%ss reserve=%skbit peak=%s desired=%s backlog=%s drop_delta=%s stats_last_ok_ms=%s stats_failures=%s stats_retry=%s tc_failures=%s tc_retry=%s state=%s\n' \
+    printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s recommended_rate=%s queue_budget_rate=%s profile_mode=%s profile_rate=%s profile_limit=%s profile_drop_streak=%s profile_state=%s session_source=%s session_state=%s session_grace=%ss session_pending=%s activity=%s activity_source=%s idle_rate=%skbit floor=%s start=%s ceiling=%s poll_interval=%ss idle_poll_interval=%ss poll_state=%s demand_window=%ss reserve=%skbit peak=%s desired=%s backlog=%s drop_delta=%s stats_last_ok_ms=%s stats_failures=%s stats_retry=%s tc_failures=%s tc_retry=%s state=%s\n' \
         "$priority_mode" "$direction" "$dev" "$scheduler_rate" "$desired" "${ADAPTIVE_PROFILE_RATE:-$MW_RT_START}" \
         "${ADAPTIVE_LEAF_MODE:-static}" "${ADAPTIVE_PROFILE_RATE:-$MW_RT_START}" "${ADAPTIVE_PROFILE_LIMIT:-0}" "${ADAPTIVE_PROFILE_DROP_STREAK:-0}" "${ADAPTIVE_PROFILE_STATE:-fixed}" \
-        "${ADAPTIVE_SESSION_SOURCE:-none}" \
-        "${ADAPTIVE_ACTIVITY_STATE:-idle}" "${ADAPTIVE_ACTIVITY_SOURCE:-none}" "$MW_RT_START" "$((ACTIVE_HOLD_MS / 1000))" \
+        "${ADAPTIVE_SESSION_SOURCE:-none}" "${ADAPTIVE_SESSION_STATE:-idle}" "$((SESSION_GRACE_MS / 1000))" "${ADAPTIVE_SESSION_PENDING:-0}" \
+        "${ADAPTIVE_ACTIVITY_STATE:-idle}" "${ADAPTIVE_ACTIVITY_SOURCE:-none}" "$MW_RT_START" \
         "$MW_RT_FLOOR" "$MW_RT_START" "$MW_RT_CEILING" "$SAMPLE_INTERVAL" "$IDLE_POLL_INTERVAL" "${ADAPTIVE_POLL_STATE:-active}" "$DEMAND_WINDOW_SAMPLES" \
         "$TARGET_RESERVE_KBIT" "$peak" "$desired" "$backlog" "$drop_delta" \
         "${ADAPTIVE_STATS_LAST_OK:-0}" "${ADAPTIVE_STATS_FAILURES:-0}" "${ADAPTIVE_STATS_RETRY:-0}" \
@@ -203,6 +207,7 @@ reset_sample_state() {
     printf '0\n' > "$state_dir/peak_4"
     printf '0\n' > "$state_dir/rollback_rate"
     printf '0\n' > "$state_dir/rollback_until"
+    rm -f "$state_dir/agent_session_pending"
 }
 
 process_direction() {
@@ -213,8 +218,8 @@ process_direction() {
     local backlog_samples backlog_free_since lower_since last_decrease last_increase idle_since new_session slow_rate slow_weight last_drop rollback_rate rollback_until drop_step new state rv
     local mtu profile_rate
     local stats_last_ok stats_failures stats_retry_after tc_failures tc_retry_after tc_backoff startup_state
-    local agent_session_id saved_agent_session_id agent_session_changed next_sample_ms
-    local last_activity_ms realtime_active activity_source
+    local agent_session_id saved_agent_session_id agent_session_changed agent_session_pending next_sample_ms
+    local last_activity_ms traffic_active session_active activity_source session_state
 
     [ -d "/sys/class/net/$dev" ] || return 0
     key="${dev}-${direction}"
@@ -256,6 +261,8 @@ process_direction() {
     ADAPTIVE_PROFILE_STATE=fixed
     ADAPTIVE_PROFILE_DROP_STREAK=0
     ADAPTIVE_SESSION_SOURCE=none
+    ADAPTIVE_SESSION_STATE=idle
+    ADAPTIVE_SESSION_PENDING=0
     ADAPTIVE_ACTIVITY_STATE=idle
     ADAPTIVE_ACTIVITY_SOURCE=none
 
@@ -395,9 +402,31 @@ process_direction() {
     previous_drops="$MW_ADAPTIVE_NUMBER"
     read_number "$state_dir/sample_ms" 0
     previous_ms="$MW_ADAPTIVE_NUMBER"
-    if [ "$previous_ms" -eq 0 ] || [ "$bytes" -lt "$previous_bytes" ] || [ "$drops" -lt "$previous_drops" ]; then
+    if [ "$previous_ms" -eq 0 ]; then
         reset_sample_state "$state_dir" "$bytes" "$drops" "$now" "$current"
         write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" initializing 0 "$current" "$backlog" 0
+        return 0
+    fi
+    if [ "$bytes" -lt "$previous_bytes" ] || [ "$drops" -lt "$previous_drops" ]; then
+        apply_rate "$dev" "$MW_RT_START" "$shaper" "$MW_RT_START"
+        rv=$?
+        if [ "$rv" -eq 2 ]; then
+            record_tc_failure
+            write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" counter-reset-lock-busy 0 "$MW_RT_START" "$backlog" 0
+            return 0
+        elif [ "$rv" -ne 0 ]; then
+            printf '%s\n' "failed to restore $dev to ${MW_RT_START}kbit after qdisc counters reset" > "$state_dir/error"
+            record_tc_failure
+            write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" counter-reset-degraded 0 "$MW_RT_START" "$backlog" 0
+            return 0
+        fi
+        current="$MW_RT_START"
+        printf '%s\n' "$current" > "$state_dir/rate"
+        rm -f "$state_dir/error"
+        clear_tc_failure
+        reset_sample_state "$state_dir" "$bytes" "$drops" "$now" "$current"
+        log "Resynchronized $direction realtime HFSC rate on $dev after qdisc counters reset"
+        write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" counter-reset 0 "$current" "$backlog" 0
         return 0
     fi
 
@@ -405,11 +434,6 @@ process_direction() {
     [ "$elapsed" -gt 0 ] || return 0
     delta_bytes=$((bytes - previous_bytes))
     delta_drops=$((drops - previous_drops))
-    if [ "$bytes" -lt "$previous_bytes" ] || [ "$drops" -lt "$previous_drops" ]; then
-        reset_sample_state "$state_dir" "$bytes" "$drops" "$now" "$current"
-        write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" counter-reset 0 "$current" 0 0
-        return 0
-    fi
     sample_rate=$((delta_bytes * 8 / elapsed))
     printf '%s\n' "$bytes" > "$state_dir/bytes"
     printf '%s\n' "$drops" > "$state_dir/drops"
@@ -443,15 +467,34 @@ process_direction() {
     fi
     printf '%s\n' "$backlog_free_since" > "$state_dir/backlog_free_since"
 
+    traffic_active=0
+    if [ "$delta_bytes" -gt 0 ] || [ "$backlog" -gt 0 ] || [ "$delta_drops" -gt 0 ]; then
+        traffic_active=1
+    fi
+
     saved_agent_session_id=""
     if [ -r "$state_dir/agent_session_id" ]; then
         IFS= read -r saved_agent_session_id < "$state_dir/agent_session_id"
     fi
+    read_number "$state_dir/agent_session_pending" 0
+    agent_session_pending="$MW_ADAPTIVE_NUMBER"
+    ADAPTIVE_SESSION_PENDING="$agent_session_pending"
     agent_session_changed=0
-    if [ -n "$agent_session_id" ] && [ "$agent_session_id" != "$saved_agent_session_id" ] &&
-        { [ "$delta_bytes" -gt 0 ] || [ "$backlog" -gt 0 ]; }; then
-        agent_session_changed=1
+    if [ -z "$agent_session_id" ]; then
+        agent_session_pending=0
+        ADAPTIVE_SESSION_PENDING=0
+        rm -f "$state_dir/agent_session_pending"
+    elif [ "$agent_session_id" != "$saved_agent_session_id" ]; then
         printf '%s\n' "$agent_session_id" > "$state_dir/agent_session_id"
+        printf '1\n' > "$state_dir/agent_session_pending"
+        agent_session_pending=1
+        ADAPTIVE_SESSION_PENDING=1
+    fi
+    if [ "$traffic_active" -eq 1 ] && [ "$agent_session_pending" -eq 1 ]; then
+        agent_session_changed=1
+        agent_session_pending=0
+        ADAPTIVE_SESSION_PENDING=0
+        rm -f "$state_dir/agent_session_pending"
     fi
 
     read_number "$state_dir/idle_since" 0
@@ -461,8 +504,7 @@ process_direction() {
         new_session=1
         ADAPTIVE_SESSION_SOURCE=agent-flow
     fi
-    if [ -n "$agent_session_id" ] || [ "$delta_bytes" -gt 0 ] ||
-        [ "$backlog" -gt 0 ] || [ "$delta_drops" -gt 0 ]; then
+    if [ "$traffic_active" -eq 1 ]; then
         if [ "$new_session" -eq 0 ] && [ "$idle_since" -gt 0 ] &&
             [ $((now - idle_since)) -ge "$SESSION_IDLE_MS" ]; then
             new_session=1
@@ -470,7 +512,9 @@ process_direction() {
         fi
         idle_since=0
     elif [ "$idle_since" -eq 0 ]; then
-        idle_since="$now"
+        # A zero delta covers the interval since the previous sample, so use
+        # that boundary rather than adding a one-sample delay to idle timers.
+        idle_since="$previous_ms"
     fi
     printf '%s\n' "$idle_since" > "$state_dir/idle_since"
     if [ "$idle_since" -gt 0 ] && [ $((now - idle_since)) -ge "$IDLE_POLL_AFTER_MS" ]; then
@@ -482,31 +526,36 @@ process_direction() {
         ADAPTIVE_POLL_STATE=active
     fi
 
+    # Session continuity and current traffic are deliberately separate. Grace
+    # may identify the same flow, but only observed traffic may drive the rate.
     read_number "$state_dir/last_activity_ms" 0
     last_activity_ms="$MW_ADAPTIVE_NUMBER"
-    realtime_active=0
+    session_active=0
     activity_source=none
-    if [ "$delta_bytes" -gt 0 ] || [ "$backlog" -gt 0 ] || [ "$delta_drops" -gt 0 ]; then
+    session_state=idle
+    if [ "$traffic_active" -eq 1 ]; then
         last_activity_ms="$now"
-        realtime_active=1
+        session_active=1
         activity_source=traffic
+        session_state=active
     elif [ "$last_activity_ms" -gt 0 ] &&
-        [ $((now - last_activity_ms)) -lt "$ACTIVE_HOLD_MS" ]; then
-        realtime_active=1
-        activity_source=grace
+        [ $((now - last_activity_ms)) -lt "$SESSION_GRACE_MS" ]; then
+        session_active=1
+        session_state=grace
     fi
     printf '%s\n' "$last_activity_ms" > "$state_dir/last_activity_ms"
-    if [ "$realtime_active" -eq 1 ]; then
+    if [ "$traffic_active" -eq 1 ]; then
         ADAPTIVE_ACTIVITY_STATE=active
         ADAPTIVE_ACTIVITY_SOURCE="$activity_source"
     else
         ADAPTIVE_ACTIVITY_STATE=idle
         ADAPTIVE_ACTIVITY_SOURCE=none
     fi
+    ADAPTIVE_SESSION_STATE="$session_state"
     if [ -n "$agent_session_id" ]; then
         ADAPTIVE_SESSION_SOURCE=agent-flow
-    elif [ "$realtime_active" -eq 1 ]; then
-        ADAPTIVE_SESSION_SOURCE="$activity_source"
+    elif [ "$session_active" -eq 1 ]; then
+        ADAPTIVE_SESSION_SOURCE="$session_state"
     fi
 
     read_number "$state_dir/window_ms" "$now"
@@ -579,7 +628,7 @@ process_direction() {
         window_ms="$now"
         window_complete=0
     fi
-    if [ "$realtime_active" -eq 0 ]; then
+    if [ "$traffic_active" -eq 0 ]; then
         desired="$MW_RT_START"
         down_target="$MW_RT_START"
     fi
@@ -644,7 +693,7 @@ process_direction() {
         rollback_until=0
         printf '0\n' > "$state_dir/rollback_rate"
         printf '0\n' > "$state_dir/rollback_until"
-    elif [ "$realtime_active" -eq 0 ] && [ "$current" -ne "$MW_RT_START" ]; then
+    elif [ "$traffic_active" -eq 0 ]; then
         new="$MW_RT_START"
         lower_since=0
         [ "$new" -gt "$current" ] && last_increase="$now"
@@ -652,7 +701,11 @@ process_direction() {
         rollback_until=0
         printf '0\n' > "$state_dir/rollback_rate"
         printf '0\n' > "$state_dir/rollback_until"
-        state=idle-baseline
+        if [ "$new" -ne "$current" ]; then
+            state=idle-baseline
+        else
+            state=idle
+        fi
     elif [ "$rollback_rate" -gt "$current" ] && [ "$rollback_until" -ge "$now" ] &&
         { [ "$delta_drops" -gt 0 ] || [ "$backlog" -gt 0 ]; }; then
         new="$rollback_rate"
