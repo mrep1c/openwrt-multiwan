@@ -1714,9 +1714,8 @@ setup_game_qdisc() {
     mw_realtime_resolve_packet_size "$PACKETSIZE" "$MTU"
     PACKETSIZE="$MW_RT_RESOLVED_PACKET_SIZE"
 
-    # Adaptive FIFO leaves use a separate burst profile. Other leaves retain
-    # their existing rate-derived parameters and are adjusted only by their
-    # own qdisc semantics.
+    # Adaptive FIFO leaves use a fixed 1000 kbit profile. The monitor adjusts
+    # only the HFSC class, so the selected leaf and its queue stay intact.
     local budget_rate="$GAMERATE"
     case "$QDISC_TYPE" in
         bfifo|pfifo) budget_rate="$queue_budget_rate" ;;

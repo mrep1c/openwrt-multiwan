@@ -89,16 +89,12 @@ mw_realtime_adaptive_profile_range() {
     cap=$((line_rate * 25 / 100))
     [ "$cap" -lt 1 ] && cap=1
 
-    MW_RT_PROFILE_FLOOR=1500
-    [ "$MW_RT_PROFILE_FLOOR" -gt "$cap" ] && MW_RT_PROFILE_FLOOR="$cap"
-    MW_RT_PROFILE_START=1500
+    # Adaptive changes only the HFSC service rate. Keep finite game leaves at
+    # the known-good 1000 kbit profile so their freshness budget is stable.
+    MW_RT_PROFILE_START=1000
     [ "$MW_RT_PROFILE_START" -gt "$cap" ] && MW_RT_PROFILE_START="$cap"
-    [ "$MW_RT_PROFILE_START" -lt "$MW_RT_PROFILE_FLOOR" ] &&
-        MW_RT_PROFILE_START="$MW_RT_PROFILE_FLOOR"
-    MW_RT_PROFILE_CEILING=2000
-    [ "$MW_RT_PROFILE_CEILING" -gt "$cap" ] && MW_RT_PROFILE_CEILING="$cap"
-    [ "$MW_RT_PROFILE_CEILING" -lt "$MW_RT_PROFILE_START" ] &&
-        MW_RT_PROFILE_CEILING="$MW_RT_PROFILE_START"
+    MW_RT_PROFILE_FLOOR="$MW_RT_PROFILE_START"
+    MW_RT_PROFILE_CEILING="$MW_RT_PROFILE_START"
 }
 
 mw_realtime_queue_budget() {

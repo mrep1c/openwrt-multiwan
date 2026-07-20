@@ -9,13 +9,13 @@ LOCK_DIR=/var/run/multiwan_qos-refresh.lock
 RESTARTING=/tmp/multiwan_qos_restarting
 AGENT_SESSION_FILE=/var/run/multiwan-qos/agent-session
 SAMPLE_INTERVAL=1
+IDLE_POLL_INTERVAL=5
+IDLE_POLL_AFTER_MS=15000
+ACTIVE_HOLD_MS=20000
 DEMAND_WINDOW_SAMPLES=3
 TARGET_RESERVE_KBIT=200
 DROP_INCREASE_KBIT=150
 BACKLOG_INCREASE_KBIT=100
-PROFILE_STEP_RATE=250
-PROFILE_DECREASE_INTERVAL_MS=60000
-PROFILE_DROP_CONFIRM_SAMPLES=3
 DECREASE_CONFIRM_MS=5000
 DECREASE_DROP_FREE_MS=30000
 DECREASE_INTERVAL_MS=10000
@@ -50,42 +50,55 @@ read_agent_session_id() {
     MW_ADAPTIVE_AGENT_SESSION_ID="$session_id"
 }
 
-read_realtime_stats() {
-    local dev="$1"
+read_monotonic_ms() {
+    local uptime seconds fraction d1 d2 d3
 
-    MW_ADAPTIVE_STATS="$(tc -s class show dev "$dev" classid 1:11 2>/dev/null | awk '
-        BEGIN {
-            if ((getline uptime < "/proc/uptime") > 0) {
-                split(uptime, field, " ")
-                now = int((field[1] * 1000) + 0.5)
-            }
-            close("/proc/uptime")
-        }
-        / Sent / && bytes == "" {
-            bytes = $2
-            for (i = 1; i <= NF; i++) {
-                key = $i
-                gsub(/[(),]/, "", key)
-                if (key == "dropped") {
-                    drops = $(i + 1)
-                    gsub(/[(),]/, "", drops)
-                }
-            }
-        }
-        /backlog/ && backlog == "" {
-            backlog = $3
-            sub(/p$/, "", backlog)
-        }
-        END {
-            if (bytes ~ /^[0-9]+$/ && drops ~ /^[0-9]+$/ && backlog ~ /^[0-9]+$/ && now > 0)
-                printf "%s %s %s %s\n", bytes, drops, backlog, now
-            else
-                exit 1
-        }
-    ')" || {
+    IFS=' ' read -r uptime _ < /proc/uptime || return 1
+    seconds="${uptime%%.*}"
+    fraction="${uptime#*.}"
+    [ "$fraction" != "$uptime" ] || fraction=0
+    case "$seconds:$fraction" in *[!0-9:]*) return 1 ;; esac
+
+    fraction="${fraction}000"
+    d1="${fraction%${fraction#?}}"
+    fraction="${fraction#?}"
+    d2="${fraction%${fraction#?}}"
+    fraction="${fraction#?}"
+    d3="${fraction%${fraction#?}}"
+    MW_ADAPTIVE_LOOP_NOW_MS=$((seconds * 1000 + d1 * 100 + d2 * 10 + d3))
+}
+
+read_realtime_stats() {
+    local dev="$1" output line bytes="" drops="" backlog="" tail
+
+    output="$(tc -s class show dev "$dev" classid 1:11 2>/dev/null)" || {
         MW_ADAPTIVE_STATS=""
         return 1
     }
+    while IFS= read -r line; do
+        set -- $line
+        case "$1" in
+            Sent)
+                bytes="$2"
+                tail="${line#*dropped }"
+                [ "$tail" != "$line" ] && drops="${tail%%,*}"
+                ;;
+            backlog)
+                backlog="${3%p}"
+                ;;
+        esac
+    done <<EOF
+$output
+EOF
+    [ -n "$bytes" ] && [ -n "$drops" ] && [ -n "$backlog" ] || {
+        MW_ADAPTIVE_STATS=""
+        return 1
+    }
+    case "$bytes:$drops:$backlog:$MW_ADAPTIVE_LOOP_NOW_MS" in
+        *[!0-9:]*) MW_ADAPTIVE_STATS=""; return 1 ;;
+    esac
+    [ "$MW_ADAPTIVE_LOOP_NOW_MS" -gt 0 ] || return 1
+    MW_ADAPTIVE_STATS="$bytes $drops $backlog $MW_ADAPTIVE_LOOP_NOW_MS"
 }
 
 record_tc_failure() {
@@ -142,47 +155,23 @@ profile_params() {
     mw_realtime_resolve_packet_size "$PACKETSIZE" "$mtu"
     packet_size="$MW_RT_RESOLVED_PACKET_SIZE"
     mw_realtime_queue_budget "$rate" "$realtime_target_ms" "$mtu" "$packet_size" "$PFIFOMIN"
-    case "$ADAPTIVE_PROFILE_MODE" in
+    case "${ADAPTIVE_LEAF_MODE:-$GAME_QDISC}" in
         bfifo) ADAPTIVE_PROFILE_LIMIT="$MW_RT_QUEUE_BYTES" ;;
         pfifo) ADAPTIVE_PROFILE_LIMIT="$MW_RT_PFIFO_LIMIT" ;;
         *) ADAPTIVE_PROFILE_LIMIT=0 ;;
     esac
 }
 
-apply_profile() {
-    local dev="$1" rate="$2" mtu="$3" rv
-
-    case "$ADAPTIVE_PROFILE_MODE" in
-        bfifo|pfifo) ;;
-        *) return 0 ;;
-    esac
-    profile_params "$rate" "$mtu"
-    mw_lock_acquire "$LOCK_DIR" || return 2
-    case "$ADAPTIVE_PROFILE_MODE" in
-        bfifo)
-            tc qdisc change dev "$dev" parent 1:11 handle 10: bfifo \
-                limit "$ADAPTIVE_PROFILE_LIMIT"
-            rv=$?
-            ;;
-        pfifo)
-            tc qdisc change dev "$dev" parent 1:11 handle 10: pfifo \
-                limit "$ADAPTIVE_PROFILE_LIMIT"
-            rv=$?
-            ;;
-    esac
-    mw_lock_release_for "$LOCK_DIR" "$MW_LOCK_TOKEN"
-    return "$rv"
-}
-
 write_status() {
     local state_dir="$1" direction="$2" dev="$3" current="$4" shaper="$5"
     local state="$6" peak="$7" desired="$8" backlog="$9" drop_delta="${10}"
     local priority_mode=adaptive scheduler_rate="$current"
-    printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s recommended_rate=%s queue_budget_rate=%s profile_mode=%s profile_rate=%s profile_limit=%s profile_drop_streak=%s profile_state=%s session_source=%s floor=%s start=%s ceiling=%s poll_interval=%ss demand_window=%ss reserve=%skbit peak=%s desired=%s backlog=%s drop_delta=%s stats_last_ok_ms=%s stats_failures=%s stats_retry=%s tc_failures=%s tc_retry=%s state=%s\n' \
+    printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s recommended_rate=%s queue_budget_rate=%s profile_mode=%s profile_rate=%s profile_limit=%s profile_drop_streak=%s profile_state=%s session_source=%s activity=%s activity_source=%s idle_rate=%skbit activity_grace=%ss floor=%s start=%s ceiling=%s poll_interval=%ss idle_poll_interval=%ss poll_state=%s demand_window=%ss reserve=%skbit peak=%s desired=%s backlog=%s drop_delta=%s stats_last_ok_ms=%s stats_failures=%s stats_retry=%s tc_failures=%s tc_retry=%s state=%s\n' \
         "$priority_mode" "$direction" "$dev" "$scheduler_rate" "$desired" "${ADAPTIVE_PROFILE_RATE:-$MW_RT_START}" \
-        "${ADAPTIVE_PROFILE_MODE:-static}" "${ADAPTIVE_PROFILE_RATE:-$MW_RT_START}" "${ADAPTIVE_PROFILE_LIMIT:-0}" "${ADAPTIVE_PROFILE_DROP_STREAK:-0}" "${ADAPTIVE_PROFILE_STATE:-tracking}" \
+        "${ADAPTIVE_LEAF_MODE:-static}" "${ADAPTIVE_PROFILE_RATE:-$MW_RT_START}" "${ADAPTIVE_PROFILE_LIMIT:-0}" "${ADAPTIVE_PROFILE_DROP_STREAK:-0}" "${ADAPTIVE_PROFILE_STATE:-fixed}" \
         "${ADAPTIVE_SESSION_SOURCE:-none}" \
-        "$MW_RT_FLOOR" "$MW_RT_START" "$MW_RT_CEILING" "$SAMPLE_INTERVAL" "$DEMAND_WINDOW_SAMPLES" \
+        "${ADAPTIVE_ACTIVITY_STATE:-idle}" "${ADAPTIVE_ACTIVITY_SOURCE:-none}" "$MW_RT_START" "$((ACTIVE_HOLD_MS / 1000))" \
+        "$MW_RT_FLOOR" "$MW_RT_START" "$MW_RT_CEILING" "$SAMPLE_INTERVAL" "$IDLE_POLL_INTERVAL" "${ADAPTIVE_POLL_STATE:-active}" "$DEMAND_WINDOW_SAMPLES" \
         "$TARGET_RESERVE_KBIT" "$peak" "$desired" "$backlog" "$drop_delta" \
         "${ADAPTIVE_STATS_LAST_OK:-0}" "${ADAPTIVE_STATS_FAILURES:-0}" "${ADAPTIVE_STATS_RETRY:-0}" \
         "${ADAPTIVE_TC_FAILURES:-0}" "${ADAPTIVE_TC_RETRY:-0}" "$state" \
@@ -206,6 +195,7 @@ reset_sample_state() {
     printf '0\n' > "$state_dir/last_decrease"
     printf '0\n' > "$state_dir/last_increase"
     printf '0\n' > "$state_dir/idle_since"
+    printf '0\n' > "$state_dir/last_activity_ms"
     printf '0\n' > "$state_dir/slow_rate"
     printf '0\n' > "$state_dir/last_drop"
     printf '0\n' > "$state_dir/backlog_free_since"
@@ -221,10 +211,10 @@ process_direction() {
     local monitor_pid force_start
     local delta_bytes delta_drops sample_rate window_ms peak peak_1 peak_2 peak_3 peak_4 current_peak rolling_peak recent_peak desired down_target demand_input window_complete
     local backlog_samples backlog_free_since lower_since last_decrease last_increase idle_since new_session slow_rate slow_weight last_drop rollback_rate rollback_until drop_step new state rv
-    local mtu profile_rate profile_target_rate saved_profile_rate profile_rate_needs_write profile_last_change profile_last_drop profile_drop_streak profile_new profile_state profile_rv
-    local profile_deferred burst_drop rate_apply_ok profile_pending
+    local mtu profile_rate
     local stats_last_ok stats_failures stats_retry_after tc_failures tc_retry_after tc_backoff startup_state
-    local agent_session_id saved_agent_session_id agent_session_changed
+    local agent_session_id saved_agent_session_id agent_session_changed next_sample_ms
+    local last_activity_ms realtime_active activity_source
 
     [ -d "/sys/class/net/$dev" ] || return 0
     key="${dev}-${direction}"
@@ -233,24 +223,41 @@ process_direction() {
     esac
     state_dir="$STATE_ROOT/$key"
     [ -d "$state_dir" ] || mkdir -p "$state_dir"
+    now="$MW_ADAPTIVE_LOOP_NOW_MS"
+    agent_session_id="$MW_ADAPTIVE_AGENT_SESSION_ID"
+    ADAPTIVE_POLL_STATE=active
+
+    if [ -r "$state_dir/next_sample_ms" ]; then
+        read_number "$state_dir/next_sample_ms" 0
+        next_sample_ms="$MW_ADAPTIVE_NUMBER"
+        saved_agent_session_id=""
+        [ ! -r "$state_dir/agent_session_id" ] || IFS= read -r saved_agent_session_id < "$state_dir/agent_session_id"
+        if [ "$next_sample_ms" -gt "$now" ] &&
+            { [ -z "$agent_session_id" ] || [ "$agent_session_id" = "$saved_agent_session_id" ]; }; then
+            return 0
+        fi
+        rm -f "$state_dir/next_sample_ms"
+    fi
 
     mw_realtime_adaptive_profile_range "$line_rate"
     case "$GAME_QDISC" in
         bfifo|pfifo)
-            ADAPTIVE_PROFILE_MODE="$GAME_QDISC"
+            ADAPTIVE_LEAF_MODE="$GAME_QDISC"
             ADAPTIVE_PROFILE_RATE="$MW_RT_PROFILE_START"
             ;;
         *)
-            ADAPTIVE_PROFILE_MODE=static
+            ADAPTIVE_LEAF_MODE="$GAME_QDISC"
             ADAPTIVE_PROFILE_RATE="$MW_RT_START"
             ;;
     esac
     mtu=""
     [ ! -r "/sys/class/net/$dev/mtu" ] || IFS= read -r mtu < "/sys/class/net/$dev/mtu"
     case "$mtu" in ''|*[!0-9]*) mtu=1500 ;; esac
-    ADAPTIVE_PROFILE_STATE=tracking
+    ADAPTIVE_PROFILE_STATE=fixed
+    ADAPTIVE_PROFILE_DROP_STREAK=0
     ADAPTIVE_SESSION_SOURCE=none
-    agent_session_id="$MW_ADAPTIVE_AGENT_SESSION_ID"
+    ADAPTIVE_ACTIVITY_STATE=idle
+    ADAPTIVE_ACTIVITY_SOURCE=none
 
     read_number "$state_dir/monitor_pid" 0
     monitor_pid="$MW_ADAPTIVE_NUMBER"
@@ -282,46 +289,6 @@ process_direction() {
     [ "$rate_needs_write" -eq 0 ] || printf '%s\n' "$current" > "$state_dir/rate"
 
     profile_rate="$ADAPTIVE_PROFILE_RATE"
-    profile_rate_needs_write=0
-    if [ "$ADAPTIVE_PROFILE_MODE" != static ]; then
-        if [ "$force_start" -eq 1 ]; then
-            profile_rate="$MW_RT_PROFILE_START"
-            profile_rate_needs_write=1
-        elif [ -r "$state_dir/profile_rate" ]; then
-            IFS= read -r saved_profile_rate < "$state_dir/profile_rate"
-            case "$saved_profile_rate" in
-                ''|*[!0-9]*) profile_rate="$MW_RT_PROFILE_START"; profile_rate_needs_write=1 ;;
-                *) profile_rate="$saved_profile_rate" ;;
-            esac
-        else
-            profile_rate="$MW_RT_PROFILE_START"
-            profile_rate_needs_write=1
-        fi
-        if [ "$profile_rate" -lt "$MW_RT_PROFILE_FLOOR" ]; then
-            profile_rate="$MW_RT_PROFILE_FLOOR"
-            profile_rate_needs_write=1
-        elif [ "$profile_rate" -gt "$MW_RT_PROFILE_CEILING" ]; then
-            profile_rate="$MW_RT_PROFILE_CEILING"
-            profile_rate_needs_write=1
-        fi
-    else
-        profile_rate="$MW_RT_START"
-    fi
-    profile_target_rate="$profile_rate"
-    if [ "$ADAPTIVE_PROFILE_MODE" != static ] && [ -r "$state_dir/profile_pending_rate" ]; then
-        IFS= read -r saved_profile_rate < "$state_dir/profile_pending_rate"
-        case "$saved_profile_rate" in
-            ''|*[!0-9]*) rm -f "$state_dir/profile_pending_rate" ;;
-            *) profile_target_rate="$saved_profile_rate"; profile_rate_needs_write=1 ;;
-        esac
-    fi
-    if [ "$ADAPTIVE_PROFILE_MODE" != static ]; then
-        if [ "$profile_target_rate" -lt "$MW_RT_PROFILE_FLOOR" ]; then
-            profile_target_rate="$MW_RT_PROFILE_FLOOR"
-        elif [ "$profile_target_rate" -gt "$MW_RT_PROFILE_CEILING" ]; then
-            profile_target_rate="$MW_RT_PROFILE_CEILING"
-        fi
-    fi
     ADAPTIVE_PROFILE_RATE="$profile_rate"
     profile_params "$profile_rate" "$mtu"
 
@@ -393,18 +360,6 @@ process_direction() {
     fi
 
     if [ "$force_start" -eq 1 ]; then
-        profile_rv=0
-        if [ "$ADAPTIVE_PROFILE_MODE" != static ]; then
-            apply_profile "$dev" "$profile_target_rate" "$mtu"
-            profile_rv=$?
-            if [ "$profile_rv" -eq 2 ]; then
-                ADAPTIVE_PROFILE_STATE=lock-busy
-                record_tc_failure
-            elif [ "$profile_rv" -ne 0 ]; then
-                ADAPTIVE_PROFILE_STATE=degraded
-                record_tc_failure
-            fi
-        fi
         apply_rate "$dev" "$current" "$shaper" "$MW_RT_START"
         rv=$?
         if [ "$rv" -eq 2 ]; then
@@ -421,52 +376,17 @@ process_direction() {
         fi
         printf '%s\n' "$$" > "$state_dir/monitor_pid"
         printf '%s\n' "$current" > "$state_dir/rate"
-        if [ "$ADAPTIVE_PROFILE_MODE" != static ] && [ "$profile_rv" -eq 0 ]; then
-            profile_rate="$profile_target_rate"
-            printf '%s\n' "$profile_rate" > "$state_dir/profile_rate"
-            rm -f "$state_dir/profile_pending_rate"
-            printf '%s\n' "$now" > "$state_dir/profile_last_change"
-            printf '%s\n' "$now" > "$state_dir/profile_last_drop"
-            printf '0\n' > "$state_dir/profile_drop_streak"
-            clear_tc_failure
-            ADAPTIVE_TC_FAILURES=0
-            ADAPTIVE_TC_RETRY=0
-        elif [ "$ADAPTIVE_PROFILE_MODE" = static ]; then
-            clear_tc_failure
-            ADAPTIVE_TC_FAILURES=0
-            ADAPTIVE_TC_RETRY=0
-        fi
-        if [ "$profile_rv" -ne 0 ]; then
-            printf '%s\n' "failed to initialize $dev ${ADAPTIVE_PROFILE_MODE} profile" > "$state_dir/error"
-            startup_state=profile-degraded
-        else
-            rm -f "$state_dir/error"
-            startup_state=initializing
-        fi
+        clear_tc_failure
+        ADAPTIVE_TC_FAILURES=0
+        ADAPTIVE_TC_RETRY=0
+        rm -f "$state_dir/error"
+        startup_state=initializing
         reset_sample_state "$state_dir" "$bytes" "$drops" "$now" "$current"
         [ -z "$agent_session_id" ] || printf '%s\n' "$agent_session_id" > "$state_dir/agent_session_id"
         ADAPTIVE_TC_FAILURES="$tc_failures"
         ADAPTIVE_TC_RETRY="$tc_retry_after"
         write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" "$startup_state" 0 "$current" "$backlog" 0
         return 0
-    fi
-
-    profile_pending=0
-    if [ "$ADAPTIVE_PROFILE_MODE" != static ] && [ "$profile_rate_needs_write" -eq 1 ]; then
-        apply_profile "$dev" "$profile_target_rate" "$mtu"
-        profile_rv=$?
-        if [ "$profile_rv" -eq 0 ]; then
-            profile_rate="$profile_target_rate"
-            profile_rate_needs_write=0
-            rm -f "$state_dir/profile_pending_rate"
-            clear_tc_failure
-            rm -f "$state_dir/error"
-        else
-            profile_pending=1
-            ADAPTIVE_PROFILE_STATE=degraded
-            record_tc_failure
-            printf '%s\n' "$profile_target_rate" > "$state_dir/profile_pending_rate"
-        fi
     fi
 
     read_number "$state_dir/bytes" 0
@@ -541,7 +461,8 @@ process_direction() {
         new_session=1
         ADAPTIVE_SESSION_SOURCE=agent-flow
     fi
-    if [ "$delta_bytes" -gt 0 ] || [ "$backlog" -gt 0 ]; then
+    if [ -n "$agent_session_id" ] || [ "$delta_bytes" -gt 0 ] ||
+        [ "$backlog" -gt 0 ] || [ "$delta_drops" -gt 0 ]; then
         if [ "$new_session" -eq 0 ] && [ "$idle_since" -gt 0 ] &&
             [ $((now - idle_since)) -ge "$SESSION_IDLE_MS" ]; then
             new_session=1
@@ -552,6 +473,41 @@ process_direction() {
         idle_since="$now"
     fi
     printf '%s\n' "$idle_since" > "$state_dir/idle_since"
+    if [ "$idle_since" -gt 0 ] && [ $((now - idle_since)) -ge "$IDLE_POLL_AFTER_MS" ]; then
+        next_sample_ms=$((now + IDLE_POLL_INTERVAL * 1000))
+        printf '%s\n' "$next_sample_ms" > "$state_dir/next_sample_ms"
+        ADAPTIVE_POLL_STATE=idle
+    else
+        [ ! -e "$state_dir/next_sample_ms" ] || rm -f "$state_dir/next_sample_ms"
+        ADAPTIVE_POLL_STATE=active
+    fi
+
+    read_number "$state_dir/last_activity_ms" 0
+    last_activity_ms="$MW_ADAPTIVE_NUMBER"
+    realtime_active=0
+    activity_source=none
+    if [ "$delta_bytes" -gt 0 ] || [ "$backlog" -gt 0 ] || [ "$delta_drops" -gt 0 ]; then
+        last_activity_ms="$now"
+        realtime_active=1
+        activity_source=traffic
+    elif [ "$last_activity_ms" -gt 0 ] &&
+        [ $((now - last_activity_ms)) -lt "$ACTIVE_HOLD_MS" ]; then
+        realtime_active=1
+        activity_source=grace
+    fi
+    printf '%s\n' "$last_activity_ms" > "$state_dir/last_activity_ms"
+    if [ "$realtime_active" -eq 1 ]; then
+        ADAPTIVE_ACTIVITY_STATE=active
+        ADAPTIVE_ACTIVITY_SOURCE="$activity_source"
+    else
+        ADAPTIVE_ACTIVITY_STATE=idle
+        ADAPTIVE_ACTIVITY_SOURCE=none
+    fi
+    if [ -n "$agent_session_id" ]; then
+        ADAPTIVE_SESSION_SOURCE=agent-flow
+    elif [ "$realtime_active" -eq 1 ]; then
+        ADAPTIVE_SESSION_SOURCE="$activity_source"
+    fi
 
     read_number "$state_dir/window_ms" "$now"
     window_ms="$MW_ADAPTIVE_NUMBER"
@@ -623,44 +579,11 @@ process_direction() {
         window_ms="$now"
         window_complete=0
     fi
-
-    read_number "$state_dir/profile_last_change" "$now"
-    profile_last_change="$MW_ADAPTIVE_NUMBER"
-    read_number "$state_dir/profile_last_drop" "$now"
-    profile_last_drop="$MW_ADAPTIVE_NUMBER"
-    read_number "$state_dir/profile_drop_streak" 0
-    profile_drop_streak="$MW_ADAPTIVE_NUMBER"
-    profile_new="$profile_rate"
-    profile_state=tracking
-    burst_drop=0
-    if [ "$ADAPTIVE_PROFILE_MODE" != static ]; then
-        if [ "$delta_drops" -gt 0 ] && [ "$backlog" -eq 0 ] &&
-            [ "$desired" -lt $((current + 100)) ]; then
-            profile_drop_streak=$((profile_drop_streak + 1))
-        elif [ "$delta_drops" -eq 0 ]; then
-            profile_drop_streak=0
-        fi
-        if [ "$delta_drops" -gt 0 ]; then
-            profile_last_drop="$now"
-            if [ "$profile_rate" -lt "$MW_RT_PROFILE_CEILING" ]; then
-                profile_new=$((profile_rate + PROFILE_STEP_RATE))
-                [ "$profile_new" -gt "$MW_RT_PROFILE_CEILING" ] && profile_new="$MW_RT_PROFILE_CEILING"
-                profile_state=burst-increase
-            fi
-        elif [ "$backlog" -eq 0 ] && [ "$profile_rate" -gt "$MW_RT_PROFILE_FLOOR" ] &&
-            [ $((now - profile_last_drop)) -ge "$PROFILE_DECREASE_INTERVAL_MS" ] &&
-            [ $((now - profile_last_change)) -ge "$PROFILE_DECREASE_INTERVAL_MS" ]; then
-            profile_new=$((profile_rate - PROFILE_STEP_RATE))
-            [ "$profile_new" -lt "$MW_RT_PROFILE_FLOOR" ] && profile_new="$MW_RT_PROFILE_FLOOR"
-            profile_state=burst-decrease
-        fi
-        if [ "$delta_drops" -gt 0 ] && [ "$backlog" -eq 0 ] &&
-            [ "$desired" -lt $((current + 100)) ] &&
-            { [ "$profile_rate" -lt "$MW_RT_PROFILE_CEILING" ] ||
-              [ "$profile_drop_streak" -lt "$PROFILE_DROP_CONFIRM_SAMPLES" ]; }; then
-            burst_drop=1
-        fi
+    if [ "$realtime_active" -eq 0 ]; then
+        desired="$MW_RT_START"
+        down_target="$MW_RT_START"
     fi
+
     printf '%s\n' "$slow_rate" > "$state_dir/slow_rate"
     printf '%s\n' "$window_ms" > "$state_dir/window_ms"
     printf '%s\n' "$peak" > "$state_dir/peak"
@@ -702,14 +625,12 @@ process_direction() {
     if [ "$new_session" -eq 1 ]; then
         new="$current"
         [ "$new" -lt "$MW_RT_START" ] && new="$MW_RT_START"
-        if [ "$delta_drops" -gt 0 ] && [ "$burst_drop" -eq 0 ]; then
+        if [ "$delta_drops" -gt 0 ]; then
             drop_step="$DROP_INCREASE_KBIT"
             [ "$delta_drops" -ge 10 ] && drop_step=200
             [ "$delta_drops" -ge 50 ] && drop_step=250
             [ $((current + drop_step)) -gt "$new" ] && new=$((current + drop_step))
             state=session-drop-increase
-        elif [ "$delta_drops" -gt 0 ]; then
-            state=session-burst-profile
         elif [ "$backlog" -gt 0 ]; then
             [ $((current + BACKLOG_INCREASE_KBIT)) -gt "$new" ] && new=$((current + BACKLOG_INCREASE_KBIT))
             state=session-backlog-increase
@@ -723,6 +644,15 @@ process_direction() {
         rollback_until=0
         printf '0\n' > "$state_dir/rollback_rate"
         printf '0\n' > "$state_dir/rollback_until"
+    elif [ "$realtime_active" -eq 0 ] && [ "$current" -ne "$MW_RT_START" ]; then
+        new="$MW_RT_START"
+        lower_since=0
+        [ "$new" -gt "$current" ] && last_increase="$now"
+        rollback_rate=0
+        rollback_until=0
+        printf '0\n' > "$state_dir/rollback_rate"
+        printf '0\n' > "$state_dir/rollback_until"
+        state=idle-baseline
     elif [ "$rollback_rate" -gt "$current" ] && [ "$rollback_until" -ge "$now" ] &&
         { [ "$delta_drops" -gt 0 ] || [ "$backlog" -gt 0 ]; }; then
         new="$rollback_rate"
@@ -731,7 +661,7 @@ process_direction() {
         lower_since=0
         last_increase="$now"
         state=decrease-rollback
-    elif [ "$delta_drops" -gt 0 ] && [ "$burst_drop" -eq 0 ]; then
+    elif [ "$delta_drops" -gt 0 ]; then
         drop_step="$DROP_INCREASE_KBIT"
         [ "$delta_drops" -ge 10 ] && drop_step=200
         [ "$delta_drops" -ge 50 ] && drop_step=250
@@ -741,8 +671,6 @@ process_direction() {
         lower_since=0
         last_increase="$now"
         state=drop-increase
-    elif [ "$delta_drops" -gt 0 ]; then
-        state=burst-profile
     elif [ "$backlog_samples" -ge 2 ] && [ $((now - last_increase)) -ge 1000 ]; then
         new=$((current + BACKLOG_INCREASE_KBIT))
         [ "$desired" -gt "$new" ] && new="$desired"
@@ -781,51 +709,18 @@ process_direction() {
     printf '%s\n' "$last_decrease" > "$state_dir/last_decrease"
     printf '%s\n' "$last_increase" > "$state_dir/last_increase"
 
-    profile_deferred=0
-    rate_apply_ok=1
-    if [ "$profile_pending" -eq 1 ]; then
-        rate_apply_ok=0
-        state=profile-degraded
-    elif [ "$profile_new" -gt "$profile_rate" ]; then
-        apply_profile "$dev" "$profile_new" "$mtu"
-        profile_rv=$?
-        if [ "$profile_rv" -eq 0 ]; then
-            profile_rate="$profile_new"
-            profile_last_change="$now"
-            ADAPTIVE_PROFILE_STATE="$profile_state"
-            rm -f "$state_dir/profile_pending_rate"
-            log "Adjusted $direction realtime $ADAPTIVE_PROFILE_MODE profile on $dev: ${ADAPTIVE_PROFILE_RATE}kbit -> ${profile_rate}kbit"
-        elif [ "$profile_rv" -eq 2 ]; then
-            ADAPTIVE_PROFILE_STATE=lock-busy
-            rate_apply_ok=0
-            profile_pending=1
-            printf '%s\n' "$profile_new" > "$state_dir/profile_pending_rate"
-            record_tc_failure
-        else
-            ADAPTIVE_PROFILE_STATE=degraded
-            rate_apply_ok=0
-            profile_pending=1
-            printf '%s\n' "$profile_new" > "$state_dir/profile_pending_rate"
-            record_tc_failure
-        fi
-    elif [ "$profile_new" -lt "$profile_rate" ]; then
-        profile_deferred=1
-    fi
-
-    if [ "$new" -ne "$current" ] && [ "$rate_apply_ok" -eq 1 ]; then
+    if [ "$new" -ne "$current" ]; then
         apply_rate "$dev" "$new" "$shaper" "$MW_RT_START"
         rv=$?
         if [ "$rv" -eq 2 ]; then
             state=lock-busy
             new="$current"
-            rate_apply_ok=0
             record_tc_failure
         elif [ "$rv" -ne 0 ]; then
             printf '%s\n' "failed to change $dev from ${current}kbit to ${new}kbit" > "$state_dir/error"
             record_tc_failure
             state=degraded
             new="$current"
-            rate_apply_ok=0
         else
             printf '%s\n' "$new" > "$state_dir/rate"
             rm -f "$state_dir/error"
@@ -841,38 +736,8 @@ process_direction() {
         fi
     fi
 
-    if [ "$profile_deferred" -eq 1 ] && [ "$rate_apply_ok" -eq 1 ]; then
-        apply_profile "$dev" "$profile_new" "$mtu"
-        profile_rv=$?
-        if [ "$profile_rv" -eq 0 ]; then
-            profile_rate="$profile_new"
-            profile_last_change="$now"
-            ADAPTIVE_PROFILE_STATE="$profile_state"
-            rm -f "$state_dir/profile_pending_rate"
-            log "Adjusted $direction realtime $ADAPTIVE_PROFILE_MODE profile on $dev: ${ADAPTIVE_PROFILE_RATE}kbit -> ${profile_rate}kbit"
-        elif [ "$profile_rv" -eq 2 ]; then
-            ADAPTIVE_PROFILE_STATE=lock-busy
-            profile_pending=1
-            printf '%s\n' "$profile_new" > "$state_dir/profile_pending_rate"
-            record_tc_failure
-        else
-            ADAPTIVE_PROFILE_STATE=degraded
-            profile_pending=1
-            printf '%s\n' "$profile_new" > "$state_dir/profile_pending_rate"
-            record_tc_failure
-        fi
-    fi
-
     ADAPTIVE_PROFILE_RATE="$profile_rate"
     profile_params "$profile_rate" "$mtu"
-    if [ "$ADAPTIVE_PROFILE_MODE" != static ]; then
-        printf '%s\n' "$profile_rate" > "$state_dir/profile_rate"
-        printf '%s\n' "$profile_last_change" > "$state_dir/profile_last_change"
-        printf '%s\n' "$profile_last_drop" > "$state_dir/profile_last_drop"
-        printf '%s\n' "$profile_drop_streak" > "$state_dir/profile_drop_streak"
-    fi
-
-    ADAPTIVE_PROFILE_DROP_STREAK="$profile_drop_streak"
     ADAPTIVE_TC_FAILURES="$tc_failures"
     ADAPTIVE_TC_RETRY="$tc_retry_after"
     write_status "$state_dir" "$direction" "$dev" "$new" "$shaper" "$state" "$rolling_peak" "$desired" "$backlog" "$delta_drops"
@@ -912,6 +777,11 @@ config_get PACKETSIZE hfsc PACKETSIZE 450
 
 while true; do
     [ -f "$RESTARTING" ] && exit 0
+    if ! read_monotonic_ms; then
+        log "ERROR: adaptive monitor could not read monotonic time"
+        sleep "$SAMPLE_INTERVAL"
+        continue
+    fi
     read_agent_session_id
     config_foreach process_interface interface
     sleep "$SAMPLE_INTERVAL"
