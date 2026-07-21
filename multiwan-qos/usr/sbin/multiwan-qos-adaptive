@@ -819,7 +819,7 @@ mkdir -p "$STATE_ROOT"
 while [ -f "$RESTARTING" ]; do sleep 1; done
 
 config_load multiwan-qos
-config_get RATE_MODE hfsc realtime_rate_mode auto
+config_get RATE_MODE hfsc realtime_rate_mode default
 [ "$RATE_MODE" = adaptive ] || exit 0
 config_get GAME_QDISC hfsc gameqdisc bfifo
 config_get FRESHNESS_MODE hfsc freshness_mode auto

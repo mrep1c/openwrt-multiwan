@@ -150,7 +150,8 @@ MULTIWAN_QOS_EXEC_FILES_FRONTEND="
     "$MULTIWAN_QOS_VERSION_FILE_BACKEND" "$MULTIWAN_QOS_FILE_TYPES_BACKEND" "$MULTIWAN_QOS_GEN_FILES_BACKEND" \
     "$MULTIWAN_QOS_EXEC_FILES_BACKEND" "$MULTIWAN_QOS_EXTRA_FILES_BACKEND" "$MULTIWAN_QOS_FILE_TYPES_FRONTEND" \
     "$MULTIWAN_QOS_GEN_FILES_FRONTEND" "$MULTIWAN_QOS_EXTRA_FILES_FRONTEND" "$MULTIWAN_QOS_EXEC_FILES_FRONTEND" \
-    "${global_enabled:=}" "${ROOT_QDISC:=}" "${gameqdisc:=}" "${gameqdisc_child:=}"
+    "${global_enabled:=}" "${ROOT_QDISC:=}" "${gameqdisc:=}" "${gameqdisc_child:=}" \
+    "${realtime_rate_mode:=default}" "${realtime_first_scheduling:=0}"
 
 
 ### Utility functions
@@ -1075,7 +1076,7 @@ load_and_fix_config() {
     done
 
     if ! uci -q get multiwan-qos.hfsc.realtime_rate_mode >/dev/null 2>&1 && [ -z "$nofix" ]; then
-        local legacy_up legacy_down migrated_mode=auto
+        local legacy_up legacy_down migrated_mode=default
         legacy_up="$(uci -q get multiwan-qos.hfsc.GAMEUP)"
         legacy_down="$(uci -q get multiwan-qos.hfsc.GAMEDOWN)"
         [ -n "$legacy_up$legacy_down" ] && migrated_mode=manual
@@ -1845,6 +1846,53 @@ start_agent_watchdog() {
     procd_close_instance
 }
 
+validate_realtime_first_support() {
+    local requires_ets=0
+
+    case "${realtime_rate_mode:-default}" in
+        default|manual|adaptive) ;;
+        auto)
+            error_out "Unsupported realtime_rate_mode 'auto'. Select 'default' and apply the settings again."
+            return 1
+            ;;
+        *)
+            error_out "Unsupported realtime_rate_mode '$realtime_rate_mode'."
+            return 1
+            ;;
+    esac
+    case "${realtime_first_scheduling:-0}" in
+        0|1) ;;
+        *)
+            error_out "Unsupported realtime_first_scheduling value '$realtime_first_scheduling'. Expected 0 or 1."
+            return 1
+            ;;
+    esac
+
+    [ "${realtime_first_scheduling:-0}" = "1" ] || return 0
+    [ "${realtime_rate_mode:-default}" != "adaptive" ] || return 0
+
+    realtime_first_check_interface() {
+        local section="$1" enabled qdisc
+        config_get_bool enabled "$section" enabled 1
+        [ "$enabled" -eq 1 ] || return 0
+        config_get qdisc "$section" qdisc hfsc
+        case "$qdisc" in
+            hfsc|hybrid) requires_ets=1 ;;
+        esac
+    }
+    config_foreach realtime_first_check_interface interface
+    [ "$requires_ets" -eq 1 ] || return 0
+
+    if [ ! -d /sys/module/sch_ets ]; then
+        command -v modprobe >/dev/null 2>&1 && modprobe sch_ets >/dev/null 2>&1
+    fi
+    [ -d /sys/module/sch_ets ] || {
+        error_out "Realtime First Scheduling requires sch_ets (OpenWrt 24.10 or newer). The running QoS configuration was not changed."
+        return 1
+    }
+    return 0
+}
+
 start_service_impl() {
     # handle first run after installation or update from older versions
     if [ "$VERSION" = dev ]; then
@@ -1892,6 +1940,7 @@ start_service_impl() {
     create_hotplug_script || return 1
 
     load_and_fix_config || return 1
+    validate_realtime_first_support || return 1
 
     # Enable the global option
     uci set multiwan-qos.global.enabled='1' &&
@@ -1912,6 +1961,7 @@ start_service_impl() {
 
     preserve_config_files # Add config files to sysupgrade.conf
 
+    rm -rf /var/run/multiwan-qos/realtime-first
     run_with_timeout 90 /bin/sh "$MULTIWAN_QOS_MAIN_SCRIPT" || { error_out "Failed to start multiwan_qos."; return 1; }
 
     if ! run_with_timeout 30 /etc/init.d/firewall reload; then
@@ -2048,6 +2098,7 @@ stop_service_impl() {
     stop_legacy_processes /etc/multiwan-qos-agent-watchdog.lua /var/run/multiwan-qos-agent-watchdog.pid
     rm -f /etc/multiwan-qos-agent-watchdog.lua
     rm -rf /tmp/multiwan-qos/cake_type
+    rm -rf /var/run/multiwan-qos/realtime-first
 
     ## Delete files
     rm -f "$MULTIWAN_QOS_HOTPLUG_SCRIPT"
@@ -2113,8 +2164,11 @@ status_service() {
         not_managing=", but multiwan_qos is not managing it"
     fi
     print_msg "multiwan_qos global:enabled is $config_enabled."
-    print_msg "Realtime rate mode: ${realtime_rate_mode:-auto}"
-    if [ "${realtime_rate_mode:-auto}" = adaptive ]; then
+    print_msg "Realtime rate mode: ${realtime_rate_mode:-default}"
+    print_msg "Realtime First Scheduling requested: ${realtime_first_scheduling:-0}"
+    if [ "${realtime_rate_mode:-default}" = adaptive ]; then
+        [ "${realtime_first_scheduling:-0}" = "1" ] &&
+            print_msg "Realtime First Scheduling effective: 0 (Adaptive takes precedence)"
         local adaptive_status
         for adaptive_status in /var/run/multiwan-qos/adaptive/*/status; do
             [ -f "$adaptive_status" ] && print_msg "  $(cat "$adaptive_status")"
@@ -2123,6 +2177,15 @@ status_service() {
             [ -f "$adaptive_status" ] && print_msg "  WARNING: $(cat "$adaptive_status")"
         done
     fi
+
+    local realtime_first_status realtime_first_reported=0
+    print_msg "Realtime First Scheduling status:"
+    for realtime_first_status in /var/run/multiwan-qos/realtime-first/*.status; do
+        [ -f "$realtime_first_status" ] || continue
+        realtime_first_reported=1
+        print_msg "  $(cat "$realtime_first_status" 2>/dev/null)"
+    done
+    [ "$realtime_first_reported" -eq 1 ] || print_msg "  No live Realtime First interface status is available."
 
     print_msg "Per-device QoS hotplug results:"
     local hotplug_status hotplug_reported=0
@@ -2375,6 +2438,7 @@ refresh_interface() {
     [ -z "$target_device" ] && { error_out "Usage: /etc/init.d/multiwan-qos refresh <device>"; return 1; }
 
     load_and_fix_config || return 1
+    validate_realtime_first_support || return 1
     /bin/sh "$MULTIWAN_QOS_MAIN_SCRIPT" refresh-device "$target_device"
 }
 
@@ -2384,6 +2448,8 @@ refresh() {
 
 restart() {
     local rv
+    load_and_fix_config || return 1
+    validate_realtime_first_support || return 1
     mark_multiwan_qos_restarting
     if ! cleanup_agent_runtime_files; then
         clear_multiwan_qos_restarting

@@ -23,6 +23,13 @@ MultiWAN QoS is a latency-focused traffic shaper. It uses nftables
 classification, DSCP marking, tc qdiscs, IP sets, custom rules, connection
 statistics, and an optional Windows agent endpoint for live game-flow updates.
 
+HFSC and Hybrid also offer optional Realtime First Scheduling on OpenWrt 24.10
+and newer. It places an ETS scheduler below the HFSC link shaper, sends
+EF/CS5/CS6/CS7 traffic through one strict realtime band, and keeps the selected
+game qdisc as that band's leaf. Adaptive mode retains the bounded HFSC topology
+and takes precedence over this option. OpenWrt 23.05 remains supported for the
+normal QoS modes but does not ship the required `sch_ets` module.
+
 The two services are designed to coexist. MultiWAN QoS uses the lower byte of
 conntrack marks for DSCP state, while MultiWAN NFT uses separate upper routing
 mark bits.

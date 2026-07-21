@@ -65,6 +65,11 @@ var bytesToKbits = function(bytes) {
     return (bytes * 8 / 1000).toFixed(2);
 };
 
+var matchesTopologyClass = function(data, classId, legacyClass, realtimeFirstClass) {
+    return classId.includes(legacyClass) ||
+        (data.realtime_first_effective && classId.includes(realtimeFirstClass));
+};
+
 // Standard chart colors
 var chartColors = ['#4CAF50', '#2196F3', '#FFC107', '#F44336', '#9C27B0', '#795548', '#FF9800', '#607D8B'];
 
@@ -387,23 +392,23 @@ return view.extend({
                 var sortOrder = 999; // Default high value for unknown classes
                 
                 // Determine class description based on ID and skip those that don't match
-                if (classId.includes('1:11')) {
+                if (matchesTopologyClass(data, classId, '1:11', '2:1')) {
                     classDesc = _('High Priority (Realtime)');
                     sortOrder = 5;
                 }
-                else if (classId.includes('1:12')) {
+                else if (matchesTopologyClass(data, classId, '1:12', '2:2')) {
                     classDesc = _('Fast Non-Realtime');
                     sortOrder = 4;
                 }
-                else if (classId.includes('1:13')) {
+                else if (matchesTopologyClass(data, classId, '1:13', '2:3')) {
                     classDesc = _('Normal');
                     sortOrder = 3;
                 }
-                else if (classId.includes('1:14')) {
+                else if (matchesTopologyClass(data, classId, '1:14', '2:4')) {
                     classDesc = _('Low Priority');
                     sortOrder = 2;
                 }
-                else if (classId.includes('1:15')) {
+                else if (matchesTopologyClass(data, classId, '1:15', '2:5')) {
                     classDesc = _('Bulk');
                     sortOrder = 1;
                 }
@@ -492,23 +497,23 @@ return view.extend({
                 var sortOrder = 999; // Default high value for unknown classes
                 
                 // Determine class description based on ID and skip those that don't match
-                if (classId.includes('1:11')) {
+                if (matchesTopologyClass(data, classId, '1:11', '2:1')) {
                     classDesc = _('High Priority (Realtime)');
                     sortOrder = 5;
                 }
-                else if (classId.includes('1:12')) {
+                else if (matchesTopologyClass(data, classId, '1:12', '2:2')) {
                     classDesc = _('Fast Non-Realtime');
                     sortOrder = 4;
                 }
-                else if (classId.includes('1:13')) {
+                else if (matchesTopologyClass(data, classId, '1:13', '2:3')) {
                     classDesc = _('Normal');
                     sortOrder = 3;
                 }
-                else if (classId.includes('1:14')) {
+                else if (matchesTopologyClass(data, classId, '1:14', '2:4')) {
                     classDesc = _('Low Priority');
                     sortOrder = 2;
                 }
-                else if (classId.includes('1:15')) {
+                else if (matchesTopologyClass(data, classId, '1:15', '2:5')) {
                     classDesc = _('Bulk');
                     sortOrder = 1;
                 }
@@ -598,7 +603,7 @@ return view.extend({
         if (data.egress_leaf_qdiscs && data.egress_leaf_qdiscs.length > 0) {
             var egressRows = [];
             
-            // Process all qdiscs first and collect data (hybrid only has 1:11, 1:13, 1:15)
+            // Process all qdiscs first and collect data for either Hybrid topology.
             var classData = {};
             
             data.egress_leaf_qdiscs.forEach(function(qdisc) {
@@ -610,17 +615,17 @@ return view.extend({
                 var sortOrder = 999;
                 
                 // Hybrid class mapping based on setup_hybrid() function
-                if (classId.includes('1:11')) {
+                if (matchesTopologyClass(data, classId, '1:11', '2:1')) {
                     classDesc = _('Realtime Gaming');
                     queueType = data.gameqdisc || 'pfifo';
                     sortOrder = 3;
                 }
-                else if (classId.includes('1:13')) {
+                else if (matchesTopologyClass(data, classId, '1:13', '2:2')) {
                     classDesc = _('Default (CAKE)');
                     queueType = 'cake';
                     sortOrder = 2;
                 }
-                else if (classId.includes('1:15')) {
+                else if (matchesTopologyClass(data, classId, '1:15', '2:3')) {
                     classDesc = _('Bulk');
                     queueType = 'fq_codel';
                     sortOrder = 1;
@@ -712,17 +717,17 @@ return view.extend({
                 var sortOrder = 999;
                 
                 // Hybrid class mapping
-                if (classId.includes('1:11')) {
+                if (matchesTopologyClass(data, classId, '1:11', '2:1')) {
                     classDesc = _('Realtime Gaming');
                     queueType = data.gameqdisc || 'pfifo';
                     sortOrder = 3;
                 }
-                else if (classId.includes('1:13')) {
+                else if (matchesTopologyClass(data, classId, '1:13', '2:2')) {
                     classDesc = _('Default (CAKE)');
                     queueType = 'cake';
                     sortOrder = 2;
                 }
-                else if (classId.includes('1:15')) {
+                else if (matchesTopologyClass(data, classId, '1:15', '2:3')) {
                     classDesc = _('Bulk');
                     queueType = 'fq_codel';
                     sortOrder = 1;
@@ -795,7 +800,7 @@ return view.extend({
             ));
         }
         
-        // Add CAKE details for the 1:13 class if available
+        // Add CAKE details for the active Hybrid default band if available.
         if (data.hybrid_cake_egress && Object.keys(data.hybrid_cake_egress).length > 0) {
             var cakeEgressData = data.hybrid_cake_egress;
             if (cakeEgressData.tins && cakeEgressData.tins.length > 0) {
@@ -1200,6 +1205,21 @@ return view.extend({
                     row.appendChild(E('span', { 'style': 'font-weight: bold;' }, _('Realtime Rate Mode:')));
                     row.appendChild(document.createTextNode(' '));
                     row.appendChild(E('span', {}, qosStats.realtime_rate_mode));
+                    infoContainer.appendChild(row);
+                }
+                if (qosStats.realtime_first_requested !== undefined) {
+                    var row = E('div', { 'style': 'margin-right: 1.5em; margin-bottom: 0.3em;' });
+                    row.appendChild(E('span', { 'style': 'font-weight: bold;' }, _('Realtime First Scheduling:')));
+                    row.appendChild(document.createTextNode(' '));
+                    row.appendChild(E('span', {}, qosStats.realtime_first_effective ? _('Active') : _('Inactive')));
+                    row.appendChild(document.createTextNode(' (' + (qosStats.realtime_first_reason || 'unknown') + ')'));
+                    infoContainer.appendChild(row);
+                }
+                if (qosStats.realtime_first_effective) {
+                    var row = E('div', { 'style': 'margin-right: 1.5em; margin-bottom: 0.3em;' });
+                    row.appendChild(E('span', { 'style': 'font-weight: bold;' }, _('Realtime First Topology:')));
+                    row.appendChild(document.createTextNode(' '));
+                    row.appendChild(E('span', {}, (qosStats.realtime_first_topology || '-') + ' / ' + (qosStats.realtime_first_classid || '2:1')));
                     infoContainer.appendChild(row);
                 }
                 if (qosStats.gameqdisc) {

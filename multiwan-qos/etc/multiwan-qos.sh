@@ -14,7 +14,7 @@ IFS="$DEFAULT_IFS"
 : "${VERSION}" "${global_enabled:=}" "${nongameqdisc:=}" "${nongameqdiscoptions:=}" "${OVERHEAD:=}"
 : "${gameqdisc:=pfifo}" "${gameqdisc_child:=red}" "${nongameqdisc:=fq_codel}" "${ACK_FILTER_EGRESS:=auto}"
 : "${freshness_mode:=auto}" "${freshness_target_ms:=18}"
-: "${realtime_rate_mode:=auto}"
+: "${realtime_rate_mode:=default}" "${realtime_first_scheduling:=0}"
 : "${MAXDEL:=24}" "${PFIFOMIN:=5}" "${PACKETSIZE:=450}"
 : "${DOWNLOAD_IFB_STAB:=0}"
 : "${DISABLE_QOS_OFFLOADS:=1}"
@@ -301,8 +301,68 @@ get_priomap_elements() {
     echo "ef : 1:11, cs5 : 1:11, cs6 : 1:11, cs7 : 1:11, cs4 : 1:12, af41 : 1:12, af42 : 1:12, cs2 : 1:14, af11 : 1:14, cs1 : 1:15, cs0 : 1:13"
 }
 
+realtime_first_is_effective() {
+    local qdisc="$1"
+
+    [ "${realtime_first_scheduling:-0}" = "1" ] || return 1
+    [ "$realtime_rate_mode" != "adaptive" ] || return 1
+    case "$qdisc" in
+        hfsc|hybrid) return 0 ;;
+    esac
+    return 1
+}
+
+validate_realtime_first_runtime() {
+    local requires_ets=0
+
+    [ "${realtime_first_scheduling:-0}" = "1" ] || return 0
+    [ "$realtime_rate_mode" != "adaptive" ] || return 0
+
+    realtime_first_runtime_check_interface() {
+        local section="$1" enabled qdisc
+        config_get_bool enabled "$section" enabled 1
+        [ "$enabled" -eq 1 ] || return 0
+        config_get qdisc "$section" qdisc hfsc
+        case "$qdisc" in
+            hfsc|hybrid) requires_ets=1 ;;
+        esac
+    }
+    config_foreach realtime_first_runtime_check_interface interface
+    [ "$requires_ets" -eq 1 ] || return 0
+
+    if [ ! -d /sys/module/sch_ets ]; then
+        command -v modprobe >/dev/null 2>&1 && modprobe sch_ets >/dev/null 2>&1
+    fi
+    [ -d /sys/module/sch_ets ] || {
+        error_out "Realtime First Scheduling requires sch_ets (OpenWrt 24.10 or newer). No qdisc was changed."
+        return 1
+    }
+}
+
 get_dscp_classid_for_qdisc() {
     local dscp_class="$1" qdisc="${2:-hfsc}"
+
+    if realtime_first_is_effective "$qdisc"; then
+        case "$qdisc" in
+            hfsc)
+                case "$dscp_class" in
+                    ef|cs5|cs6|cs7) echo "2:1" ;;
+                    cs4|af41|af42) echo "2:2" ;;
+                    cs0) echo "2:3" ;;
+                    cs2|af11) echo "2:4" ;;
+                    cs1) echo "2:5" ;;
+                esac
+                ;;
+            hybrid)
+                case "$dscp_class" in
+                    ef|cs5|cs6|cs7) echo "2:1" ;;
+                    cs1) echo "2:3" ;;
+                    cs4|af41|af42|cs2|af11|cs0) echo "2:2" ;;
+                esac
+                ;;
+        esac
+        return 0
+    fi
 
     case "$qdisc" in
         hfsc)
@@ -1594,28 +1654,38 @@ fi
 # 1 - device
 # 2 - class enum
 # 3 - family (ipv4|ipv6)
+# 4 - root qdisc (hfsc|hybrid|htb)
 add_tc_filter() {
-    local class_id dsfield hex_match proto prio match_str \
+    local class_id dsfield hex_match proto prio match_str parent \
         dev="$1" \
         class_enum="$2" \
-        family="$3"
+        family="$3" \
+        root_qdisc="${4:-hfsc}"
 
     case "$class_enum" in
-        cs0|CS0) class_id=1:13 dsfield=0x00 hex_match=0x0000 ;; # 0 -> Default
-        ef|EF) class_id=1:11 dsfield=0xb8 hex_match=0x0B80 ;; # 46
-        cs1|CS1) class_id=1:15 dsfield=0x20 hex_match=0x0200 ;; # 8
-        cs2|CS2) class_id=1:14 dsfield=0x40 hex_match=0x0400 ;; # 16
-        cs4|CS4) class_id=1:12 dsfield=0x80 hex_match=0x0800 ;; # 32
-        cs5|CS5) class_id=1:11 dsfield=0xa0 hex_match=0x0A00 ;; # 40
-        cs6|CS6) class_id=1:11 dsfield=0xc0 hex_match=0x0C00 ;; # 48
-        cs7|CS7) class_id=1:11 dsfield=0xe0 hex_match=0x0E00 ;; # 56
-        af11|AF11) class_id=1:14 dsfield=0x28 hex_match=0x0280 ;; # 10
-        af41|AF41) class_id=1:12 dsfield=0x88 hex_match=0x0880 ;; # 34
-        af42|AF42) class_id=1:12 dsfield=0x90 hex_match=0x0900 ;; # 36
+        cs0|CS0) dsfield=0x00 hex_match=0x0000 ;; # 0 -> Default
+        ef|EF) dsfield=0xb8 hex_match=0x0B80 ;; # 46
+        cs1|CS1) dsfield=0x20 hex_match=0x0200 ;; # 8
+        cs2|CS2) dsfield=0x40 hex_match=0x0400 ;; # 16
+        cs4|CS4) dsfield=0x80 hex_match=0x0800 ;; # 32
+        cs5|CS5) dsfield=0xa0 hex_match=0x0A00 ;; # 40
+        cs6|CS6) dsfield=0xc0 hex_match=0x0C00 ;; # 48
+        cs7|CS7) dsfield=0xe0 hex_match=0x0E00 ;; # 56
+        af11|AF11) dsfield=0x28 hex_match=0x0280 ;; # 10
+        af41|AF41) dsfield=0x88 hex_match=0x0880 ;; # 34
+        af42|AF42) dsfield=0x90 hex_match=0x0900 ;; # 36
         *)
             log_msg -err "add_tc_filter: unsupported DSCP class '$class_enum'. Skipping."
             return 1
     esac
+
+    class_id="$(get_dscp_classid_for_qdisc "$(printf '%s' "$class_enum" | tr 'A-Z' 'a-z')" "$root_qdisc")"
+    [ -n "$class_id" ] || {
+        log_msg -err "add_tc_filter: no class mapping for '$class_enum' in $root_qdisc."
+        return 1
+    }
+    parent="1:"
+    realtime_first_is_effective "$root_qdisc" && parent="2:"
 
     case "$family" in
         ipv4)
@@ -1650,7 +1720,7 @@ add_tc_filter() {
     esac
 
     # shellcheck disable=SC2086
-    tc filter add dev "$dev" parent 1: protocol "$proto" prio "$prio" u32 match $match_str classid "$class_id"
+    tc filter add dev "$dev" parent "$parent" protocol "$proto" prio "$prio" u32 match $match_str classid "$class_id"
 }
 
 attach_classful_game_default_filter() {
@@ -1690,13 +1760,14 @@ attach_classful_game_child_qdisc() {
 }
 
 # Function to setup the specific game qdisc (pfifo, red, fq_codel, netem, etc.)
-# Arguments: $1:DEV, $2:RATE, $3:GAMERATE, $4:QDISC_TYPE, $5:DIR, $6:MTU, ... HFSC params ... $17: FIFO profile rate
+# Arguments: $1:DEV, $2:RATE, $3:GAMERATE, $4:QDISC_TYPE, $5:DIR, $6:MTU, ... HFSC params ... $17: FIFO profile rate, $18: parent class
 setup_game_qdisc() {
     local DEV="$1" RATE="$2" GAMERATE="$3" QDISC_TYPE="$4" DIR="$5" MTU="$6"
     local MAXDEL="$7" PFIFOMIN="$8" PACKETSIZE="$9"
     local FRESHNESS_MODE="${10:-auto}" FRESHNESS_TARGET_MS="${11:-18}"
     local netemdelayms="${12}" netemjitterms="${13}" netemdist="${14}" NETEM_DIRECTION="${15}" pktlossp="${16}"
     local queue_budget_rate="${17:-$GAMERATE}"
+    local game_parent="${18:-1:11}"
 
     # Ensure numeric inputs are non-zero to avoid errors in calculations.
     case "$RATE" in ''|*[!0-9]*) RATE=1 ;; esac
@@ -1734,12 +1805,12 @@ setup_game_qdisc() {
     local INTVL=100 TARG=5
 
     # Delete previous qdisc on this handle if it exists (optional, but good practice)
-    tc qdisc del dev "$DEV" parent 1:11 handle 10: > /dev/null 2>&1
+    tc qdisc del dev "$DEV" parent "$game_parent" handle 10: > /dev/null 2>&1
 
     case $QDISC_TYPE in
         "drr")
             if ! {
-                tc qdisc add dev "$DEV" parent 1:11 handle 10: drr &&
+                tc qdisc add dev "$DEV" parent "$game_parent" handle 10: drr &&
                 tc class add dev "$DEV" parent 10: classid 10:1 drr quantum 8000
             }; then
                 qdisc_setup_failed "Failed to set up DRR qdisc on $DEV."
@@ -1749,7 +1820,7 @@ setup_game_qdisc() {
         ;;
         "qfq")
             if ! {
-                tc qdisc add dev "$DEV" parent 1:11 handle 10: qfq &&
+                tc qdisc add dev "$DEV" parent "$game_parent" handle 10: qfq &&
                 tc class add dev "$DEV" parent 10: classid 10:1 qfq weight 8000 &&
                 attach_classful_game_child_qdisc "$DEV" 10:1 101: "$gameqdisc_child" "$GAMERATE" "$MTU" "$pfifo_limit" "$bfifo_limit" "$REDMIN" "$REDMAX" "$BURST" "$INTVL" "$TARG" "$PACKETSIZE" &&
                 tc class add dev "$DEV" parent 10: classid 10:2 qfq weight 4000 &&
@@ -1763,17 +1834,17 @@ setup_game_qdisc() {
                 qdisc_setup_failed "Failed to attach QFQ default class filter on $DEV."
         ;;
         "pfifo")
-            tc qdisc add dev "$DEV" parent 1:11 handle 10: pfifo limit "$pfifo_limit"
+            tc qdisc add dev "$DEV" parent "$game_parent" handle 10: pfifo limit "$pfifo_limit"
         ;;
         "bfifo")
-            tc qdisc add dev "$DEV" parent 1:11 handle 10: bfifo limit "$bfifo_limit"
+            tc qdisc add dev "$DEV" parent "$game_parent" handle 10: bfifo limit "$bfifo_limit"
         ;;
         "red")
-            tc qdisc add dev "$DEV" parent 1:11 handle 10: red limit "$REDLIMIT" min "$REDMIN" max "$REDMAX" avpkt "$PACKETSIZE" bandwidth "${GAMERATE}kbit" burst "$BURST" probability 1.0
+            tc qdisc add dev "$DEV" parent "$game_parent" handle 10: red limit "$REDLIMIT" min "$REDMIN" max "$REDMAX" avpkt "$PACKETSIZE" bandwidth "${GAMERATE}kbit" burst "$BURST" probability 1.0
             ## send game packets to 10:, they're all treated the same
         ;;
         "fq_codel")
-            tc qdisc add dev "$DEV" parent "1:11" handle 10: fq_codel \
+            tc qdisc add dev "$DEV" parent "$game_parent" handle 10: fq_codel \
                 memory_limit "$(fq_codel_memory_limit "$GAMERATE")" \
                 interval 100ms target 5ms quantum "$MTU" noecn
         ;;
@@ -1808,10 +1879,10 @@ setup_game_qdisc() {
                 fi
                 
                 # shellcheck disable=SC2086
-                tc qdisc add dev "$DEV" parent 1:11 handle 10: netem $netem_args
+                tc qdisc add dev "$DEV" parent "$game_parent" handle 10: netem $netem_args
             else
                 # NETEM is intentionally direction-scoped; keep the game class attached in the other direction.
-                tc qdisc add dev "$DEV" parent 1:11 handle 10: pfifo limit "$pfifo_limit"
+                tc qdisc add dev "$DEV" parent "$game_parent" handle 10: pfifo limit "$pfifo_limit"
             fi
         ;;
         *)
@@ -1819,6 +1890,95 @@ setup_game_qdisc() {
             return 1
         ;;
     esac
+}
+
+setup_realtime_first_root() {
+    local DEV="$1" RATE="$2" DIR="$3" PRESET="$4" OVERHEAD="$5" MPU="$6"
+    local bands="$7" quanta="$8" priomap="$9" TC_OH_PARAMS
+
+    tc qdisc del dev "$DEV" root > /dev/null 2>&1
+    TC_OH_PARAMS=$(get_tc_overhead_params "$PRESET" "$OVERHEAD" "$MPU")
+    if should_apply_root_stab "$DIR"; then
+        # shellcheck disable=SC2086
+        tc qdisc replace dev "$DEV" handle 1: root ${TC_OH_PARAMS} hfsc default 1 ||
+            qdisc_setup_failed "Failed to create Realtime First HFSC root on $DEV."
+    else
+        tc qdisc replace dev "$DEV" handle 1: root hfsc default 1 ||
+            qdisc_setup_failed "Failed to create Realtime First HFSC root on $DEV."
+    fi
+
+    tc class add dev "$DEV" parent 1: classid 1:1 hfsc \
+        ls m2 "${RATE}kbit" ul m2 "${RATE}kbit" ||
+        qdisc_setup_failed "Failed to create Realtime First shaped class 1:1 on $DEV."
+
+    # shellcheck disable=SC2086
+    tc qdisc add dev "$DEV" parent 1:1 handle 2: ets bands "$bands" strict 1 \
+        quanta $quanta priomap $priomap ||
+        qdisc_setup_failed "Failed to create Realtime First ETS scheduler on $DEV."
+
+    # Existing nft classification deliberately keeps the legacy 1:1x classids
+    # for mixed-interface compatibility. Funnel every packet through the sole
+    # HFSC class before ETS performs the per-device DSCP classification.
+    tc filter add dev "$DEV" parent 1: protocol all prio 100 matchall classid 1:1 ||
+        qdisc_setup_failed "Failed to attach Realtime First root classifier on $DEV."
+}
+
+setup_realtime_first_filters() {
+    local DEV="$1" root_qdisc="$2" family class_enum
+
+    tc filter del dev "$DEV" parent 2: prio 10 > /dev/null 2>&1
+    tc filter del dev "$DEV" parent 2: prio 11 > /dev/null 2>&1
+    for family in ipv4 ipv6; do
+        for class_enum in ef cs5 cs6 cs7 cs4 af41 af42 cs2 af11 cs1 cs0; do
+            add_tc_filter "$DEV" "$class_enum" "$family" "$root_qdisc" ||
+                qdisc_setup_failed "Failed to install Realtime First $family DSCP $class_enum filter on $DEV."
+        done
+    done
+}
+
+attach_hfsc_realtime_first_non_game_qdisc() {
+    local DEV="$1" PARENT="$2" HANDLE="$3" RATE="$4" MTU="$5" INTVL="$6" TARG="$7"
+
+    case "$nongameqdisc" in
+        cake)
+            # shellcheck disable=SC2086
+            tc qdisc add dev "$DEV" parent "$PARENT" handle "$HANDLE" cake $nongameqdiscoptions ||
+                qdisc_setup_failed "Failed to attach CAKE non-game qdisc to $PARENT on $DEV."
+            ;;
+        fq_codel)
+            tc qdisc add dev "$DEV" parent "$PARENT" handle "$HANDLE" fq_codel \
+                memory_limit "$(fq_codel_memory_limit "$RATE")" interval "${INTVL}ms" \
+                target "${TARG}ms" quantum $((MTU * 2)) ||
+                qdisc_setup_failed "Failed to attach fq_codel non-game qdisc to $PARENT on $DEV."
+            ;;
+        *)
+            qdisc_setup_failed "Unsupported non-game qdisc '$nongameqdisc' on $DEV."
+            ;;
+    esac
+}
+
+setup_hfsc_realtime_first() {
+    local DEV="$1" RATE="$2" GAMERATE="$3" GAME_QDISC_TYPE="$4" DIR="$5" PRESET="$6" OVERHEAD="$7"
+    local MTU="${8:-1500}" MPU="$9"
+    local INTVL=$((100 + 2 * MTU * 8 / RATE))
+    local TARG=$((540 * 8 / RATE + 4))
+    local quanta="$((MTU * 6)) $((MTU * 9)) $((MTU * 3)) $((MTU * 2))"
+    local priomap="2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2"
+
+    setup_realtime_first_root "$DEV" "$RATE" "$DIR" "$PRESET" "$OVERHEAD" "$MPU" \
+        5 "$quanta" "$priomap"
+    setup_game_qdisc "$DEV" "$RATE" "$GAMERATE" "$GAME_QDISC_TYPE" "$DIR" \
+        "$MTU" "$MAXDEL" "$PFIFOMIN" "$PACKETSIZE" \
+        "$freshness_mode" "$freshness_target_ms" \
+        "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp" \
+        "$GAMERATE" "2:1" ||
+        qdisc_setup_failed "Failed to set up $GAME_QDISC_TYPE game qdisc on $DEV."
+
+    attach_hfsc_realtime_first_non_game_qdisc "$DEV" 2:2 12: "$RATE" "$MTU" "$INTVL" "$TARG"
+    attach_hfsc_realtime_first_non_game_qdisc "$DEV" 2:3 13: "$RATE" "$MTU" "$INTVL" "$TARG"
+    attach_hfsc_realtime_first_non_game_qdisc "$DEV" 2:4 14: "$RATE" "$MTU" "$INTVL" "$TARG"
+    attach_hfsc_realtime_first_non_game_qdisc "$DEV" 2:5 15: "$RATE" "$MTU" "$INTVL" "$TARG"
+    setup_realtime_first_filters "$DEV" hfsc
 }
 
 # Function to setup HFSC qdisc structure
@@ -1832,6 +1992,11 @@ setup_hfsc() {
     if [ "$realtime_rate_mode" = adaptive ]; then
         mw_realtime_adaptive_profile_range "$RATE"
         queue_budget_rate="$MW_RT_PROFILE_START"
+    fi
+
+    if realtime_first_is_effective hfsc; then
+        setup_hfsc_realtime_first "$@"
+        return $?
     fi
 
     tc qdisc del dev "$DEV" root > /dev/null 2>&1
@@ -1907,7 +2072,7 @@ setup_hfsc() {
         local family class_enum
         for family in ipv4 ipv6; do
             for class_enum in ef cs5 cs6 cs7 cs4 af41 af42 cs2 af11 cs1 cs0; do
-                add_tc_filter "$DEV" "$class_enum" "$family" ||
+                add_tc_filter "$DEV" "$class_enum" "$family" hfsc ||
                     qdisc_setup_failed "Failed to install $family DSCP $class_enum filter on $DEV."
             done
         done
@@ -2071,6 +2236,61 @@ record_cake_qdisc_type "$LAN" "$CAKE_QDISC_IGR"
 debug_log "INGRESS $CAKE_QDISC_IGR opts: '$CAKE_OPTS'"
 }
 
+setup_hybrid_realtime_first() {
+    local DEV="$1" RATE="$2" GAMERATE="$3" DIR="$4" PRESET="$5" OVERHEAD="$6" MPU="$7"
+    local MTU="${8:-1500}"
+    local SHAPER_RATE=$((RATE * 98 / 100)); [ "$SHAPER_RATE" -le 0 ] && SHAPER_RATE=1
+    local bulk_rate=$((SHAPER_RATE * 10 / 100)); [ "$bulk_rate" -le 0 ] && bulk_rate=1
+    local cake_memlimit bulk_packet_limit bulk_memlimit cake_link_params CAKE_OPTS
+    local quanta="$((MTU * 9)) $MTU"
+    local priomap="1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+
+    cake_memlimit="$(cake_memory_limit "$SHAPER_RATE")"
+    bulk_packet_limit="$(fq_codel_bulk_packet_limit "$bulk_rate" "$MTU")"
+    bulk_memlimit="$(fq_codel_bulk_memory_limit "$bulk_rate")"
+    print_msg "  Realtime First Hybrid limits on $DEV: cake=${cake_memlimit}B bulk=${bulk_packet_limit}p/${bulk_memlimit}B"
+
+    setup_realtime_first_root "$DEV" "$SHAPER_RATE" "$DIR" "$PRESET" "$OVERHEAD" "$MPU" \
+        3 "$quanta" "$priomap"
+    setup_game_qdisc "$DEV" "$RATE" "$GAMERATE" "$gameqdisc" "$DIR" \
+        "$MTU" "$MAXDEL" "$PFIFOMIN" "$PACKETSIZE" \
+        "$freshness_mode" "$freshness_target_ms" \
+        "$netemdelayms" "$netemjitterms" "$netemdist" "$NETEM_DIRECTION" "$pktlossp" \
+        "$GAMERATE" "2:1" ||
+        qdisc_setup_failed "Failed to set up $gameqdisc game qdisc on $DEV."
+
+    cake_link_params="$(get_cake_link_params "$PRESET" "$OVERHEAD" "$MPU" "hybrid")"
+    CAKE_OPTS=""
+    if [ "$DIR" = "wan" ]; then
+        CAKE_OPTS="besteffort"
+        append_cake_opt "dual-srchost" "$HOST_ISOLATION" &&
+        append_cake_opt "$EXTRA_PARAMETERS_EGRESS" "1" &&
+        append_cake_opt "nat" "$NAT_EGRESS" &&
+        append_cake_opt "wash" "$WASHDSCPUP"
+    else
+        CAKE_OPTS="besteffort ingress"
+        append_cake_opt "dual-dsthost" "$HOST_ISOLATION" &&
+        append_cake_opt "$EXTRA_PARAMETERS_INGRESS" "1" &&
+        append_cake_opt "nat" "$NAT_INGRESS" &&
+        append_cake_opt "wash" "$WASHDSCPDOWN"
+    fi &&
+    append_cake_opt "rtt ${RTT}ms" "${RTT:+1}" &&
+    append_cake_opt "$cake_link_params" "1" &&
+    append_cake_opt "$LINK_COMPENSATION" "1" &&
+    append_cake_opt "memlimit ${cake_memlimit}b" "1" &&
+    # shellcheck disable=SC2086
+    tc qdisc add dev "$DEV" parent 2:2 handle 13: cake $CAKE_OPTS ||
+        qdisc_setup_failed "Failed to attach Realtime First Hybrid CAKE qdisc on $DEV."
+    debug_log "$DIR REALTIME-FIRST HYBRID cake opts: '$CAKE_OPTS'"
+
+    tc qdisc add dev "$DEV" parent 2:3 handle 15: fq_codel \
+        limit "$bulk_packet_limit" memory_limit "${bulk_memlimit}b" interval 100ms \
+        target 5ms quantum "$MTU" ||
+        qdisc_setup_failed "Failed to attach Realtime First Hybrid bulk fq_codel qdisc on $DEV."
+
+    setup_realtime_first_filters "$DEV" hybrid
+}
+
 # Helper function to set up hybrid qdisc on an interface
 # Arguments: $1:DEV, $2:RATE, $3:GAMERATE, $4:DIR, $5:PRESET, $6:OVERHEAD, $7:MPU, $8:MTU
 setup_hybrid() {
@@ -2086,6 +2306,11 @@ setup_hybrid() {
 
     [ "$GAMERATE" -lt "$SHAPER_RATE" ] 2>/dev/null ||
         qdisc_setup_failed "Hybrid realtime rate ${GAMERATE}kbit must be lower than the ${SHAPER_RATE}kbit shaped rate on $DEV."
+
+    if realtime_first_is_effective hybrid; then
+        setup_hybrid_realtime_first "$@"
+        return $?
+    fi
 
     # Keep both link-sharing curve segments within the parent. The realtime
     # class has its own RT curve and must not be subtracted from LS weights.
@@ -2188,14 +2413,14 @@ debug_log "$DIR HYBRID cake opts: '$CAKE_OPTS'"
         # EF, CS5, CS6, CS7 -> Realtime
         # CS1 -> Bulk
         for class_enum in ef cs5 cs6 cs7 cs1; do
-            add_tc_filter "$DEV" "$class_enum" "ipv4" ||
+            add_tc_filter "$DEV" "$class_enum" "ipv4" hybrid ||
                 qdisc_setup_failed "Failed to install IPv4 DSCP $class_enum filter on $DEV."
         done
         # Default rule sends to 1:13 (CAKE)
 
         # IPv6 Filters (prio 11)
         for class_enum in ef cs5 cs6 cs7 cs1 cs0; do
-            add_tc_filter "$DEV" "$class_enum" "ipv6" ||
+            add_tc_filter "$DEV" "$class_enum" "ipv6" hybrid ||
                 qdisc_setup_failed "Failed to install IPv6 DSCP $class_enum filter on $DEV."
         done
     fi
@@ -2273,7 +2498,7 @@ select_realtime_rate() {
     if [ "$override" -gt 0 ] 2>/dev/null && [ "$override" -lt "$line_rate" ] 2>/dev/null; then
         MW_SELECTED_REALTIME_RATE="$override"
         [ "$override" -ge "$auto_rate" ] ||
-            log_msg -warn "Manual realtime $direction reserve ${override}kbit is below the automatic ${auto_rate}kbit reserve; burst drops are more likely."
+            log_msg -warn "Manual realtime $direction reserve ${override}kbit is below the default ${auto_rate}kbit reserve; burst drops are more likely."
         return 0
     fi
 
@@ -2419,13 +2644,13 @@ setup_htb() {
         # Priority class: EF, CS5, CS6, CS7 -> 1:11
         # Background class: CS1 -> 1:15
         for class_enum in ef cs5 cs6 cs7 cs1; do
-            add_tc_filter "$DEV" "$class_enum" "ipv4" ||
+            add_tc_filter "$DEV" "$class_enum" "ipv4" htb ||
                 qdisc_setup_failed "Failed to install IPv4 DSCP $class_enum filter on $DEV."
         done
 
         # IPv6 filters (prio 11)
         for class_enum in ef cs5 cs6 cs7 cs1 cs0; do
-            add_tc_filter "$DEV" "$class_enum" "ipv6" ||
+            add_tc_filter "$DEV" "$class_enum" "ipv6" htb ||
                 qdisc_setup_failed "Failed to install IPv6 DSCP $class_enum filter on $DEV."
         done
     fi
@@ -2443,7 +2668,8 @@ NFT_DOWNPRIO_RULES=""
 # Setup logic for a single interface
 # Parses all custom rules and explicitly attaches them iteratively as native tc flower logic to bypass the IFB redirect firewall bug loop.
 apply_tc_custom_ingress_rules() {
-    local lan_dev="$1" qdisc="${2:-hfsc}"
+    local lan_dev="$1" qdisc="${2:-hfsc}" tc_parent="1:"
+    realtime_first_is_effective "$qdisc" && tc_parent="2:"
     
     process_tc_ingress_rule() {
         local config="$1"
@@ -2525,14 +2751,14 @@ apply_tc_custom_ingress_rules() {
                                     [ "$p_dst" != "__SKIP__" ] && p_match="$p_match src_port $p_dst"
                                 fi
                                 
-                                tc filter add dev "$lan_dev" parent 1: prio 1 protocol "$ip_fam" flower $p_match $ip_match classid "$class_id" ||
+                                tc filter add dev "$lan_dev" parent "$tc_parent" prio 1 protocol "$ip_fam" flower $p_match $ip_match classid "$class_id" ||
                                     qdisc_setup_failed "Failed to install custom ingress rule '$rule_label' on $lan_dev."
                             done
                         done
                     done
                 else
                     # No ports, just match IP and/or L4 protocol
-                    tc filter add dev "$lan_dev" parent 1: prio 1 protocol "$ip_fam" flower $tc_l4proto $ip_match classid "$class_id" ||
+                    tc filter add dev "$lan_dev" parent "$tc_parent" prio 1 protocol "$ip_fam" flower $tc_l4proto $ip_match classid "$class_id" ||
                         qdisc_setup_failed "Failed to install custom ingress rule '$rule_label' on $lan_dev."
                 fi
             done
@@ -2581,6 +2807,40 @@ cleanup_interface_state() {
         ip link del "$lan_dev" > /dev/null 2>&1 || \
             qdisc_setup_failed "Failed to remove stale IFB device $lan_dev."
     fi
+}
+
+record_realtime_first_status() {
+    local device="$1" qdisc="$2" requested="${realtime_first_scheduling:-0}"
+    local effective=0 reason=disabled topology=legacy realtime_class=1:11 bands=0
+    local status_dir=/var/run/multiwan-qos/realtime-first
+
+    if [ "$requested" = "1" ]; then
+        if [ "$realtime_rate_mode" = adaptive ]; then
+            reason=adaptive-precedence
+            topology=bounded-hfsc
+        else
+            case "$qdisc" in
+                hfsc) topology=hfsc-ets; bands=5 ;;
+                hybrid) topology=hybrid-ets; bands=3 ;;
+                *) reason=qdisc-not-applicable ;;
+            esac
+            if [ "$bands" -gt 0 ]; then
+                if tc qdisc show dev "$device" 2>/dev/null | grep -q '^qdisc ets 2:' &&
+                   tc qdisc show dev "ifb-$device" 2>/dev/null | grep -q '^qdisc ets 2:'; then
+                    effective=1
+                    reason=active
+                    realtime_class=2:1
+                else
+                    reason=ets-not-live
+                fi
+            fi
+        fi
+    fi
+
+    mkdir -p "$status_dir" || return 1
+    printf 'device=%s qdisc=%s requested=%s effective=%s reason=%s topology=%s ets_bands=%s realtime_class=%s realtime_leaf=10:\n' \
+        "$device" "$qdisc" "$requested" "$effective" "$reason" "$topology" "$bands" "$realtime_class" \
+        > "$status_dir/${device}.status"
 }
 
 setup_interface() {
@@ -2735,6 +2995,14 @@ setup_interface() {
 
     print_msg "Configuring interface $config ($device)..."
 
+    if realtime_first_is_effective "$qdisc"; then
+        print_msg -warn "Realtime First Scheduling is active on $device; continuously backlogged realtime traffic can delay or starve lower bands."
+    elif [ "${realtime_first_scheduling:-0}" = "1" ] && [ "$realtime_rate_mode" = "adaptive" ]; then
+        case "$qdisc" in
+            hfsc|hybrid) print_msg "  Realtime First Scheduling requested but ignored on $device because Adaptive takes precedence." ;;
+        esac
+    fi
+
 
     # Read device MTU for correct qdisc calculations
     local dev_mtu
@@ -2845,6 +3113,9 @@ setup_interface() {
         tc filter add dev "$device" parent 1: protocol all prio 1 matchall action ctinfo dscp 63 128 continue ||
             qdisc_setup_failed "Failed to install SFO ctinfo filter on $device."
     fi
+
+    record_realtime_first_status "$device" "$qdisc" ||
+        log_msg -warn "Could not record Realtime First status for $device."
 }
 
 ##############################
@@ -2862,9 +3133,20 @@ case "$gameqdisc" in
 esac
 
 case "$realtime_rate_mode" in
-    auto|manual|adaptive) ;;
+    default|manual|adaptive) ;;
+    auto)
+        error_out "Unsupported realtime_rate_mode 'auto'. Select 'default' and apply the settings again."
+        exit 1
+        ;;
     *) error_out "Unsupported realtime_rate_mode '$realtime_rate_mode'."; exit 1 ;;
 esac
+
+case "${realtime_first_scheduling:-0}" in
+    0|1) ;;
+    *) error_out "Unsupported realtime_first_scheduling value '$realtime_first_scheduling'. Expected 0 or 1."; exit 1 ;;
+esac
+
+validate_realtime_first_runtime || exit 1
 
 if [ "$gameqdisc" = "qfq" ]; then
     case "$gameqdisc_child" in
@@ -2919,6 +3201,7 @@ if [ "$1" = "device-event" ]; then
             cleanup_interface_state "$device" "$lan_dev"
             rm -rf "/var/run/multiwan-qos/adaptive/${device}-wan" \
                 "/var/run/multiwan-qos/adaptive/${lan_dev}-lan"
+            rm -f "/var/run/multiwan-qos/realtime-first/${device}.status"
             log_msg "Detached QoS state for $device; other WAN qdiscs and classifiers were preserved."
             return 0
         fi

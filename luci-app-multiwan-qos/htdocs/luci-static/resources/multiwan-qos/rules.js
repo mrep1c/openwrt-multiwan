@@ -343,29 +343,29 @@ return view.extend({
             E('h4', _('HFSC Mapping:')),
             E('table', { 'class': 'table' }, [
                 E('tr', { 'class': 'tr' }, [
-                    E('td', { 'class': 'td left', 'width': '25%' }, _('High Priority [Realtime] (1:11)')),
+                    E('td', { 'class': 'td left', 'width': '25%' }, _('High Priority [Realtime] (1:11 / ETS 2:1)')),
                     E('td', { 'class': 'td left' }, 'EF, CS5, CS6, CS7')
                 ]),
                 E('tr', { 'class': 'tr' }, [
-                    E('td', { 'class': 'td left' }, _('Fast Non-Realtime (1:12)')),
+                    E('td', { 'class': 'td left' }, _('Fast Non-Realtime (1:12 / ETS 2:2)')),
                     E('td', { 'class': 'td left' }, 'CS4, AF41, AF42')
                 ]),
                 E('tr', { 'class': 'tr' }, [
-                    E('td', { 'class': 'td left' }, _('Normal (1:13)')),
+                    E('td', { 'class': 'td left' }, _('Normal (1:13 / ETS 2:3)')),
                     E('td', { 'class': 'td left' }, 'CS0')
                 ]),
                 E('tr', { 'class': 'tr' }, [
-                    E('td', { 'class': 'td left' }, _('Low Priority (1:14)')),
+                    E('td', { 'class': 'td left' }, _('Low Priority (1:14 / ETS 2:4)')),
                     E('td', { 'class': 'td left' }, 'CS2, AF11')
                 ]),
                 E('tr', { 'class': 'tr' }, [
-                    E('td', { 'class': 'td left' }, _('Bulk (1:15)')),
+                    E('td', { 'class': 'td left' }, _('Bulk (1:15 / ETS 2:5)')),
                     E('td', { 'class': 'td left' }, 'CS1')
                 ])
             ]),
             E('p', { 'style': 'font-size:0.9em; margin: -5px 0 15px 5px;' }, [
                 E('strong', _('Hybrid Note:')), ' ',
-                _('Uses Realtime (1:11) & Bulk (1:15) classes with their dscp values from HFSC. All other traffic is handled by a single CAKE class (1:13).')
+                _('The bounded topology uses Realtime 1:11, Default 1:13, and Bulk 1:15. Realtime First uses ETS Realtime 2:1, Default 2:2, and Bulk 2:3. All default traffic is handled by a single CAKE lane.')
             ]),
             E('h4', _('CAKE Mapping (diffserv4):')),
             E('table', { 'class': 'table' }, [

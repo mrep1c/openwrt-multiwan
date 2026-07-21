@@ -196,19 +196,27 @@ get_stats() {
         debug_log "Egress leaf qdiscs: $egress_leaf_qdiscs"
         
         # Process the output to ensure it's valid JSON and filter non-HFSC qdiscs
-        egress_leaf_qdiscs=$(echo "$egress_leaf_qdiscs" | jq -c '[.[] | select(.kind != "hfsc" and .parent != null)]' 2>/dev/null || echo "[]")
+        egress_leaf_qdiscs=$(echo "$egress_leaf_qdiscs" | jq -c '[.[] | select(.kind != "hfsc" and .kind != "ets" and .parent != null)]' 2>/dev/null || echo "[]")
 
         local ingress_leaf_qdiscs
         ingress_leaf_qdiscs=$(get_tc_json tc -s -j qdisc show dev "$ifb_interface")
         debug_log "Ingress leaf qdiscs: $ingress_leaf_qdiscs"
         
         # Process the output to ensure it's valid JSON and filter non-HFSC qdiscs
-        ingress_leaf_qdiscs=$(echo "$ingress_leaf_qdiscs" | jq -c '[.[] | select(.kind != "hfsc" and .parent != null)]' 2>/dev/null || echo "[]")
+        ingress_leaf_qdiscs=$(echo "$ingress_leaf_qdiscs" | jq -c '[.[] | select(.kind != "hfsc" and .kind != "ets" and .parent != null)]' 2>/dev/null || echo "[]")
 
         # Get game qdisc type (used by both HFSC and hybrid)
-        local gameqdisc realtime_rate_mode adaptive_state adaptive_errors adaptive_file adaptive_line
+        local gameqdisc realtime_rate_mode realtime_first_requested realtime_first_effective
+        local realtime_first_reason realtime_first_topology realtime_first_classid
+        local adaptive_state adaptive_errors adaptive_file adaptive_line
         gameqdisc=$(uci -q get multiwan-qos.hfsc.gameqdisc || echo "pfifo")
-        realtime_rate_mode=$(uci -q get multiwan-qos.hfsc.realtime_rate_mode || echo "auto")
+        realtime_rate_mode=$(uci -q get multiwan-qos.hfsc.realtime_rate_mode || echo "default")
+        realtime_first_requested=$(uci -q get multiwan-qos.hfsc.realtime_first_scheduling || echo "0")
+        case "$realtime_first_requested" in 1) ;; *) realtime_first_requested=0 ;; esac
+        realtime_first_effective=0
+        realtime_first_reason=disabled
+        realtime_first_topology=legacy
+        realtime_first_classid=1:11
         adaptive_state='[]'
         adaptive_errors='[]'
         if [ "$realtime_rate_mode" = "adaptive" ]; then
@@ -236,13 +244,34 @@ EOF
         local hfsc_ingress
         hfsc_ingress=$(echo "$hfsc_ingress_qdisc" | jq -c '.[0] // {}' 2>/dev/null || echo "{}")
 
+        local ets_egress ets_ingress
+        ets_egress=$(get_tc_json tc -s -j qdisc show dev "$wan_interface" | jq -c '[.[] | select(.kind == "ets" and (.handle == "2:" or .handle == "2:0"))] | .[0] // {}' 2>/dev/null || echo "{}")
+        ets_ingress=$(get_tc_json tc -s -j qdisc show dev "$ifb_interface" | jq -c '[.[] | select(.kind == "ets" and (.handle == "2:" or .handle == "2:0"))] | .[0] // {}' 2>/dev/null || echo "{}")
+        if [ "$realtime_first_requested" -eq 1 ]; then
+            if [ "$realtime_rate_mode" = adaptive ]; then
+                realtime_first_reason=adaptive-precedence
+                realtime_first_topology=bounded-hfsc
+            elif [ "$root_qdisc" != hfsc ] && [ "$root_qdisc" != hybrid ]; then
+                realtime_first_reason=qdisc-not-applicable
+            elif echo "$ets_egress" | jq -e 'length > 0' >/dev/null 2>&1 &&
+                 echo "$ets_ingress" | jq -e 'length > 0' >/dev/null 2>&1; then
+                realtime_first_effective=1
+                realtime_first_reason=active
+                realtime_first_topology="${root_qdisc}-ets"
+                realtime_first_classid=2:1
+            else
+                realtime_first_reason=ets-not-live
+                realtime_first_topology="${root_qdisc}-ets"
+            fi
+        fi
+
         # For hybrid mode, also extract CAKE statistics from the 1:13 classes
         local hybrid_cake_egress="{}"
         local hybrid_cake_ingress="{}"
         if [ "$root_qdisc" = "hybrid" ]; then
             # Get CAKE stats from the 1:13 parent classes
-            hybrid_cake_egress=$(echo "$egress_leaf_qdiscs" | jq -c '[.[] | select(.kind == "cake" and (.parent == "1:13" or .parent == "1:13:"))] | .[0] // {}' 2>/dev/null || echo "{}")
-            hybrid_cake_ingress=$(echo "$ingress_leaf_qdiscs" | jq -c '[.[] | select(.kind == "cake" and (.parent == "1:13" or .parent == "1:13:"))] | .[0] // {}' 2>/dev/null || echo "{}")
+            hybrid_cake_egress=$(echo "$egress_leaf_qdiscs" | jq -c '[.[] | select(.kind == "cake" and (.parent == "1:13" or .parent == "1:13:" or .parent == "2:2" or .parent == "2:2:"))] | .[0] // {}' 2>/dev/null || echo "{}")
+            hybrid_cake_ingress=$(echo "$ingress_leaf_qdiscs" | jq -c '[.[] | select(.kind == "cake" and (.parent == "1:13" or .parent == "1:13:" or .parent == "2:2" or .parent == "2:2:"))] | .[0] // {}' 2>/dev/null || echo "{}")
             debug_log "Hybrid CAKE egress: $hybrid_cake_egress"
             debug_log "Hybrid CAKE ingress: $hybrid_cake_ingress"
         fi
@@ -254,6 +283,11 @@ EOF
             --arg ii "$ifb_interface" \
             --arg gq "$gameqdisc" \
             --arg rrm "$realtime_rate_mode" \
+            --argjson rfr "$realtime_first_requested" \
+            --argjson rfe "$realtime_first_effective" \
+            --arg rfreason "$realtime_first_reason" \
+            --arg rftopology "$realtime_first_topology" \
+            --arg rfclass "$realtime_first_classid" \
             --argjson ars "$adaptive_state" \
             --argjson are "$adaptive_errors" \
             --argjson fs "$filtered_stats" \
@@ -265,12 +299,19 @@ EOF
             --argjson ilq "$ingress_leaf_qdiscs" \
             --argjson hce "$hybrid_cake_egress" \
             --argjson hci "$hybrid_cake_ingress" \
+            --argjson ee "$ets_egress" \
+            --argjson ei "$ets_ingress" \
             '{
                 root_qdisc: $rq,
                 wan_interface: $wi,
                 ifb_interface: $ii,
                 gameqdisc: $gq,
                 realtime_rate_mode: $rrm,
+                realtime_first_requested: ($rfr == 1),
+                realtime_first_effective: ($rfe == 1),
+                realtime_first_reason: $rfreason,
+                realtime_first_topology: $rftopology,
+                realtime_first_classid: $rfclass,
                 adaptive_realtime_state: $ars,
                 adaptive_realtime_errors: $are,
                 qdisc_stats: $fs,
@@ -281,7 +322,9 @@ EOF
                 egress_leaf_qdiscs: $elq,
                 ingress_leaf_qdiscs: $ilq,
                 hybrid_cake_egress: $hce,
-                hybrid_cake_ingress: $hci
+                hybrid_cake_ingress: $hci,
+                realtime_first_ets_egress: $ee,
+                realtime_first_ets_ingress: $ei
             }' 2>/dev/null)
     elif [ "$root_qdisc" = "htb" ]; then
         local htb_egress_qdisc
