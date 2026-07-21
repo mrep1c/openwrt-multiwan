@@ -222,6 +222,7 @@ process_direction() {
     local last_activity_ms traffic_active session_active activity_source session_state
 
     [ -d "/sys/class/net/$dev" ] || return 0
+    [ ! -e "$STATE_ROOT/.detached-$dev" ] || return 0
     key="${dev}-${direction}"
     case "$key" in
         *[!A-Za-z0-9_.:@-]*) log "ERROR: unsafe adaptive state key for device '$dev'"; return 0 ;;

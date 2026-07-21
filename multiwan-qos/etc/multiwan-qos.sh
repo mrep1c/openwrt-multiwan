@@ -23,8 +23,10 @@ IFS="$DEFAULT_IFS"
 : "${MULTIWAN_QOS_REFRESH_LOCK_DIR:=/var/run/multiwan_qos-refresh.lock}"
 : "${MULTIWAN_QOS_RESTARTING_FILE:=/tmp/multiwan_qos_restarting}"
 : "${MULTIWAN_QOS_CAKE_TYPE_DIR:=/tmp/multiwan-qos/cake_type}"
+: "${MULTIWAN_QOS_ETS_PROBE_STATE:=/var/run/multiwan-qos/ets-probe-device}"
 QOS_OFFLOAD_EXTRA_APPLIED=0
 QOS_OFFLOAD_WARNED_MISSING_ETHTOOL=0
+MULTIWAN_QOS_RUNTIME_ETS_PROBE_DEVICE=
 
 . /lib/functions.sh
 . /lib/multiwan-qos/process-lock.sh
@@ -247,6 +249,53 @@ disable_qos_offload_feature() {
     ethtool -K "$dev" "$feature" off >/dev/null 2>&1 || true
 }
 
+qos_offload_feature_name() {
+    case "$1" in
+        gro) echo generic-receive-offload ;;
+        gso) echo generic-segmentation-offload ;;
+        tso) echo tcp-segmentation-offload ;;
+        rx-gro-list|tx-udp-segmentation|hw-tc-offload) echo "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+save_qos_offload_state() {
+    local dev="$1" feature long_name value saved=0
+    local state_root=/var/run/multiwan-qos/offloads state_file tmp
+
+    case "$dev" in ''|*[!A-Za-z0-9_.:@-]*) return 1 ;; esac
+    state_file="$state_root/$dev"
+    [ -e "$state_file" ] && return 0
+    mkdir -p "$state_root" || return 1
+    tmp="${state_file}.$$"
+    : > "$tmp" || return 1
+    for feature in gro gso tso rx-gro-list tx-udp-segmentation hw-tc-offload; do
+        long_name="$(qos_offload_feature_name "$feature")" || continue
+        value="$(ethtool -k "$dev" 2>/dev/null | awk -v name="${long_name}:" '$1 == name { print $2; exit }')"
+        case "$value" in
+            on|off) printf '%s %s\n' "$feature" "$value" >> "$tmp"; saved=$((saved + 1)) ;;
+        esac
+    done
+    [ "$saved" -gt 0 ] || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$state_file"
+}
+
+restore_qos_offload_state() {
+    local dev="$1" feature value state_file="/var/run/multiwan-qos/offloads/$1" restore_result=0
+
+    [ -r "$state_file" ] || return 0
+    command -v ethtool >/dev/null 2>&1 && ip link show "$dev" >/dev/null 2>&1 || return 1
+    while read -r feature value; do
+        case "$feature:$value" in
+            gro:on|gro:off|gso:on|gso:off|tso:on|tso:off|rx-gro-list:on|rx-gro-list:off|tx-udp-segmentation:on|tx-udp-segmentation:off|hw-tc-offload:on|hw-tc-offload:off)
+                ethtool -K "$dev" "$feature" "$value" >/dev/null 2>&1 || restore_result=1
+                ;;
+        esac
+    done < "$state_file"
+    [ "$restore_result" -eq 0 ] && rm -f "$state_file"
+    return "$restore_result"
+}
+
 disable_qos_offloads() {
     local dev="$1" role="$2" feature
 
@@ -263,6 +312,11 @@ disable_qos_offloads() {
 
     if ! ip link show "$dev" >/dev/null 2>&1; then
         [ "$role" = "extra" ] && log_msg -warn "QoS offload extra device $dev not found; skipping."
+        return 0
+    fi
+
+    if [ "$role" != ifb ] && ! save_qos_offload_state "$dev"; then
+        log_msg -warn "Could not save NIC offload state for $dev; leaving its offloads unchanged."
         return 0
     fi
 
@@ -312,19 +366,50 @@ realtime_first_is_effective() {
     return 1
 }
 
+cleanup_runtime_ets_probe() {
+    local probe_device
+
+    probe_device="$MULTIWAN_QOS_RUNTIME_ETS_PROBE_DEVICE"
+    if [ -z "$probe_device" ] && [ -r "$MULTIWAN_QOS_ETS_PROBE_STATE" ]; then
+        IFS= read -r probe_device < "$MULTIWAN_QOS_ETS_PROBE_STATE"
+    fi
+    [ -n "$probe_device" ] || return 0
+    case "$probe_device" in mqe[0-9]*_[0-9]*) ;; *) return 1 ;; esac
+
+    if ! ip link show "$probe_device" >/dev/null 2>&1; then
+        rm -f "$MULTIWAN_QOS_ETS_PROBE_STATE"
+        MULTIWAN_QOS_RUNTIME_ETS_PROBE_DEVICE=
+        return 0
+    fi
+    ip -d link show "$probe_device" 2>/dev/null | grep -qw ifb || return 1
+    ip link del "$probe_device" >/dev/null 2>&1 || return 1
+    rm -f "$MULTIWAN_QOS_ETS_PROBE_STATE"
+    MULTIWAN_QOS_RUNTIME_ETS_PROBE_DEVICE=
+    return 0
+}
+
 validate_realtime_first_runtime() {
-    local requires_ets=0
+    local target_device_filter="${1:-}" requires_ets=0 requires_hfsc=0 requires_hybrid=0
+    local probe_device probe_result=0 probe_attempt=0
 
     [ "${realtime_first_scheduling:-0}" = "1" ] || return 0
     [ "$realtime_rate_mode" != "adaptive" ] || return 0
 
+    cleanup_runtime_ets_probe || {
+        error_out "Realtime First Scheduling preflight could not remove the previously owned ETS probe device. Its identity remains in $MULTIWAN_QOS_ETS_PROBE_STATE."
+        return 1
+    }
+
     realtime_first_runtime_check_interface() {
-        local section="$1" enabled qdisc
+        local section="$1" enabled qdisc device
         config_get_bool enabled "$section" enabled 1
         [ "$enabled" -eq 1 ] || return 0
+        config_get device "$section" device
+        [ -z "$target_device_filter" ] || [ "$device" = "$target_device_filter" ] || return 0
         config_get qdisc "$section" qdisc hfsc
         case "$qdisc" in
-            hfsc|hybrid) requires_ets=1 ;;
+            hfsc) requires_ets=1; requires_hfsc=1 ;;
+            hybrid) requires_ets=1; requires_hybrid=1 ;;
         esac
     }
     config_foreach realtime_first_runtime_check_interface interface
@@ -337,6 +422,48 @@ validate_realtime_first_runtime() {
         error_out "Realtime First Scheduling requires sch_ets (OpenWrt 24.10 or newer). No qdisc was changed."
         return 1
     }
+
+    probe_device=
+    while [ "$probe_attempt" -lt 10 ]; do
+        probe_device="mqe$$_$probe_attempt"
+        if ! ip link show "$probe_device" >/dev/null 2>&1; then
+            mkdir -p "${MULTIWAN_QOS_ETS_PROBE_STATE%/*}" &&
+                printf '%s\n' "$probe_device" > "$MULTIWAN_QOS_ETS_PROBE_STATE" || {
+                    error_out "Could not reserve ownership state for ETS probe device $probe_device."
+                    return 1
+                }
+            if ip link add name "$probe_device" type ifb >/dev/null 2>&1; then
+                MULTIWAN_QOS_RUNTIME_ETS_PROBE_DEVICE="$probe_device"
+                break
+            fi
+            rm -f "$MULTIWAN_QOS_ETS_PROBE_STATE"
+        fi
+        probe_device=
+        probe_attempt=$((probe_attempt + 1))
+    done
+    [ -n "$probe_device" ] || probe_result=1
+    if [ "$probe_result" -eq 0 ] && [ "$requires_hfsc" -eq 1 ]; then
+        tc qdisc add dev "$probe_device" root handle 2: ets bands 5 strict 1 \
+            quanta 9000 13500 4500 3000 \
+            priomap 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 >/dev/null 2>&1 || probe_result=1
+        [ "$probe_result" -ne 0 ] || tc qdisc del dev "$probe_device" root >/dev/null 2>&1 || probe_result=1
+    fi
+    if [ "$probe_result" -eq 0 ] && [ "$requires_hybrid" -eq 1 ]; then
+        tc qdisc add dev "$probe_device" root handle 2: ets bands 3 strict 1 \
+            quanta 13500 1500 \
+            priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 >/dev/null 2>&1 || probe_result=1
+    fi
+    [ "$probe_result" -eq 0 ] || {
+        cleanup_runtime_ets_probe ||
+            error_out "ETS preflight failed and the owned probe could not be removed; cleanup will be retried later."
+        error_out "Realtime First Scheduling preflight failed: tc could not create an ETS qdisc. No qdisc was changed."
+        return 1
+    }
+    cleanup_runtime_ets_probe || {
+        error_out "Realtime First Scheduling preflight succeeded, but its owned probe device could not be removed. Its identity was retained for cleanup."
+        return 1
+    }
+    return 0
 }
 
 get_dscp_classid_for_qdisc() {
@@ -1723,6 +1850,25 @@ add_tc_filter() {
     tc filter add dev "$dev" parent "$parent" protocol "$proto" prio "$prio" u32 match $match_str classid "$class_id"
 }
 
+tc_filter_group_has_flowid() {
+    local filter_status="$1" expected_family="$2" expected_pref="$3" expected_flowid="$4"
+
+    printf '%s\n' "$filter_status" | awk \
+        -v family="$expected_family" \
+        -v pref="$expected_pref" \
+        -v flowid="$expected_flowid" '
+        /^filter / {
+            if (index($0, "protocol " family " ") &&
+                index($0, "pref " pref " "))
+                in_group = 1
+            else
+                in_group = 0
+        }
+        in_group && index($0, "flowid " flowid) { found = 1 }
+        END { exit(found ? 0 : 1) }
+    '
+}
+
 attach_classful_game_default_filter() {
     local DEV="$1" PARENT="$2" CLASSID="$3"
 
@@ -2089,20 +2235,94 @@ qdisc_setup_failed() {
 }
 
 rollback_qdisc_setup() {
-    local dev
+    local dev owner rollback_result=0
+    local rollback_failed_devices=""
+
+    mark_rollback_failure() {
+        local failed_device="$1" reason="$2"
+
+        case " $rollback_failed_devices " in
+            *" $failed_device "*) ;;
+            *) rollback_failed_devices="${rollback_failed_devices:+$rollback_failed_devices }$failed_device" ;;
+        esac
+        rollback_result=1
+        log_msg -warn "QoS rollback could not fully clean $failed_device: $reason"
+    }
 
     for dev in $QDISC_SETUP_WAN_DEVICES; do
-        tc qdisc del dev "$dev" ingress > /dev/null 2>&1
-        tc qdisc del dev "$dev" root > /dev/null 2>&1
+        if tc qdisc show dev "$dev" 2>/dev/null | grep -q '^qdisc ingress ffff:'; then
+            tc qdisc del dev "$dev" ingress >/dev/null 2>&1 ||
+                mark_rollback_failure "$dev" "failed to remove the WAN ingress qdisc"
+        fi
+        if tc qdisc show dev "$dev" 2>/dev/null | grep -Eq '^qdisc (hfsc|htb|cake|cake_mq) .* root'; then
+            tc qdisc del dev "$dev" root >/dev/null 2>&1 ||
+                mark_rollback_failure "$dev" "failed to remove the WAN root qdisc"
+        fi
+        if tc qdisc show dev "$dev" 2>/dev/null | grep -q '^qdisc ingress ffff:'; then
+            mark_rollback_failure "$dev" "WAN ingress qdisc remains after rollback"
+        fi
+        if tc qdisc show dev "$dev" 2>/dev/null | grep -Eq '^qdisc (hfsc|htb|cake|cake_mq) .* root'; then
+            mark_rollback_failure "$dev" "WAN root qdisc remains after rollback"
+        fi
+        rm -f "/var/run/multiwan-qos/realtime-first/${dev}.status"
+        rm -rf "/var/run/multiwan-qos/adaptive/${dev}-wan"
+        restore_qos_offload_state "$dev" ||
+            mark_rollback_failure "$dev" "failed to restore the saved NIC offload state"
     done
 
     for dev in $QDISC_SETUP_LAN_DEVICES; do
+        owner="${dev#ifb-}"
         if ip link show "$dev" > /dev/null 2>&1; then
-            tc qdisc del dev "$dev" root > /dev/null 2>&1
-            ip link set "$dev" down > /dev/null 2>&1
-            ip link del "$dev" > /dev/null 2>&1
+            if tc qdisc show dev "$dev" 2>/dev/null | grep -Eq '^qdisc (hfsc|htb|cake|cake_mq) .* root'; then
+                tc qdisc del dev "$dev" root >/dev/null 2>&1 ||
+                    mark_rollback_failure "$owner" "failed to remove the IFB root qdisc from $dev"
+            fi
+            ip link set "$dev" down >/dev/null 2>&1 ||
+                mark_rollback_failure "$owner" "failed to set IFB $dev down"
+            ip link del "$dev" >/dev/null 2>&1 ||
+                mark_rollback_failure "$owner" "failed to delete IFB $dev"
         fi
+        if ip link show "$dev" >/dev/null 2>&1; then
+            mark_rollback_failure "$owner" "IFB $dev remains after rollback"
+        fi
+        rm -rf "/var/run/multiwan-qos/adaptive/${dev}-lan"
     done
+
+    for dev in $QDISC_SETUP_WAN_DEVICES; do
+        case " $rollback_failed_devices " in
+            *" $dev "*)
+                runtime_qdisc_device_add "$dev" || {
+                    rollback_result=1
+                    log_msg -warn "QoS rollback could not preserve ownership of $dev in the cleanup ledger."
+                }
+                ;;
+            *)
+                runtime_qdisc_device_remove "$dev" || {
+                    rollback_result=1
+                    log_msg -warn "QoS rollback could not remove the cleaned device $dev from the ownership ledger."
+                }
+                ;;
+        esac
+    done
+    [ "$rollback_result" -eq 0 ] ||
+        error_out "QoS rollback was incomplete. Failed device ownership and offload state were retained for '/etc/init.d/multiwan-qos stop' to retry."
+    return "$rollback_result"
+}
+
+runtime_qdisc_device_add() {
+    local device="$1" state_file=/var/run/multiwan-qos/qdisc-devices
+
+    mkdir -p /var/run/multiwan-qos || return 1
+    grep -Fqx "$device" "$state_file" 2>/dev/null || printf '%s\n' "$device" >> "$state_file"
+}
+
+runtime_qdisc_device_remove() {
+    local device="$1" state_file=/var/run/multiwan-qos/qdisc-devices tmp
+
+    [ -f "$state_file" ] || return 0
+    tmp="${state_file}.$$"
+    grep -Fvx "$device" "$state_file" > "$tmp" 2>/dev/null || :
+    mv "$tmp" "$state_file"
 }
 
 # Appends option to ${CAKE_OPTS}
@@ -2796,10 +3016,17 @@ cleanup_interface_state() {
 
     # Make interface setup idempotent. Stale ingress filters or IFB state can
     # silently survive a partial restart and blackhole the shaped WAN path.
-    tc qdisc del dev "$device" root > /dev/null 2>&1
-    tc qdisc del dev "$device" ingress > /dev/null 2>&1
+    if tc qdisc show dev "$device" 2>/dev/null | grep -Eq '^qdisc (hfsc|htb|cake|cake_mq) .* root'; then
+        tc qdisc del dev "$device" root > /dev/null 2>&1 ||
+            qdisc_setup_failed "Failed to remove the existing root qdisc from $device."
+    fi
+    if tc qdisc show dev "$device" 2>/dev/null | grep -Eq '^qdisc ingress ffff:'; then
+        tc qdisc del dev "$device" ingress > /dev/null 2>&1 ||
+            qdisc_setup_failed "Failed to remove the existing ingress qdisc from $device."
+    fi
     clear_cake_qdisc_type "$device"
     clear_cake_qdisc_type "$lan_dev"
+    restore_qos_offload_state "$device"
 
     if ip link show "$lan_dev" > /dev/null 2>&1; then
         tc qdisc del dev "$lan_dev" root > /dev/null 2>&1
@@ -2812,7 +3039,8 @@ cleanup_interface_state() {
 record_realtime_first_status() {
     local device="$1" qdisc="$2" requested="${realtime_first_scheduling:-0}"
     local effective=0 reason=disabled topology=legacy realtime_class=1:11 bands=0
-    local status_dir=/var/run/multiwan-qos/realtime-first
+    local status_dir=/var/run/multiwan-qos/realtime-first qos_device topology_valid ets_status
+    local filter_status family pref class_id
 
     if [ "$requested" = "1" ]; then
         if [ "$realtime_rate_mode" = adaptive ]; then
@@ -2825,13 +3053,29 @@ record_realtime_first_status() {
                 *) reason=qdisc-not-applicable ;;
             esac
             if [ "$bands" -gt 0 ]; then
-                if tc qdisc show dev "$device" 2>/dev/null | grep -q '^qdisc ets 2:' &&
-                   tc qdisc show dev "ifb-$device" 2>/dev/null | grep -q '^qdisc ets 2:'; then
+                topology_valid=1
+                for qos_device in "$device" "ifb-$device"; do
+                    ets_status="$(tc qdisc show dev "$qos_device" 2>/dev/null | grep -E '^qdisc ets 2: parent 1:1')"
+                    echo "$ets_status" | grep -q "bands $bands" || topology_valid=0
+                    echo "$ets_status" | grep -q 'strict 1' || topology_valid=0
+                    tc qdisc show dev "$qos_device" 2>/dev/null |
+                        grep -Eq '^qdisc [^ ]+ 10: parent 2:1' || topology_valid=0
+                    filter_status="$(tc filter show dev "$qos_device" parent 2: 2>/dev/null)"
+                    for family in ip ipv6; do
+                        [ "$family" = ip ] && pref=10 || pref=11
+                        class_id=1
+                        while [ "$class_id" -le "$bands" ]; do
+                            tc_filter_group_has_flowid "$filter_status" "$family" "$pref" "2:$class_id" || topology_valid=0
+                            class_id=$((class_id + 1))
+                        done
+                    done
+                done
+                if [ "$topology_valid" -eq 1 ]; then
                     effective=1
                     reason=active
                     realtime_class=2:1
                 else
-                    reason=ets-not-live
+                    reason=ets-topology-incomplete
                 fi
             fi
         fi
@@ -3009,6 +3253,31 @@ setup_interface() {
     dev_mtu=$(cat "/sys/class/net/$device/mtu" 2>/dev/null)
     [ -z "$dev_mtu" ] || [ "$dev_mtu" -le 0 ] 2>/dev/null && dev_mtu=1500
 
+    # Validate every rate-dependent value before replacing ingress or root
+    # qdiscs. Invalid Manual values must leave a working topology untouched.
+    local game_up game_down
+    local game_up_override game_down_override
+    config_get game_up_override hfsc GAMEUP
+    config_get game_down_override hfsc GAMEDOWN
+
+    select_realtime_rate "$upload" "$game_up_override" upload ||
+        qdisc_setup_failed "Invalid realtime upload rate for $device."
+    game_up="$MW_SELECTED_REALTIME_RATE"
+    select_realtime_rate "$download" "$game_down_override" download ||
+        qdisc_setup_failed "Invalid realtime download rate for $device."
+    game_down="$MW_SELECTED_REALTIME_RATE"
+
+    if [ "$realtime_rate_mode" = adaptive ]; then
+        local adaptive_up_floor adaptive_up_start adaptive_up_ceiling
+        local adaptive_down_floor adaptive_down_start adaptive_down_ceiling
+        mw_realtime_adaptive_range "$upload"
+        adaptive_up_floor="$MW_RT_FLOOR"; adaptive_up_start="$MW_RT_START"; adaptive_up_ceiling="$MW_RT_CEILING"
+        mw_realtime_adaptive_range "$download"
+        adaptive_down_floor="$MW_RT_FLOOR"; adaptive_down_start="$MW_RT_START"; adaptive_down_ceiling="$MW_RT_CEILING"
+        print_msg "  Adaptive upload rate: floor=${adaptive_up_floor}k start=${adaptive_up_start}k current=${game_up}k ceiling=${adaptive_up_ceiling}k"
+        print_msg "  Adaptive download rate: floor=${adaptive_down_floor}k start=${adaptive_down_start}k current=${game_down}k ceiling=${adaptive_down_ceiling}k"
+    fi
+
     # Setup IFB with matching MTU and optional multi-queue for CAKE
     local lan_dev="ifb-$device"
     local ifb_mq_args=""
@@ -3049,29 +3318,6 @@ setup_interface() {
         action mirred egress redirect dev "$lan_dev" || \
         qdisc_setup_failed "Failed to install IFB redirect from $device to $lan_dev."
     
-    # Calculate a small realtime reserve per interface. The non-realtime lane
-    # gets the rest of the link and is still host-fair through CAKE in hybrid.
-    local game_up game_down
-    local game_up_override game_down_override
-    config_get game_up_override hfsc GAMEUP
-    config_get game_down_override hfsc GAMEDOWN
-
-    select_realtime_rate "$upload" "$game_up_override" upload || return 1
-    game_up="$MW_SELECTED_REALTIME_RATE"
-    select_realtime_rate "$download" "$game_down_override" download || return 1
-    game_down="$MW_SELECTED_REALTIME_RATE"
-
-    if [ "$realtime_rate_mode" = adaptive ]; then
-        local adaptive_up_floor adaptive_up_start adaptive_up_ceiling
-        local adaptive_down_floor adaptive_down_start adaptive_down_ceiling
-        mw_realtime_adaptive_range "$upload"
-        adaptive_up_floor="$MW_RT_FLOOR"; adaptive_up_start="$MW_RT_START"; adaptive_up_ceiling="$MW_RT_CEILING"
-        mw_realtime_adaptive_range "$download"
-        adaptive_down_floor="$MW_RT_FLOOR"; adaptive_down_start="$MW_RT_START"; adaptive_down_ceiling="$MW_RT_CEILING"
-        print_msg "  Adaptive upload rate: floor=${adaptive_up_floor}k start=${adaptive_up_start}k current=${game_up}k ceiling=${adaptive_up_ceiling}k"
-        print_msg "  Adaptive download rate: floor=${adaptive_down_floor}k start=${adaptive_down_start}k current=${game_down}k ceiling=${adaptive_down_ceiling}k"
-    fi
-
     case "$qdisc" in
         hfsc)
             print_msg "  Applying HFSC (UL: ${upload}k, DL: ${download}k, game UL/DL: ${game_up}k/${game_down}k, MTU: ${dev_mtu})"
@@ -3146,7 +3392,10 @@ case "${realtime_first_scheduling:-0}" in
     *) error_out "Unsupported realtime_first_scheduling value '$realtime_first_scheduling'. Expected 0 or 1."; exit 1 ;;
 esac
 
-validate_realtime_first_runtime || exit 1
+case "$1" in
+    device-event|refresh-device) ;;
+    *) validate_realtime_first_runtime || exit 1 ;;
+esac
 
 if [ "$gameqdisc" = "qfq" ]; then
     case "$gameqdisc_child" in
@@ -3170,6 +3419,107 @@ if [ "$1" = "device-event" ]; then
         error_out "MultiWAN QoS is restarting; the device event will be retried by hotplug."
         exit 75
     }
+    [ "$global_enabled" = "1" ] || {
+        error_out "MultiWAN QoS is disabled; ignoring the device event for $target_device."
+        exit 76
+    }
+
+    interface_qos_state_ready() {
+        local device="$1" lan_dev="$2" qdisc="$3" root_pattern ets_bands qos_device ets_status ingress_status leaf_handle
+        local wan_mtu ifb_mtu require_filters filter_status family pref class_id
+
+        legacy_dscp_filters_ready() {
+            local filter_device="$1" filter_qdisc="$2" filter_status family pref class_ids class_id
+
+            filter_status="$(tc filter show dev "$filter_device" parent 1: 2>/dev/null)"
+            case "$filter_qdisc" in
+                hfsc)
+                    for family in ip ipv6; do
+                        [ "$family" = ip ] && pref=10 || pref=11
+                        class_ids="11 12 13 14 15"
+                        for class_id in $class_ids; do
+                            tc_filter_group_has_flowid "$filter_status" "$family" "$pref" "1:$class_id" || return 1
+                        done
+                    done
+                    ;;
+                hybrid|htb)
+                    for class_id in 11 15; do
+                        tc_filter_group_has_flowid "$filter_status" ip 10 "1:$class_id" || return 1
+                    done
+                    for class_id in 11 13 15; do
+                        tc_filter_group_has_flowid "$filter_status" ipv6 11 "1:$class_id" || return 1
+                    done
+                    ;;
+                *) return 1 ;;
+            esac
+            return 0
+        }
+
+        ip link show "$device" >/dev/null 2>&1 || return 1
+        ip link show "$lan_dev" >/dev/null 2>&1 || return 1
+        ip link show "$lan_dev" 2>/dev/null | grep -Eq '<[^>]*UP([,>])' || return 1
+        wan_mtu="$(cat "/sys/class/net/$device/mtu" 2>/dev/null)"
+        ifb_mtu="$(cat "/sys/class/net/$lan_dev/mtu" 2>/dev/null)"
+        case "$wan_mtu:$ifb_mtu" in
+            *[!0-9:]*|:*) return 1 ;;
+        esac
+        [ "$wan_mtu" = "$ifb_mtu" ] || return 1
+        case "$qdisc" in
+            cake) root_pattern='^qdisc (cake|cake_mq) .* root' ;;
+            hfsc|hybrid) root_pattern='^qdisc hfsc 1: root' ;;
+            htb) root_pattern='^qdisc htb 1: root' ;;
+            *) return 1 ;;
+        esac
+        tc qdisc show dev "$device" 2>/dev/null | grep -Eq "$root_pattern" || return 1
+        tc qdisc show dev "$lan_dev" 2>/dev/null | grep -Eq "$root_pattern" || return 1
+        tc qdisc show dev "$device" 2>/dev/null | grep -Eq '^qdisc ingress ffff:' || return 1
+        ingress_status="$(tc filter show dev "$device" parent ffff: 2>/dev/null)"
+        echo "$ingress_status" | awk '
+            /^filter .* pref 1 / { in_pref = 1 }
+            /^filter .* pref [0-9]+ / && $0 !~ / pref 1 / { in_pref = 0 }
+            in_pref && /ctinfo/ { found = 1 }
+            END { exit(found ? 0 : 1) }
+        ' || return 1
+        echo "$ingress_status" | awk -v expected="$lan_dev" '
+            /^filter .* pref 2 / { in_pref = 1 }
+            /^filter .* pref [0-9]+ / && $0 !~ / pref 2 / { in_pref = 0 }
+            in_pref && /mirred/ && /[Rr]edirect/ && index($0, expected) { found = 1 }
+            END { exit(found ? 0 : 1) }
+        ' || return 1
+        if realtime_first_is_effective "$qdisc"; then
+            [ "$qdisc" = hfsc ] && ets_bands=5 || ets_bands=3
+            for qos_device in "$device" "$lan_dev"; do
+                ets_status="$(tc qdisc show dev "$qos_device" 2>/dev/null | grep -E '^qdisc ets 2: parent 1:1')"
+                echo "$ets_status" | grep -q "bands $ets_bands" || return 1
+                echo "$ets_status" | grep -q 'strict 1' || return 1
+                tc qdisc show dev "$qos_device" 2>/dev/null |
+                    grep -Eq '^qdisc [^ ]+ 10: parent 2:1' || return 1
+                filter_status="$(tc filter show dev "$qos_device" parent 2: 2>/dev/null)"
+                for family in ip ipv6; do
+                    [ "$family" = ip ] && pref=10 || pref=11
+                    class_id=1
+                    while [ "$class_id" -le "$ets_bands" ]; do
+                        tc_filter_group_has_flowid "$filter_status" "$family" "$pref" "2:$class_id" || return 1
+                        class_id=$((class_id + 1))
+                    done
+                done
+            done
+        elif [ "$qdisc" != cake ]; then
+            [ "$qdisc" = htb ] && leaf_handle=110 || leaf_handle=10
+            for qos_device in "$device" "$lan_dev"; do
+                tc class show dev "$qos_device" classid 1:11 2>/dev/null | grep -q 'class ' || return 1
+                tc qdisc show dev "$qos_device" 2>/dev/null |
+                    grep -Eq "^qdisc [^ ]+ ${leaf_handle}: parent 1:11" || return 1
+                require_filters=0
+                [ "$qos_device" = "$lan_dev" ] && require_filters=1
+                [ "$SFO_ENABLED" = "1" ] && require_filters=1
+                if [ "$require_filters" -eq 1 ]; then
+                    legacy_dscp_filters_ready "$qos_device" "$qdisc" || return 1
+                fi
+            done
+        fi
+        return 0
+    }
 
     device_lock_acquired=0
     device_lock_cleanup() {
@@ -3187,21 +3537,32 @@ if [ "$1" = "device-event" ]; then
     }
     device_lock_acquired=1
     device_lock_token="$MW_LOCK_TOKEN"
+    if [ "$device_action" = attach ]; then
+        validate_realtime_first_runtime "$target_device" || exit 1
+    fi
 
     device_found=0
     process_device_event() {
-        local config="$1" device enabled lan_dev
+        local config="$1" device enabled lan_dev qdisc
         config_get device "$config" device
         [ "$device" = "$target_device" ] || return 0
         config_get_bool enabled "$config" enabled 1
         [ "$enabled" -eq 1 ] || return 0
+        config_get qdisc "$config" qdisc hfsc
         device_found=1
         lan_dev="ifb-$device"
         if [ "$device_action" = detach ]; then
+            mkdir -p /var/run/multiwan-qos/adaptive ||
+                qdisc_setup_failed "Failed to create the Adaptive detach-state directory."
+            : > "/var/run/multiwan-qos/adaptive/.detached-${device}" ||
+                qdisc_setup_failed "Failed to mark $device detached before QoS teardown."
+            : > "/var/run/multiwan-qos/adaptive/.detached-${lan_dev}" ||
+                qdisc_setup_failed "Failed to mark $lan_dev detached before QoS teardown."
             cleanup_interface_state "$device" "$lan_dev"
             rm -rf "/var/run/multiwan-qos/adaptive/${device}-wan" \
                 "/var/run/multiwan-qos/adaptive/${lan_dev}-lan"
             rm -f "/var/run/multiwan-qos/realtime-first/${device}.status"
+            runtime_qdisc_device_remove "$device"
             log_msg "Detached QoS state for $device; other WAN qdiscs and classifiers were preserved."
             return 0
         fi
@@ -3219,7 +3580,17 @@ if [ "$1" = "device-event" ]; then
             device_event_result=1
             return 0
         }
+        if interface_qos_state_ready "$device" "$lan_dev" "$qdisc"; then
+            rm -f "/var/run/multiwan-qos/adaptive/.detached-${device}" \
+                "/var/run/multiwan-qos/adaptive/.detached-${lan_dev}"
+            runtime_qdisc_device_add "$device"
+            log_msg "QoS state for $device is already attached; duplicate device event was ignored."
+            return 0
+        fi
         if setup_interface "$config"; then
+            rm -f "/var/run/multiwan-qos/adaptive/.detached-${device}" \
+                "/var/run/multiwan-qos/adaptive/.detached-${lan_dev}"
+            runtime_qdisc_device_add "$device"
             log_msg "Attached QoS state for $device; other WAN qdiscs and classifiers were preserved."
         else
             error_out "Failed to attach QoS state for $device."
@@ -3239,6 +3610,8 @@ fi
 if [ "$1" = "refresh-device" ]; then
     target_device="$2"
     [ -z "$target_device" ] && { error_out "Usage: multiwan_qos.sh refresh-device <device>"; exit 1; }
+    case "$target_device" in *[!A-Za-z0-9_.:@-]*) error_out "Unsafe QoS device name '$target_device'."; exit 1 ;; esac
+    [ "$global_enabled" = "1" ] || { error_out "MultiWAN QoS is disabled; refusing to rebuild $target_device."; exit 1; }
 
     [ -f "$MULTIWAN_QOS_RESTARTING_FILE" ] && {
         error_out "MultiWAN QoS is restarting; refresh-device is temporarily disabled."
@@ -3266,23 +3639,7 @@ if [ "$1" = "refresh-device" ]; then
     }
     refresh_lock_acquired=1
     refresh_lock_token="$MW_LOCK_TOKEN"
-
-    # Per-device cooldown: prevent rapid sequential rebuilds from any caller.
-    # The multiwan_nfttrack side has its own 60s cooldown; this 30s guard is
-    # defense-in-depth on the multiwan_qos side.
-    _cd_file="/tmp/multiwan_qos_refresh_${target_device}"
-    _cd_now=
-    _cd_last=
-    _cd_secs=30
-    _cd_now="$(date +%s 2>/dev/null)" || _cd_now=0
-    _cd_last="$(cat "$_cd_file" 2>/dev/null)"
-    case "$_cd_last" in ""|*[!0-9]*) _cd_last=0 ;; esac
-    if [ "$_cd_now" -gt 0 ] && [ "$_cd_last" -gt 0 ] && \
-       [ $((_cd_now - _cd_last)) -lt "$_cd_secs" ]; then
-        log_msg "Skipping refresh for $target_device: cooldown active (${_cd_secs}s)"
-        exit 0
-    fi
-    [ "$_cd_now" -gt 0 ] && printf '%s\n' "$_cd_now" > "$_cd_file" 2>/dev/null
+    validate_realtime_first_runtime "$target_device" || exit 1
 
     # Only allow refresh if the nft table already exists â€” qdisc refresh
     # relies on existing MultiWAN QoS classification/ctinfo state.
@@ -3291,80 +3648,42 @@ if [ "$1" = "refresh-device" ]; then
         exit 1
     }
 
-    refresh_interface_soft() {
-        local config="$1" device download qdisc enabled preset overhead mpu
-        local dev_mtu lan_dev game_down game_down_override
-
-        config_get device "$config" device
-        [ "$device" = "$target_device" ] || return 1
-
-        config_get_bool enabled "$config" enabled 1
-        [ "$enabled" -eq 1 ] || return 1
-
-        config_get download "$config" download
-        config_get qdisc "$config" qdisc 'hfsc'
-        config_get preset "$config" preset 'ethernet'
-        config_get overhead "$config" overhead
-        config_get mpu "$config" mpu
-
-        if [ "$download" -lt 1000 ] 2>/dev/null; then
-            download=1000
-        fi
-        if [ "$download" -gt 2500000 ] 2>/dev/null; then
-            download=2500000
-        fi
-
-        case "$qdisc" in
-            hfsc|htb|hybrid) ;;
-            *) return 1 ;;
-        esac
-
-        lan_dev="ifb-$device"
-        ip link show "$lan_dev" >/dev/null 2>&1 || return 1
-
-        dev_mtu=$(cat "/sys/class/net/$device/mtu" 2>/dev/null)
-        [ -z "$dev_mtu" ] || [ "$dev_mtu" -le 0 ] 2>/dev/null && dev_mtu=1500
-
-        config_get game_down_override hfsc GAMEDOWN
-        select_realtime_rate "$download" "$game_down_override" download || return 1
-        game_down="$MW_SELECTED_REALTIME_RATE"
-
-        log_msg "Rebuilding qdisc tree for $device via $lan_dev"
-        disable_qos_offloads "$device" "wan"
-        disable_qos_offloads "$lan_dev" "ifb"
-        disable_configured_extra_offloads
-        setup_interface_qdisc_direction "$lan_dev" "$download" "$game_down" "lan" "$qdisc" "$preset" "$overhead" "$dev_mtu" "$mpu" || return 1
-        apply_tc_custom_ingress_rules "$lan_dev" "$qdisc"
-    }
-
     found=0
+    refresh_result=0
     refresh_single_interface() {
-        local config="$1" device qdisc
+        local config="$1" device enabled
         config_get device "$config" device
         [ "$device" = "$target_device" ] || return 0
         found=1
-        local lan_dev="ifb-$device"
-        config_get qdisc "$config" qdisc 'hfsc'
-        [ "$qdisc" = "cake" ] && {
-            log_msg "Refreshing qdiscs for $device using full rebuild"
-            cleanup_interface_state "$device" "$lan_dev"
-            setup_interface "$config"
-            return 0
-        }
-        if refresh_interface_soft "$config"; then
-            log_msg "Soft qdisc refresh complete for $device (WAN ingress left untouched)"
+        config_get_bool enabled "$config" enabled 1
+        if [ "$enabled" -ne 1 ]; then
+            error_out "Device '$target_device' is disabled in multiwan-qos."
+            refresh_result=1
             return 0
         fi
-
-        log_msg -warn "Soft qdisc refresh unavailable for $device; falling back to full refresh"
-        cleanup_interface_state "$device" "$lan_dev"
-        setup_interface "$config"
+        ip link show "$device" >/dev/null 2>&1 || {
+            error_out "Cannot rebuild QoS for $device because the device is not present."
+            refresh_result=1
+            return 0
+        }
+        log_msg "Rebuilding upload and download qdisc trees for $device"
+        if setup_interface "$config"; then
+            rm -f "/var/run/multiwan-qos/adaptive/.detached-${device}" \
+                "/var/run/multiwan-qos/adaptive/.detached-ifb-${device}"
+            runtime_qdisc_device_add "$device" || {
+                error_out "QoS was rebuilt for $device, but its runtime ownership could not be recorded."
+                refresh_result=1
+            }
+        else
+            refresh_result=1
+        fi
     }
 
     config_foreach refresh_single_interface interface
 
     [ "$found" -eq 1 ] || { error_out "Device '$target_device' not found in multiwan_qos config"; exit 1; }
-    log_msg "Qdisc refresh complete for $target_device â€” nftables and firewall untouched"
+    [ "$refresh_result" -eq 0 ] || { error_out "Qdisc rebuild failed for $target_device."; exit 1; }
+    log_msg "Qdisc rebuild complete for $target_device; nftables and firewall were untouched"
     exit 0
 fi
 
@@ -3431,6 +3750,14 @@ EOF
 }
 
 setup_multicast_policing
+
+mkdir -p /var/run/multiwan-qos
+runtime_devices_tmp="/var/run/multiwan-qos/qdisc-devices.$$"
+: > "$runtime_devices_tmp"
+for runtime_device in $QDISC_SETUP_WAN_DEVICES; do
+    printf '%s\n' "$runtime_device" >> "$runtime_devices_tmp"
+done
+mv "$runtime_devices_tmp" /var/run/multiwan-qos/qdisc-devices
 
 print_msg "DONE!"
 

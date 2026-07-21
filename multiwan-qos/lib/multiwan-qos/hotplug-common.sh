@@ -3,11 +3,21 @@
 # packaged and generated hotplug entry points.
 
 [ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || exit 0
-/etc/init.d/multiwan-qos running >/dev/null 2>&1 || exit 0
 
 . /lib/functions.sh
 . /lib/functions/network.sh
 . /lib/multiwan-qos/process-lock.sh
+
+qos_is_enabled() {
+    local enabled
+    config_load multiwan-qos
+    config_get_bool enabled global enabled 0
+    [ "$enabled" -eq 1 ]
+}
+
+# A Default or Manual configuration may have no long-running procd process,
+# so service "running" is not a valid enabled-state check.
+qos_is_enabled || exit 0
 
 [ -n "$DEVICE" ] || {
     network_flush_cache
@@ -33,6 +43,7 @@ config_foreach check_interface interface
 state_root=/var/run/multiwan-qos/hotplug
 lockdir="/tmp/multiwan_qos-hotplug-$DEVICE.lock"
 pending_file="$state_root/$DEVICE.pending"
+claimed_file="$state_root/$DEVICE.claim"
 status_file="$state_root/$DEVICE.status"
 mkdir -p "$state_root"
 
@@ -69,6 +80,13 @@ done
 
 lock_token="$MW_LOCK_TOKEN"
 release_hotplug_lock() {
+    if [ -f "$claimed_file" ]; then
+        if [ -f "$pending_file" ]; then
+            rm -f "$claimed_file"
+        else
+            mv "$claimed_file" "$pending_file" 2>/dev/null || true
+        fi
+    fi
     mw_lock_release_for "$lockdir" "$lock_token"
 }
 trap release_hotplug_lock EXIT
@@ -76,9 +94,19 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Recover a claim left by an abruptly terminated previous worker. A newer
+# pending event wins because hotplug intentionally coalesces to latest state.
+if [ -f "$claimed_file" ]; then
+    if [ -f "$pending_file" ]; then
+        rm -f "$claimed_file"
+    else
+        mv "$claimed_file" "$pending_file" 2>/dev/null || true
+    fi
+fi
+
 wait_for_l3_device() {
     local waited=0 resolved_device mtu
-    while [ "$waited" -lt 30 ]; do
+    while [ "$waited" -lt 120 ]; do
         [ -f "$pending_file" ] && return 2
         network_flush_cache
         resolved_device=
@@ -97,7 +125,8 @@ wait_for_l3_device() {
 
 run_device_event() {
     local operation="$1" device="$2" retry=0 rv
-    while [ "$retry" -lt 5 ]; do
+    while [ "$retry" -lt 180 ]; do
+        [ -f "$pending_file" ] && return 77
         /bin/sh /etc/multiwan-qos.sh device-event "$operation" "$device"
         rv=$?
         [ "$rv" -eq 75 ] || return "$rv"
@@ -107,45 +136,68 @@ run_device_event() {
     return 75
 }
 
-processed=0
-while [ "$processed" -lt 8 ]; do
-    [ -f "$pending_file" ] || break
-    read -r event_action event_interface event_device < "$pending_file"
-    rm -f "$pending_file"
-    processed=$((processed + 1))
+while true; do
+    if ! mv "$pending_file" "$claimed_file" 2>/dev/null; then
+        [ -f "$pending_file" ] && continue
+        break
+    fi
+    read -r event_action event_interface event_device < "$claimed_file"
+
+    if ! qos_is_enabled; then
+        write_status "$event_action" ignored "service-disabled"
+        rm -f "$claimed_file"
+        continue
+    fi
 
     case "$event_action" in
         ifdown)
-            if run_device_event detach "$event_device"; then
-                write_status "$event_action" detached "affected-device-only"
-                logger -t multiwan_qos "Detached QoS for $event_interface ($event_device); healthy WANs were untouched"
-            else
-                write_status "$event_action" failed "detach-error"
-                logger -t multiwan_qos "Failed to detach QoS for $event_interface ($event_device); healthy WANs were untouched"
-            fi
+            run_device_event detach "$event_device"
+            event_result=$?
+            case "$event_result" in
+                0)
+                    write_status "$event_action" detached "affected-device-only"
+                    logger -t multiwan_qos "Detached QoS for $event_interface ($event_device); healthy WANs were untouched"
+                    ;;
+                76) write_status "$event_action" ignored "service-disabled" ;;
+                77) write_status "$event_action" superseded "newer-event-pending" ;;
+                *)
+                    write_status "$event_action" failed "detach-error-$event_result"
+                    logger -t multiwan_qos "Failed to detach QoS for $event_interface ($event_device); healthy WANs were untouched"
+                    ;;
+            esac
             ;;
         ifup)
             wait_for_l3_device
             ready_result=$?
             if [ "$ready_result" -eq 2 ]; then
                 write_status "$event_action" superseded "newer-event-pending"
+                rm -f "$claimed_file"
                 continue
             elif [ "$ready_result" -ne 0 ]; then
                 write_status "$event_action" failed "l3-device-not-ready"
                 logger -t multiwan_qos "QoS attach timed out waiting for $event_interface ($event_device)"
-            elif run_device_event attach "$event_device"; then
-                write_status "$event_action" attached "affected-device-only"
-                logger -t multiwan_qos "Attached QoS for $event_interface ($event_device); healthy WANs were untouched"
             else
-                write_status "$event_action" failed "attach-error"
-                logger -t multiwan_qos "Failed to attach QoS for $event_interface ($event_device); healthy WANs were untouched"
+                run_device_event attach "$event_device"
+                event_result=$?
+                case "$event_result" in
+                    0)
+                        write_status "$event_action" attached "affected-device-only"
+                        logger -t multiwan_qos "Attached QoS for $event_interface ($event_device); healthy WANs were untouched"
+                        ;;
+                    76) write_status "$event_action" ignored "service-disabled" ;;
+                    77) write_status "$event_action" superseded "newer-event-pending" ;;
+                    *)
+                        write_status "$event_action" failed "attach-error-$event_result"
+                        logger -t multiwan_qos "Failed to attach QoS for $event_interface ($event_device); healthy WANs were untouched"
+                        ;;
+                esac
             fi
             ;;
     esac
+
+    rm -f "$claimed_file"
 
     # Give a racing event time to publish its replacement request before this
     # worker releases the per-device lock.
     sleep 1
 done
-
-[ "$processed" -lt 8 ] || logger -t multiwan_qos "Hotplug coalescing limit reached for $DEVICE; the newest result is recorded in $status_file"

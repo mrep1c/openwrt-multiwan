@@ -29,6 +29,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WORKFLOW_RUN_ACTOR: ${{ github.event.workflow_run.actor.login }}
         run: |
           build=false
           reason="unsupported event"
@@ -39,7 +40,9 @@ jobs:
               reason="manual dispatch"
               ;;
             workflow_run)
-              if [ "$WORKFLOW_RUN_CONCLUSION" != "success" ]; then
+              if [ "$WORKFLOW_RUN_ACTOR" = "github-actions[bot]" ]; then
+                reason="ignoring the bot-authored auto-bump follow-up run"
+              elif [ "$WORKFLOW_RUN_CONCLUSION" != "success" ]; then
                 reason="auto-bump workflow did not succeed"
               else
                 changed_files="$(git diff --name-only HEAD^ HEAD)"
