@@ -134,6 +134,7 @@ return view.extend({
             var m, s, o;
             var rootQdisc = getPrimaryInterfaceQdisc();
             var gameqdisc = uci.get('multiwan-qos', 'hfsc', 'gameqdisc') || 'pfifo';
+            var realtimeRateMode = uci.get('multiwan-qos', 'hfsc', 'realtime_rate_mode') || 'default';
 
             var relevanceText = '';
             if (rootQdisc === 'hfsc') {
@@ -179,19 +180,14 @@ return view.extend({
         o.value('netem', _('NETEM'));
         o.default = 'pfifo';
 
-        o = s.option(form.Flag, 'realtime_first_scheduling', _('Realtime First Scheduling'),
-            _('For HFSC and Hybrid in Default or Manual mode, place an ETS scheduler below the link shaper so EF, CS5, CS6, and CS7 are dequeued before non-realtime traffic. The selected game queue discipline remains unchanged. Continuously backlogged realtime traffic can delay or starve lower bands. Requires OpenWrt 24.10 or newer.'));
+        var realtimeFirstDescription = _('For HFSC and Hybrid in Default or Manual mode, place an ETS scheduler below the link shaper so EF, CS5, CS6, and CS7 are dequeued before non-realtime traffic. The selected game queue discipline remains unchanged. Continuously backlogged realtime traffic can delay or starve lower bands. Requires OpenWrt 24.10 or newer.');
+        if (realtimeRateMode === 'adaptive')
+            realtimeFirstDescription += ' ' + _('Currently unavailable because Adaptive takes precedence; the saved toggle value is preserved.');
+
+        o = s.option(form.Flag, 'realtime_first_scheduling', _('Realtime First Scheduling'), realtimeFirstDescription);
         o.default = '0';
         o.rmempty = false;
-        o.retain = true;
-        o.depends('realtime_rate_mode', 'default');
-        o.depends('realtime_rate_mode', 'manual');
-
-        o = s.option(form.DummyValue, '_realtime_first_adaptive', _('Realtime First Scheduling'),
-            _('Adaptive takes precedence and keeps the bounded HFSC realtime class, so Realtime First Scheduling is not applied. Its saved toggle value is preserved.'));
-        o.rawhtml = true;
-        o.default = '<em>' + _('Unavailable while Adaptive is selected') + '</em>';
-        o.depends('realtime_rate_mode', 'adaptive');
+        o.readonly = (realtimeRateMode === 'adaptive');
 
         o = s.option(form.ListValue, 'realtime_rate_mode', _('Realtime Rate Mode'),
             _('Default uses a fixed 1500 kbit/s reserve capped at 25% of the link. Manual uses the overrides below. Adaptive idles and starts new realtime sessions at 1000 kbit/s. While realtime packets are present, measured demand may adjust the HFSC rate from 300 to 1800 kbit/s, capped at 25% of the link. The first one-second sample without realtime traffic returns the rate to 1000 kbit/s; the 20-second session grace tracks continuity only and cannot lower the rate. Increases use the highest one-second demand sample from the last 3 seconds plus a 200 kbit/s reserve. Decreases use 30-second smoothed demand and 5-second burst memory, require clean drop and backlog history, and move in 50 kbit/s steps no faster than every 10 seconds. BFIFO and PFIFO use a fixed queue profile calculated at 1000 kbit/s; Adaptive changes only the HFSC class and never resizes the selected game qdisc.'));
