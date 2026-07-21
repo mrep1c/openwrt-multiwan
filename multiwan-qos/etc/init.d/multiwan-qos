@@ -60,6 +60,8 @@ MULTIWAN_QOS_RESTARTING_FILE=/tmp/multiwan_qos_restarting
 MULTIWAN_QOS_REFRESH_LOCK_DIR=/var/run/multiwan_qos-refresh.lock
 MULTIWAN_QOS_LIFECYCLE_LOCK_HELD=0
 MULTIWAN_QOS_LIFECYCLE_LOCK_TOKEN=
+MULTIWAN_QOS_START_RESULT=0
+MULTIWAN_QOS_STOP_RESULT=0
 MULTIWAN_QOS_ETS_PROBE_DEVICE=
 MULTIWAN_QOS_ETS_PROBE_STATE=/var/run/multiwan-qos/ets-probe-device
 MULTIWAN_QOS_PACKAGE_LOCK=/tmp/multiwan_qos-package-install.lock
@@ -280,6 +282,32 @@ quiesce_agent_for_stop() {
     mw_lock_reclaim_stale "$lock_dir" 2>/dev/null
     rm -f /tmp/multiwan_qos_agent_rules.nft /tmp/multiwan_qos_agent_last_seen /tmp/multiwan_qos_agent_rate_limit /tmp/multiwan_qos_agent_state.json /var/run/multiwan-qos/agent-session
     return 0
+}
+
+restore_offload_state_file() {
+    local state_file="$1" device feature value restore_result=0
+
+    [ -r "$state_file" ] || return 0
+    device="${state_file##*/}"
+    case "$device" in ''|*[!A-Za-z0-9_.:@-]*) return 1 ;; esac
+    command -v ethtool >/dev/null 2>&1 || {
+        log_msg -warn "Could not restore saved offloads for $device because ethtool is unavailable."
+        return 1
+    }
+    ip link show "$device" >/dev/null 2>&1 || {
+        log_msg -warn "Deferring saved offload restoration for unavailable device $device."
+        return 2
+    }
+    while read -r feature value; do
+        case "$feature:$value" in
+            gro:on|gro:off|gso:on|gso:off|tso:on|tso:off|rx-gro-list:on|rx-gro-list:off|tx-udp-segmentation:on|tx-udp-segmentation:off|hw-tc-offload:on|hw-tc-offload:off)
+                ethtool -K "$device" "$feature" "$value" >/dev/null 2>&1 ||
+                    { log_msg -warn "Could not restore $feature=$value on $device."; restore_result=1; }
+                ;;
+        esac
+    done < "$state_file"
+    [ "$restore_result" -eq 0 ] && rm -f "$state_file"
+    return "$restore_result"
 }
 
 acquire_qos_lifecycle_lock() {
@@ -2213,6 +2241,7 @@ start_service_impl() {
 start_service() {
     local rv lifecycle_lock_owner=0
 
+    MULTIWAN_QOS_START_RESULT=0
     if is_package_script_context; then
         log_msg "Skipping service start during package installation."
         return 0
@@ -2220,18 +2249,31 @@ start_service() {
 
     if [ "$MULTIWAN_QOS_LIFECYCLE_LOCK_HELD" -ne 1 ]; then
         mark_multiwan_qos_restarting
-        acquire_qos_lifecycle_lock || { clear_multiwan_qos_restarting; return 1; }
+        acquire_qos_lifecycle_lock || {
+            clear_multiwan_qos_restarting
+            MULTIWAN_QOS_START_RESULT=1
+            return 1
+        }
         lifecycle_lock_owner=1
         arm_qos_lifecycle_traps
     fi
     if ! cleanup_agent_runtime_files; then
         [ "$lifecycle_lock_owner" -eq 1 ] && finish_qos_lifecycle
+        MULTIWAN_QOS_START_RESULT=1
         return 1
     fi
     start_service_impl
     rv=$?
     [ "$lifecycle_lock_owner" -eq 1 ] && finish_qos_lifecycle
+    MULTIWAN_QOS_START_RESULT="$rv"
     return $rv
+}
+
+# rc.common closes the procd service after start_service() and otherwise returns
+# that close operation's status. Preserve the actual QoS startup result for the
+# caller after procd registration is complete.
+service_started() {
+    return "${MULTIWAN_QOS_START_RESULT:-0}"
 }
 
 stop_legacy_processes() {
@@ -2310,7 +2352,7 @@ stop_qos_supervised_processes() {
 stop_service_impl() {
     . /lib/functions/network.sh
 
-    local stop_result=0 offload_state device
+    local stop_result=0 offload_state offload_restore_result device
     local qdisc_state=/var/run/multiwan-qos/qdisc-devices
     local cleanup_list=/var/run/multiwan-qos/qdisc-devices.cleanup.$$
     local cleanup_failed=/var/run/multiwan-qos/qdisc-devices.failed.$$
@@ -2368,29 +2410,6 @@ stop_service_impl() {
             device_result=1
         fi
         return "$device_result"
-    }
-
-    restore_offload_state_file() {
-        local state_file="$1" device feature value restore_result=0
-
-        [ -r "$state_file" ] || return 0
-        device="${state_file##*/}"
-        case "$device" in ''|*[!A-Za-z0-9_.:@-]*) return 1 ;; esac
-        if command -v ethtool >/dev/null 2>&1 && ip link show "$device" >/dev/null 2>&1; then
-            while read -r feature value; do
-                case "$feature:$value" in
-                    gro:on|gro:off|gso:on|gso:off|tso:on|tso:off|rx-gro-list:on|rx-gro-list:off|tx-udp-segmentation:on|tx-udp-segmentation:off|hw-tc-offload:on|hw-tc-offload:off)
-                        ethtool -K "$device" "$feature" "$value" >/dev/null 2>&1 ||
-                            { log_msg -warn "Could not restore $feature=$value on $device."; restore_result=1; }
-                        ;;
-                esac
-            done < "$state_file"
-        else
-            log_msg -warn "Could not restore saved offloads for $device because the device or ethtool is unavailable."
-            restore_result=1
-        fi
-        [ "$restore_result" -eq 0 ] && rm -f "$state_file"
-        return "$restore_result"
     }
 
     cleanup_interface() {
@@ -2475,7 +2494,12 @@ stop_service_impl() {
     rm -f "$cleanup_list"
     for offload_state in /var/run/multiwan-qos/offloads/*; do
         [ -f "$offload_state" ] || continue
-        restore_offload_state_file "$offload_state" || stop_result=1
+        restore_offload_state_file "$offload_state"
+        offload_restore_result=$?
+        case "$offload_restore_result" in
+            0|2) ;;
+            *) stop_result=1 ;;
+        esac
     done
     rmdir /var/run/multiwan-qos/offloads 2>/dev/null
 
@@ -2508,9 +2532,14 @@ stop_service_impl() {
 
 stop_service() {
     local rv lifecycle_lock_owner=0
+    MULTIWAN_QOS_STOP_RESULT=0
     if [ "$MULTIWAN_QOS_LIFECYCLE_LOCK_HELD" -ne 1 ]; then
         mark_multiwan_qos_restarting
-        acquire_qos_lifecycle_lock stop || { clear_multiwan_qos_restarting; return 1; }
+        acquire_qos_lifecycle_lock stop || {
+            clear_multiwan_qos_restarting
+            MULTIWAN_QOS_STOP_RESULT=1
+            return 1
+        }
         lifecycle_lock_owner=1
         arm_qos_lifecycle_traps
     fi
@@ -2526,11 +2555,14 @@ stop_service() {
             finish_qos_lifecycle 1
         fi
     fi
+    MULTIWAN_QOS_STOP_RESULT="$rv"
     return $rv
 }
 
 service_stopped() {
+    local rv="${MULTIWAN_QOS_STOP_RESULT:-0}"
     finish_qos_lifecycle
+    return "$rv"
 }
 
 shutdown() {

@@ -3751,13 +3751,36 @@ EOF
 
 setup_multicast_policing
 
-mkdir -p /var/run/multiwan-qos
-runtime_devices_tmp="/var/run/multiwan-qos/qdisc-devices.$$"
-: > "$runtime_devices_tmp"
-for runtime_device in $QDISC_SETUP_WAN_DEVICES; do
-    printf '%s\n' "$runtime_device" >> "$runtime_devices_tmp"
-done
-mv "$runtime_devices_tmp" /var/run/multiwan-qos/qdisc-devices
+commit_runtime_qdisc_ledger() {
+    local state_root=/var/run/multiwan-qos
+    local state_file="$state_root/qdisc-devices"
+    local state_tmp="$state_file.$$"
+    local runtime_device
+
+    mkdir -p "$state_root" || return 1
+    : > "$state_tmp" || {
+        rm -f "$state_tmp"
+        return 1
+    }
+    for runtime_device in $QDISC_SETUP_WAN_DEVICES; do
+        if ! grep -Fqx "$runtime_device" "$state_tmp" 2>/dev/null; then
+            printf '%s\n' "$runtime_device" >> "$state_tmp" || {
+                rm -f "$state_tmp"
+                return 1
+            }
+        fi
+    done
+    mv "$state_tmp" "$state_file" || {
+        rm -f "$state_tmp"
+        return 1
+    }
+}
+
+commit_runtime_qdisc_ledger || {
+    error_out "Could not publish the QoS qdisc ownership ledger; rolling back the configured dataplane."
+    rollback_qdisc_setup
+    exit 1
+}
 
 print_msg "DONE!"
 
