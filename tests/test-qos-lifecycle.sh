@@ -32,11 +32,21 @@ service_stopped || stop_result=$?
 [ "$stop_result" -eq 29 ] || fail "service_stopped did not preserve teardown failure"
 [ "$lifecycle_finished" -eq 1 ] || fail "service_stopped skipped lifecycle cleanup"
 
+preflight_command=
+run_with_timeout() {
+    preflight_command="$*"
+    return 31
+}
+preflight_result=0
+validate_realtime_first_support || preflight_result=$?
+[ "$preflight_result" -eq 31 ] || fail "shared preflight failure was not preserved"
+[ "$preflight_command" = "30 /bin/sh $MULTIWAN_QOS_MAIN_SCRIPT preflight" ] || fail "init did not delegate to the dataplane preflight"
+
 log_msg() { :; }
 ethtool() { :; }
 ip() { return 1; }
 deferred_result=0
-restore_offload_state_file "$REPO_ROOT/multiwan-qos/Makefile" || deferred_result=$?
+mw_qos_restore_offload_state_file "$REPO_ROOT/multiwan-qos/Makefile" || deferred_result=$?
 [ "$deferred_result" -eq 2 ] || fail "unavailable device was not treated as deferred restoration"
 [ -r "$REPO_ROOT/multiwan-qos/Makefile" ] || fail "deferred restoration removed its state file"
 

@@ -52,6 +52,7 @@ define Package/multiwan-qos/install
 	$(INSTALL_DATA) ./lib/multiwan-qos/hotplug-common.sh $(1)/lib/multiwan-qos/
 	$(INSTALL_DATA) ./lib/multiwan-qos/process-lock.sh $(1)/lib/multiwan-qos/
 	$(INSTALL_DATA) ./lib/multiwan-qos/realtime.sh $(1)/lib/multiwan-qos/
+	$(INSTALL_DATA) ./lib/multiwan-qos/runtime-state.sh $(1)/lib/multiwan-qos/
 	$(INSTALL_BIN) ./usr/sbin/multiwan-qos-adaptive $(1)/usr/sbin/
 	$(INSTALL_BIN) ./usr/sbin/multiwan-qos-agent-watchdog $(1)/usr/sbin/
 	$(INSTALL_CONF) ./etc/hotplug.d/iface/13-multiwan-qos-hotplug $(1)/etc/hotplug.d/iface/
@@ -69,6 +70,7 @@ define Package/multiwan-qos/install
 			lib/multiwan-qos/hotplug-common.sh \
 			lib/multiwan-qos/process-lock.sh \
 			lib/multiwan-qos/realtime.sh \
+			lib/multiwan-qos/runtime-state.sh \
 			usr/sbin/multiwan-qos-adaptive \
 			usr/sbin/multiwan-qos-agent-watchdog \
 			usr/lib/tc/experimental.dist \

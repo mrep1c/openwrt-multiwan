@@ -173,6 +173,7 @@ install_main() {
 	install_file multiwan-qos/lib/multiwan-qos/hotplug-common.sh /lib/multiwan-qos/hotplug-common.sh 0644
 	install_file multiwan-qos/lib/multiwan-qos/process-lock.sh /lib/multiwan-qos/process-lock.sh 0644
 	install_file multiwan-qos/lib/multiwan-qos/realtime.sh /lib/multiwan-qos/realtime.sh 0644
+	install_file multiwan-qos/lib/multiwan-qos/runtime-state.sh /lib/multiwan-qos/runtime-state.sh 0644
 	install_file multiwan-qos/usr/sbin/multiwan-qos-adaptive /usr/sbin/multiwan-qos-adaptive 0755
 	install_file multiwan-qos/usr/sbin/multiwan-qos-agent-watchdog /usr/sbin/multiwan-qos-agent-watchdog 0755
 	install_file multiwan-qos/www/cgi-bin/multiwan-qos-agent /www/cgi-bin/multiwan-qos-agent 0755
