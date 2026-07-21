@@ -8,7 +8,7 @@
 'require poll';
 'require tools.widgets as widgets';
 
-const UI_VERSION = '1.0.48';
+const UI_VERSION = '1.0.49';
 const UI_UPD_CHANNEL = 'release';
 
 var callInitAction = rpc.declare({
