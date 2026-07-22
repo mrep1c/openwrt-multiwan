@@ -112,10 +112,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - openwrt_release: "24.10.6"
+          - openwrt_release: "24.10.7"
             target: rockchip
             subtarget: armv8
-            sdk_url: https://downloads.openwrt.org/releases/24.10.6/targets/rockchip/armv8/openwrt-sdk-24.10.6-rockchip-armv8_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+            sdk_url: https://downloads.openwrt.org/releases/24.10.7/targets/rockchip/armv8/openwrt-sdk-24.10.7-rockchip-armv8_gcc-13.3.0_musl.Linux-x86_64.tar.zst
             release_tag: opkg-24.10-noarch
           - openwrt_release: "23.05.6"
             target: rockchip

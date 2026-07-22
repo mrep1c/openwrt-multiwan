@@ -12,10 +12,10 @@ permissions:
   contents: write
 
 env:
-  OPENWRT_RELEASE: "25.12.4"
+  OPENWRT_RELEASE: "25.12.5"
   TARGET: rockchip
   SUBTARGET: armv8
-  SDK_URL: https://downloads.openwrt.org/releases/25.12.4/targets/rockchip/armv8/openwrt-sdk-25.12.4-rockchip-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+  SDK_URL: https://downloads.openwrt.org/releases/25.12.5/targets/rockchip/armv8/openwrt-sdk-25.12.5-rockchip-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst
   RELEASE_TAG: apk-25.12-noarch
 
 jobs:

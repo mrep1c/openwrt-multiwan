@@ -23,7 +23,7 @@ DEFAULT_LOWEST_METRIC=256
 # nft helper: ensure table exists (for queries only)
 multiwan_nft_nft_init_table()
 {
-	$NFT list table $NFT_FAMILY $NFT_TABLE >/dev/null 2>&1 && return 0
+	$NFT list table $NFT_FAMILY $NFT_TABLE &>/dev/null && return 0
 	if [ -n "$NFT_BATCH_FILE" ]; then
 		LOG warn "nft: policy transaction requires existing table $NFT_FAMILY $NFT_TABLE"
 		return 1
@@ -82,7 +82,7 @@ multiwan_nft_nft_create_set()
 	local settype="$2"
 	local setflags="$3"
 	
-	if $NFT list set $NFT_FAMILY $NFT_TABLE "$setname" >/dev/null 2>&1; then
+	if $NFT list set $NFT_FAMILY $NFT_TABLE "$setname" &>/dev/null; then
 		$NFT flush set $NFT_FAMILY $NFT_TABLE "$setname" || {
 			LOG warn "nft: failed to flush set $setname"
 			return 1
@@ -102,7 +102,7 @@ multiwan_nft_nft_create_chain()
 	local chaintype="$2"
 
 	if [ -n "$NFT_BATCH_FILE" ]; then
-		if $NFT list chain $NFT_FAMILY $NFT_TABLE "$chain" >/dev/null 2>&1; then
+		if $NFT list chain $NFT_FAMILY $NFT_TABLE "$chain" &>/dev/null; then
 			printf 'flush chain %s %s %s\n' "$NFT_FAMILY" "$NFT_TABLE" "$chain" >> "$NFT_BATCH_FILE"
 		elif [ -n "$chaintype" ]; then
 			printf 'add chain %s %s %s { %s; }\n' "$NFT_FAMILY" "$NFT_TABLE" "$chain" "$chaintype" >> "$NFT_BATCH_FILE"
@@ -112,7 +112,7 @@ multiwan_nft_nft_create_chain()
 		return 0
 	fi
 	
-	if $NFT list chain $NFT_FAMILY $NFT_TABLE "$chain" >/dev/null 2>&1; then
+	if $NFT list chain $NFT_FAMILY $NFT_TABLE "$chain" &>/dev/null; then
 		$NFT flush chain $NFT_FAMILY $NFT_TABLE "$chain" || {
 			LOG warn "nft: failed to flush chain $chain"
 			return 1
@@ -321,7 +321,7 @@ multiwan_nft_load_base_ruleset()
 	local ruleset
 	
 	# Ensure table exists before flush (for fresh installs)
-	$NFT list table $NFT_FAMILY $NFT_TABLE >/dev/null 2>&1 || \
+	$NFT list table $NFT_FAMILY $NFT_TABLE &>/dev/null || \
 		$NFT add table $NFT_FAMILY $NFT_TABLE
 	
 	ruleset=$(multiwan_nft_generate_base_ruleset)
@@ -338,52 +338,42 @@ multiwan_nft_load_base_ruleset()
 	fi
 }
 
-MULTIWAN_NFT_TABLE_ID=0
-multiwan_nft_dev_tbl_ipv4=" "
-multiwan_nft_dev_tbl_ipv6=" "
-multiwan_nft_iface_tbl=" "
 
-multiwan_nft_map_device_to_table()
-{
-	local interface="$1" family curr_table device enabled
-
-	MULTIWAN_NFT_TABLE_ID=$((MULTIWAN_NFT_TABLE_ID + 1))
-	config_get family "$interface" family ipv4
-	network_get_device device "$interface"
-	[ -n "$device" ] || return
-	config_get_bool enabled "$interface" enabled 0
-	[ "$enabled" -eq 1 ] || return
-	case "$family" in
-		ipv4) curr_table="$multiwan_nft_dev_tbl_ipv4" ;;
-		ipv6) curr_table="$multiwan_nft_dev_tbl_ipv6" ;;
-		*) return ;;
-	esac
-	export "multiwan_nft_dev_tbl_$family=${curr_table}${device}=$MULTIWAN_NFT_TABLE_ID "
-}
-
-multiwan_nft_map_interface_to_table()
-{
-	MULTIWAN_NFT_TABLE_ID=$((MULTIWAN_NFT_TABLE_ID + 1))
-	export multiwan_nft_iface_tbl="${multiwan_nft_iface_tbl}${1}=$MULTIWAN_NFT_TABLE_ID "
-}
 
 multiwan_nft_update_dev_to_table()
 {
+	local _tid
 	# shellcheck disable=SC2034
 	multiwan_nft_dev_tbl_ipv4=" "
 	# shellcheck disable=SC2034
 	multiwan_nft_dev_tbl_ipv6=" "
 
-	MULTIWAN_NFT_TABLE_ID=0
+	update_table()
+	{
+		local family curr_table device enabled
+		let _tid++
+		config_get family "$1" family ipv4
+		network_get_device device "$1"
+		[ -z "$device" ] && return
+		config_get enabled "$1" enabled
+		[ "$enabled" -eq 0 ] && return
+		curr_table=$(eval "echo	 \"\$multiwan_nft_dev_tbl_${family}\"")
+		export "multiwan_nft_dev_tbl_$family=${curr_table}${device}=$_tid "
+	}
 	network_flush_cache
-	config_foreach multiwan_nft_map_device_to_table interface
+	config_foreach update_table interface
 }
 
 multiwan_nft_update_iface_to_table()
 {
+	local _tid
 	multiwan_nft_iface_tbl=" "
-	MULTIWAN_NFT_TABLE_ID=0
-	config_foreach multiwan_nft_map_interface_to_table interface
+	update_table()
+	{
+		let _tid++
+		export multiwan_nft_iface_tbl="${multiwan_nft_iface_tbl}${1}=$_tid "
+	}
+	config_foreach update_table interface
 }
 
 multiwan_nft_route_line_dev()
@@ -393,15 +383,11 @@ multiwan_nft_route_line_dev()
 	local _tid route_line route_device route_family entry curr_table
 	route_line=$2
 	route_family=$3
-	route_device=$(printf '%s\n' "$route_line" | sed -ne "s/.*dev \([^ ]*\).*/\1/p")
-	export "$1="
+	route_device=$(echo "$route_line" | sed -ne "s/.*dev \([^ ]*\).*/\1/p")
+	unset "$1"
 	[ -z "$route_device" ] && return
 
-	case "$route_family" in
-		ipv4) curr_table="$multiwan_nft_dev_tbl_ipv4" ;;
-		ipv6) curr_table="$multiwan_nft_dev_tbl_ipv6" ;;
-		*) return ;;
-	esac
+	curr_table=$(eval "echo \"\$multiwan_nft_dev_tbl_${route_family}\"")
 	for entry in $curr_table; do
 		if [ "${entry%%=*}" = "$route_device" ]; then
 			_tid=${entry##*=}
@@ -467,9 +453,12 @@ multiwan_nft_set_connected_ipv4()
 
 	candidate_list=""
 	cidr_list=""
-	# Only query the main routing table; table 0 is a superset that duplicates
-	# connected entries.
-	for connected_network_v4 in $($IP4 route | awk '{print $1}' | grep -E "$IPv4_REGEX"); do
+	route_lists()
+	{
+		# Only query main routing table — 'table 0' is superset that creates duplicates (#25)
+		$IP4 route | awk '{print $1}'
+	}
+	for connected_network_v4 in $(route_lists | grep -E "$IPv4_REGEX"); do
 		if [ -z "${connected_network_v4##*/*}" ]; then
 			cidr_list="$cidr_list $connected_network_v4"
 		else
@@ -555,7 +544,7 @@ multiwan_nft_create_iface_nft()
 	multiwan_nft_delete_iface_nft "$iface"
 
 	# Only create shared chain if not exist - don't flush (other interfaces may have added rules)
-	if ! $NFT list chain $NFT_FAMILY $NFT_TABLE "multiwan_nft_ifaces_in" >/dev/null 2>&1; then
+	if ! $NFT list chain $NFT_FAMILY $NFT_TABLE "multiwan_nft_ifaces_in" &>/dev/null; then
 		$NFT add chain $NFT_FAMILY $NFT_TABLE "multiwan_nft_ifaces_in" || {
 			LOG warn "nft: failed to create shared chain multiwan_nft_ifaces_in"
 			return 1
@@ -795,58 +784,9 @@ multiwan_nft_create_iface_rules()
 	}
 }
 
-MULTIWAN_NFT_TRACKER_RULE_IFACE=""
-MULTIWAN_NFT_TRACKER_RULE_DEVICE=""
-MULTIWAN_NFT_TRACKER_RULE_FAMILY=""
-MULTIWAN_NFT_TRACKER_RULE_IP=""
-MULTIWAN_NFT_TRACKER_RULE_TABLE=""
-MULTIWAN_NFT_TRACKER_RULE_SOURCE=""
-MULTIWAN_NFT_TRACKER_RULE_COUNT=0
-
-multiwan_nft_add_tracker_oif_rule()
-{
-	local target="$1" track_method httping_ssl protocol source_selector
-
-	if [ "$MULTIWAN_NFT_TRACKER_RULE_FAMILY" = "ipv4" ]; then
-		printf '%s\n' "$target" | grep -Eq "^${IPv4_REGEX}$" || return 0
-	else
-		printf '%s\n' "$target" | grep -Eq "^${IPv6_REGEX}$" || return 0
-	fi
-	config_get track_method "$MULTIWAN_NFT_TRACKER_RULE_IFACE" track_method ping
-	config_get_bool httping_ssl "$MULTIWAN_NFT_TRACKER_RULE_IFACE" httping_ssl 0
-	case "$track_method" in
-		ping|nping-icmp)
-			[ "$MULTIWAN_NFT_TRACKER_RULE_FAMILY" = "ipv4" ] &&
-				protocol="ipproto icmp" || protocol="ipproto ipv6-icmp"
-			;;
-		nping-tcp) protocol="ipproto tcp" ;;
-		nping-udp) protocol="ipproto udp" ;;
-		httping)
-			[ "$httping_ssl" -eq 1 ] &&
-				protocol="ipproto tcp dport 443" || protocol="ipproto tcp dport 80"
-			;;
-		*) return 0 ;;
-	esac
-	# ping/nping are bound to the L3 device. httping can bind only its
-	# source address, so its exact source+target+port tuple omits oif.
-	if [ "$track_method" = httping ]; then
-		source_selector="from $MULTIWAN_NFT_TRACKER_RULE_SOURCE"
-	else
-		source_selector="from $MULTIWAN_NFT_TRACKER_RULE_SOURCE oif $MULTIWAN_NFT_TRACKER_RULE_DEVICE"
-	fi
-	# shellcheck disable=SC2086
-	if $MULTIWAN_NFT_TRACKER_RULE_IP rule add \
-		pref $((MULTIWAN_NFT_TRACKER_RULE_TABLE + 1000)) \
-		$source_selector to "$target" $protocol lookup "$MULTIWAN_NFT_TRACKER_RULE_TABLE"; then
-		MULTIWAN_NFT_TRACKER_RULE_COUNT=$((MULTIWAN_NFT_TRACKER_RULE_COUNT + 1))
-	else
-		LOG warn "rule: failed to add tracker-only oif rule for $MULTIWAN_NFT_TRACKER_RULE_IFACE target $target"
-	fi
-}
-
 multiwan_nft_set_tracker_oif_rules()
 {
-	local iface="$1" device="$2" id family IP mark_val source
+	local iface="$1" device="$2" id family IP tracker_rule_count mark_val source
 
 	config_get family "$iface" family ipv4
 	multiwan_nft_get_iface_id id "$iface"
@@ -876,15 +816,35 @@ multiwan_nft_set_tracker_oif_rules()
 		LOG warn "Could not resolve a tracker source address for $iface"
 		return 1
 	}
-	MULTIWAN_NFT_TRACKER_RULE_IFACE="$iface"
-	MULTIWAN_NFT_TRACKER_RULE_DEVICE="$device"
-	MULTIWAN_NFT_TRACKER_RULE_FAMILY="$family"
-	MULTIWAN_NFT_TRACKER_RULE_IP="$IP"
-	MULTIWAN_NFT_TRACKER_RULE_TABLE="$id"
-	MULTIWAN_NFT_TRACKER_RULE_SOURCE="$source"
-	MULTIWAN_NFT_TRACKER_RULE_COUNT=0
-	config_list_foreach "$iface" track_ip multiwan_nft_add_tracker_oif_rule
-	[ "$MULTIWAN_NFT_TRACKER_RULE_COUNT" -gt 0 ] || {
+	tracker_rule_count=0
+	add_tracker_rule() {
+		local target="$1" track_method httping_ssl protocol source_selector
+		if [ "$family" = "ipv4" ]; then
+			echo "$target" | grep -Eq "^${IPv4_REGEX}$" || return 0
+		else
+			echo "$target" | grep -Eq "^${IPv6_REGEX}$" || return 0
+		fi
+		config_get track_method "$iface" track_method ping
+		config_get_bool httping_ssl "$iface" httping_ssl 0
+		case "$track_method" in
+			ping|nping-icmp) [ "$family" = "ipv4" ] && protocol="ipproto icmp" || protocol="ipproto ipv6-icmp" ;;
+			nping-tcp) protocol="ipproto tcp" ;;
+			nping-udp) protocol="ipproto udp" ;;
+			httping) [ "$httping_ssl" -eq 1 ] && protocol="ipproto tcp dport 443" || protocol="ipproto tcp dport 80" ;;
+			*) return 0 ;;
+		esac
+		# ping/nping are bound to the L3 device. httping can bind only its
+		# source address, so its exact source+target+port tuple omits oif.
+		[ "$track_method" = httping ] && source_selector="from $source" || source_selector="from $source oif $device"
+		# shellcheck disable=SC2086
+		if $IP rule add pref $((id+1000)) $source_selector to "$target" $protocol lookup "$id"; then
+			tracker_rule_count=$((tracker_rule_count + 1))
+		else
+			LOG warn "rule: failed to add tracker-only oif rule for $iface target $target"
+		fi
+	}
+	config_list_foreach "$iface" track_ip add_tracker_rule
+	[ "$tracker_rule_count" -gt 0 ] || {
 		LOG warn "No valid tracker-only oif rules could be installed for $iface"
 		return 1
 	}
@@ -1236,7 +1196,7 @@ multiwan_nft_set_sticky_nft()
 		# If interface chain exists, add sticky rules
 		# Sticky logic: if source IP + current mark combo exists in set, 
 		# traffic is "stuck" to that interface. Otherwise, proceed with normal policy.
-		if $NFT list chain $NFT_FAMILY $NFT_TABLE "multiwan_nft_iface_in_$interface" >/dev/null 2>&1; then
+		if $NFT list chain $NFT_FAMILY $NFT_TABLE "multiwan_nft_iface_in_$interface" &>/dev/null; then
 			# Insert rule: Query set for specific WAN mark, if found, apply it and return
 			if [ "$ipv" = "ipv4" ]; then
 				multiwan_nft_nft_insert_rule "multiwan_nft_rule_$rule" \
@@ -1258,7 +1218,7 @@ multiwan_nft_set_sticky_set()
 	multiwan_nft_nft_init_table || return 1
 	
 	# Create sticky set for IPv4
-	if ! $NFT list set $NFT_FAMILY $NFT_TABLE "multiwan_nft_sticky_ipv4_$rule" >/dev/null 2>&1; then
+	if ! $NFT list set $NFT_FAMILY $NFT_TABLE "multiwan_nft_sticky_ipv4_$rule" &>/dev/null; then
 		$NFT add set $NFT_FAMILY $NFT_TABLE "multiwan_nft_sticky_ipv4_$rule" \
 			"{ type ipv4_addr . mark; flags timeout; timeout ${timeout}s; }" || {
 			LOG warn "nft: failed to create sticky IPv4 set for rule $rule"
@@ -1268,7 +1228,7 @@ multiwan_nft_set_sticky_set()
 
 	# Create sticky set for IPv6
 	if [ "$NO_IPV6" -eq 0 ]; then
-		if ! $NFT list set $NFT_FAMILY $NFT_TABLE "multiwan_nft_sticky_ipv6_$rule" >/dev/null 2>&1; then
+		if ! $NFT list set $NFT_FAMILY $NFT_TABLE "multiwan_nft_sticky_ipv6_$rule" &>/dev/null; then
 			$NFT add set $NFT_FAMILY $NFT_TABLE "multiwan_nft_sticky_ipv6_$rule" \
 				"{ type ipv6_addr . mark; flags timeout; timeout ${timeout}s; }" || {
 				LOG warn "nft: failed to create sticky IPv6 set for rule $rule"
@@ -1403,7 +1363,7 @@ multiwan_nft_set_user_nft_rule()
 
 	if [ "$rule_policy" -eq 1 ]; then
 		# Create rule chain if not exists (flush handled by multiwan_nft_set_user_rules_nft)
-		if ! $NFT list chain $NFT_FAMILY $NFT_TABLE "multiwan_nft_rule_$rule" >/dev/null 2>&1; then
+		if ! $NFT list chain $NFT_FAMILY $NFT_TABLE "multiwan_nft_rule_$rule" &>/dev/null; then
 			$NFT add chain $NFT_FAMILY $NFT_TABLE "multiwan_nft_rule_$rule" || {
 				LOG warn "nft: failed to create user rule chain multiwan_nft_rule_$rule"
 				return 1
@@ -1467,21 +1427,9 @@ multiwan_nft_set_user_nft_rule()
 	fi
 }
 
-MULTIWAN_NFT_USER_RULE_IFACE=""
-MULTIWAN_NFT_USER_RULE_IFACE_FOUND=0
-
-multiwan_nft_find_user_rule_iface()
-{
-	local src_iface
-
-	config_get src_iface "$1" src_iface
-	[ "$src_iface" = "$MULTIWAN_NFT_USER_RULE_IFACE" ] &&
-		MULTIWAN_NFT_USER_RULE_IFACE_FOUND=1
-}
-
 multiwan_nft_set_user_iface_rules_nft()
 {
-	local iface device
+	local iface device is_src_iface
 	iface=$1
 	device=$2
 
@@ -1493,10 +1441,15 @@ multiwan_nft_set_user_iface_rules_nft()
 	# Check if any rules reference this interface
 	$NFT list chain $NFT_FAMILY $NFT_TABLE multiwan_nft_rules 2>/dev/null | grep -q "iifname \"$device\"" && return
 
-	MULTIWAN_NFT_USER_RULE_IFACE="$iface"
-	MULTIWAN_NFT_USER_RULE_IFACE_FOUND=0
-	config_foreach multiwan_nft_find_user_rule_iface rule
-	[ "$MULTIWAN_NFT_USER_RULE_IFACE_FOUND" -eq 1 ] && multiwan_nft_set_user_rules_nft
+	is_src_iface=0
+	iface_rule()
+	{
+		local src_iface
+		config_get src_iface "$1" src_iface
+		[ "$src_iface" = "$iface" ] && is_src_iface=1
+	}
+	config_foreach iface_rule rule
+	[ "$is_src_iface" -eq 1 ] && multiwan_nft_set_user_rules_nft
 }
 
 multiwan_nft_set_user_rules_nft()
@@ -1530,10 +1483,9 @@ multiwan_nft_interface_hotplug_shutdown()
 	local interface status device ifdown
 	interface="$1"
 	ifdown="$2"
-	status=""
-	if [ -r "$MULTIWAN_NFT_TRACK_STATUS_DIR/$interface/STATUS" ]; then
-		{ IFS= read -r status < "$MULTIWAN_NFT_TRACK_STATUS_DIR/$interface/STATUS" || [ -n "$status" ]; } 2>/dev/null || status=
-	fi
+	[ -f $MULTIWAN_NFT_TRACK_STATUS_DIR/$interface/STATUS ] && {
+		status=$(cat $MULTIWAN_NFT_TRACK_STATUS_DIR/$interface/STATUS)
+	}
 
 	[ "$status" != "online" ] && [ "$ifdown" != 1 ] && return
 
@@ -1587,15 +1539,25 @@ multiwan_nft_ifup()
 		json_load "$status"
 		json_get_vars up l3_device
 	}
+	hotplug_startup()
+	{
+		env -i MULTIWAN_NFT_STARTUP=$caller ACTION=ifup \
+		    INTERFACE=$interface DEVICE=$l3_device \
+		    sh /etc/hotplug.d/iface/15-multiwan-nft
+	}
+
 	if [ "$up" != "1" ] || [ -z "$l3_device" ]; then
 		return
 	fi
 
-	# config_foreach invokes this synchronously. During service start the
-	# hotplug script bypasses procd_lock, so interfaces remain serialized.
-	env -i MULTIWAN_NFT_STARTUP="$caller" ACTION=ifup \
-		INTERFACE="$interface" DEVICE="$l3_device" \
-		sh /etc/hotplug.d/iface/15-multiwan-nft
+	if [ "${caller}" = "init" ]; then
+		# During service start the hotplug script intentionally bypasses
+		# procd_lock, so run interface setup serially here. This prevents two
+		# online WANs from mutating nft/ip rules and route tables at once.
+		hotplug_startup
+	else
+		hotplug_startup
+	fi
 
 }
 
@@ -1608,13 +1570,9 @@ multiwan_nft_set_iface_hotplug_state() {
 }
 
 multiwan_nft_get_iface_hotplug_state() {
-	local iface=$1 state
+	local iface=$1
 
-	state=""
-	if [ -r "$MULTIWAN_NFT_STATUS_DIR/iface_state/$iface" ]; then
-		{ IFS= read -r state < "$MULTIWAN_NFT_STATUS_DIR/iface_state/$iface" || [ -n "$state" ]; } 2>/dev/null || state=
-	fi
-	printf '%s\n' "${state:-offline}"
+	cat "$MULTIWAN_NFT_STATUS_DIR/iface_state/$iface" 2>/dev/null || echo "offline"
 }
 
 multiwan_nft_report_iface_status()
@@ -1654,7 +1612,7 @@ multiwan_nft_report_iface_status()
 		[ -n "$($IP rule | awk -v pref="$((id+3000)):" '$1 == pref')" ] ||
 			error=$((error+8))
 		# Check nft interface chain (bit 4)
-		$NFT list chain $NFT_FAMILY $NFT_TABLE "multiwan_nft_iface_in_$1" >/dev/null 2>&1 ||
+		$NFT list chain $NFT_FAMILY $NFT_TABLE "multiwan_nft_iface_in_$1" &>/dev/null ||
 			error=$((error+16))
 		# Check default route in interface table (bit 5)
 		[ -n "$($IP route list table $id default dev $device 2> /dev/null)" ] ||
@@ -1664,10 +1622,7 @@ multiwan_nft_report_iface_status()
 	if [ "$result" = "offline" ]; then
 		:
 	elif [ "$error" -eq 0 ] && [ "$hotplug_state" = offline ]; then
-		recovery_result=""
-		if [ -r "$MULTIWAN_NFT_TRACK_STATUS_DIR/$1/RECOVERY_RULE_RESULT" ]; then
-			{ IFS= read -r recovery_result < "$MULTIWAN_NFT_TRACK_STATUS_DIR/$1/RECOVERY_RULE_RESULT" || [ -n "$recovery_result" ]; } 2>/dev/null || recovery_result=
-		fi
+		recovery_result="$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/$1/RECOVERY_RULE_RESULT" 2>/dev/null)"
 		result="offline (isolated, recovery=${recovery_result:-unknown})"
 	elif [ "$error" -eq 0 ]; then
 		online=$(get_online_time "$1")
@@ -1756,14 +1711,14 @@ multiwan_nft_report_policies_v6()
 
 multiwan_nft_report_connected_v4()
 {
-	if $NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v4 >/dev/null 2>&1; then
+	if $NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v4 &>/dev/null; then
 		$NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v4 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?'
 	fi
 }
 
 multiwan_nft_report_connected_v6()
 {
-	if $NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v6 >/dev/null 2>&1; then
+	if $NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v6 &>/dev/null; then
 		$NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v6 | \
 			grep -oE '([0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}(/[0-9]+)?|::/[0-9]+'
 	fi
@@ -1771,7 +1726,7 @@ multiwan_nft_report_connected_v6()
 
 multiwan_nft_report_rules_v4()
 {
-	if $NFT list chain $NFT_FAMILY $NFT_TABLE multiwan_nft_rules >/dev/null 2>&1; then
+	if $NFT list chain $NFT_FAMILY $NFT_TABLE multiwan_nft_rules &>/dev/null; then
 		$NFT list chain $NFT_FAMILY $NFT_TABLE multiwan_nft_rules | \
 			grep -E 'jump|meta mark set' | \
 			sed 's/.*jump multiwan_nft_policy_/- /' | \
@@ -1947,41 +1902,35 @@ multiwan_nft_restore_iface_table_default_route()
 	multiwan_nft_restore_iface_default_route "$1" "$2" "$id" "table $id"
 }
 
-MULTIWAN_NFT_FLUSH_INTERFACE=""
-MULTIWAN_NFT_FLUSH_ACTION=""
-
-multiwan_nft_flush_conntrack_option()
-{
-	local flush_conntrack="$1"
-
-	if [ "$MULTIWAN_NFT_FLUSH_ACTION" = "$flush_conntrack" ] &&
-		[ "$MULTIWAN_NFT_FLUSH_MATCHED" -eq 0 ]; then
-		MULTIWAN_NFT_FLUSH_MATCHED=1
-		if multiwan_nft_flush_conntrack_iface "$MULTIWAN_NFT_FLUSH_INTERFACE"; then
-			LOG info "Scoped connection tracking purge completed for interface '$MULTIWAN_NFT_FLUSH_INTERFACE' on action '$MULTIWAN_NFT_FLUSH_ACTION'"
-		else
-			MULTIWAN_NFT_FLUSH_FAILED=1
-		fi
-	fi
-}
-
 multiwan_nft_flush_conntrack()
 {
 	local interface="$1"
 	local action="$2"
 	MULTIWAN_NFT_FLUSH_MATCHED=0
 	MULTIWAN_NFT_FLUSH_FAILED=0
-	MULTIWAN_NFT_FLUSH_INTERFACE="$interface"
-	MULTIWAN_NFT_FLUSH_ACTION="$action"
+
+	handle_flush() {
+		local flush_conntrack="$1"
+		local action="$2"
+
+		if [ "$action" = "$flush_conntrack" ] && [ "$MULTIWAN_NFT_FLUSH_MATCHED" -eq 0 ]; then
+			MULTIWAN_NFT_FLUSH_MATCHED=1
+			if multiwan_nft_flush_conntrack_iface "$interface"; then
+				LOG info "Scoped connection tracking purge completed for interface '$interface' on action '$action'"
+			else
+				MULTIWAN_NFT_FLUSH_FAILED=1
+			fi
+		fi
+	}
 
 	if [ -e "$CONNTRACK_FILE" ]; then
-		config_list_foreach "$interface" flush_conntrack multiwan_nft_flush_conntrack_option
+		config_list_foreach "$interface" flush_conntrack handle_flush "$action"
 	fi
 	[ "$MULTIWAN_NFT_FLUSH_FAILED" -eq 0 ]
 }
 
 multiwan_nft_track_clean()
 {
-	rm -rf "${MULTIWAN_NFT_STATUS_DIR:?}/${1}" >/dev/null 2>&1
+	rm -rf "${MULTIWAN_NFT_STATUS_DIR:?}/${1}" &> /dev/null
 	rmdir --ignore-fail-on-non-empty "$MULTIWAN_NFT_STATUS_DIR"
 }
