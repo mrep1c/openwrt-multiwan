@@ -101,39 +101,28 @@ mw_qos_cleanup_device() {
 	return "$result"
 }
 
-mw_qos_offload_feature_name() {
-	case "$1" in
-		gro) echo generic-receive-offload ;;
-		gso) echo generic-segmentation-offload ;;
-		tso) echo tcp-segmentation-offload ;;
-		rx-gro-list|tx-udp-segmentation|hw-tc-offload) echo "$1" ;;
-		*) return 1 ;;
-	esac
-}
-
 mw_qos_save_offload_state() {
-	local device="$1" feature long_name value saved=0 state_file tmp
+	local device="$1" state_file tmp
 
 	mw_qos_device_name_safe "$device" || return 1
 	state_file="$MULTIWAN_QOS_OFFLOAD_ROOT/$device"
 	[ -e "$state_file" ] && return 0
 	mkdir -p "$MULTIWAN_QOS_OFFLOAD_ROOT" || return 1
 	tmp="${state_file}.$$"
-	: > "$tmp" || return 1
-	for feature in gro gso tso rx-gro-list tx-udp-segmentation hw-tc-offload; do
-		long_name="$(mw_qos_offload_feature_name "$feature")" || continue
-		value="$(ethtool -k "$device" 2>/dev/null | awk -v name="${long_name}:" '$1 == name { print $2; exit }')"
-		case "$value" in
-			on|off)
-				printf '%s %s\n' "$feature" "$value" >> "$tmp" || {
-					rm -f "$tmp"
-					return 1
-				}
-				saved=$((saved + 1))
-				;;
-		esac
-	done
-	[ "$saved" -gt 0 ] || { rm -f "$tmp"; return 1; }
+	# ethtool -k can be relatively expensive on embedded hardware. Parse one
+	# snapshot instead of spawning ethtool and awk once for every feature.
+	ethtool -k "$device" 2>/dev/null | awk '
+		function emit(short_name) {
+			if ($2 == "on" || $2 == "off") print short_name, $2
+		}
+		$1 == "generic-receive-offload:" { emit("gro") }
+		$1 == "generic-segmentation-offload:" { emit("gso") }
+		$1 == "tcp-segmentation-offload:" { emit("tso") }
+		$1 == "rx-gro-list:" { emit("rx-gro-list") }
+		$1 == "tx-udp-segmentation:" { emit("tx-udp-segmentation") }
+		$1 == "hw-tc-offload:" { emit("hw-tc-offload") }
+	' > "$tmp" || { rm -f "$tmp"; return 1; }
+	[ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
 	mv "$tmp" "$state_file" || { rm -f "$tmp"; return 1; }
 }
 
@@ -175,7 +164,8 @@ mw_qos_restore_offload_state() {
 }
 
 mw_qos_ledger_commit() {
-	local state_file="$MULTIWAN_QOS_QDISC_LEDGER" tmp="${MULTIWAN_QOS_QDISC_LEDGER}.$$" device
+	local state_file="$MULTIWAN_QOS_QDISC_LEDGER" tmp="${MULTIWAN_QOS_QDISC_LEDGER}.$$"
+	local device committed_devices=""
 
 	mkdir -p "${state_file%/*}" || return 1
 	if [ "$#" -eq 0 ]; then
@@ -185,8 +175,11 @@ mw_qos_ledger_commit() {
 	: > "$tmp" || return 1
 	for device in "$@"; do
 		mw_qos_device_name_safe "$device" || { rm -f "$tmp"; return 1; }
-		grep -Fqx "$device" "$tmp" 2>/dev/null ||
-			printf '%s\n' "$device" >> "$tmp" || { rm -f "$tmp"; return 1; }
+		case " $committed_devices " in
+			*" $device "*) continue ;;
+		esac
+		printf '%s\n' "$device" >> "$tmp" || { rm -f "$tmp"; return 1; }
+		committed_devices="${committed_devices:+$committed_devices }$device"
 	done
 	mv "$tmp" "$state_file" || { rm -f "$tmp"; return 1; }
 }
@@ -222,38 +215,46 @@ mw_qos_ledger_remove() {
 	fi
 }
 
+# config_foreach callbacks are global in ash even when declared inside another
+# function. Keep them explicitly namespaced and pass their state through
+# namespaced globals so teardown cannot leak generic helper names.
+MW_QOS_TEARDOWN_DEVICES=""
+MW_QOS_TEARDOWN_RESULT=0
+
+mw_qos_teardown_add_device() {
+	local candidate="$1"
+
+	mw_qos_device_name_safe "$candidate" || return 1
+	case " $MW_QOS_TEARDOWN_DEVICES " in
+		*" $candidate "*) ;;
+		*) MW_QOS_TEARDOWN_DEVICES="${MW_QOS_TEARDOWN_DEVICES:+$MW_QOS_TEARDOWN_DEVICES }$candidate" ;;
+	esac
+}
+
+mw_qos_teardown_collect_configured_device() {
+	local section="$1" configured_device
+
+	config_get configured_device "$section" device
+	if [ -z "$configured_device" ] && type network_get_device >/dev/null 2>&1; then
+		network_get_device configured_device "$section" 2>/dev/null
+	fi
+	[ -n "$configured_device" ] || return 0
+	mw_qos_teardown_add_device "$configured_device" || {
+		mw_qos_warn "Ignored unsafe QoS device identity '$configured_device' during teardown."
+		MW_QOS_TEARDOWN_RESULT=1
+	}
+}
+
 # Full dataplane teardown. Configuration finds currently declared interfaces;
 # the ledger finds interfaces that were renamed or removed from configuration.
 # Only devices that fail verified cleanup remain in the ownership ledger.
 mw_qos_teardown_runtime() {
 	local cleanup_devices="" failed_devices="" device state_file table_spec restore_result result=0
 
-	collect_teardown_device() {
-		local candidate="$1"
-
-		mw_qos_device_name_safe "$candidate" || return 1
-		case " $cleanup_devices " in
-			*" $candidate "*) ;;
-			*) cleanup_devices="${cleanup_devices:+$cleanup_devices }$candidate" ;;
-		esac
-	}
-
-	collect_configured_device() {
-		local section="$1" configured_device
-
-		config_get configured_device "$section" device
-		if [ -z "$configured_device" ] && type network_get_device >/dev/null 2>&1; then
-			network_get_device configured_device "$section" 2>/dev/null
-		fi
-		[ -n "$configured_device" ] || return 0
-		collect_teardown_device "$configured_device" || {
-			mw_qos_warn "Ignored unsafe QoS device identity '$configured_device' during teardown."
-			result=1
-		}
-	}
-
+	MW_QOS_TEARDOWN_DEVICES=""
+	MW_QOS_TEARDOWN_RESULT=0
 	if config_load multiwan-qos; then
-		config_foreach collect_configured_device interface
+		config_foreach mw_qos_teardown_collect_configured_device interface
 	else
 		mw_qos_error "Failed to load multiwan-qos while collecting configured interfaces for teardown."
 		result=1
@@ -261,9 +262,13 @@ mw_qos_teardown_runtime() {
 	if [ -r "$MULTIWAN_QOS_QDISC_LEDGER" ]; then
 		while IFS= read -r device; do
 			[ -n "$device" ] || continue
-			collect_teardown_device "$device" || result=1
+			mw_qos_teardown_add_device "$device" || MW_QOS_TEARDOWN_RESULT=1
 		done < "$MULTIWAN_QOS_QDISC_LEDGER"
 	fi
+	cleanup_devices="$MW_QOS_TEARDOWN_DEVICES"
+	[ "$MW_QOS_TEARDOWN_RESULT" -eq 0 ] || result=1
+	MW_QOS_TEARDOWN_DEVICES=""
+	MW_QOS_TEARDOWN_RESULT=0
 
 	for device in $cleanup_devices; do
 		if ! mw_qos_cleanup_device "$device"; then

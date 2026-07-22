@@ -132,9 +132,37 @@ cleanup_result=0
 mw_qos_cleanup_device wan0 || cleanup_result=$?
 [ "$cleanup_result" -ne 0 ] || fail "remaining root qdisc was reported as clean"
 
+# Saving offload state takes one driver snapshot per device and records only
+# the supported features that can safely be restored.
+ETHTOOL_CALLS="$TEST_ROOT/ethtool-calls"
+ethtool() {
+    printf '%s\n' "$*" >> "$ETHTOOL_CALLS"
+    case "$1" in
+        -k)
+            printf '%s\n' \
+                'Features for save0:' \
+                'generic-receive-offload: on' \
+                'generic-segmentation-offload: off' \
+                'tcp-segmentation-offload: on' \
+                'rx-gro-list: off' \
+                'tx-udp-segmentation: on' \
+                'hw-tc-offload: off' \
+                'unrelated-feature: on'
+            ;;
+        -K) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+mw_qos_save_offload_state save0 || fail "could not save offload state"
+[ "$(grep -c '^-k save0$' "$ETHTOOL_CALLS")" -eq 1 ] || fail "offload save queried ethtool more than once"
+[ "$(grep -c . "$MULTIWAN_QOS_OFFLOAD_ROOT/save0")" -eq 6 ] || fail "offload save did not record the supported feature set"
+grep -Fqx 'gro on' "$MULTIWAN_QOS_OFFLOAD_ROOT/save0" || fail "offload save lost GRO state"
+grep -Fqx 'hw-tc-offload off' "$MULTIWAN_QOS_OFFLOAD_ROOT/save0" || fail "offload save lost hardware TC state"
+grep -q 'unrelated' "$MULTIWAN_QOS_OFFLOAD_ROOT/save0" && fail "offload save recorded an unmanaged feature"
+rm -f "$MULTIWAN_QOS_OFFLOAD_ROOT/save0"
+
 mkdir -p "$MULTIWAN_QOS_OFFLOAD_ROOT"
 printf 'gro on\n' > "$MULTIWAN_QOS_OFFLOAD_ROOT/absent0"
-ethtool() { return 0; }
 restore_result=0
 mw_qos_restore_offload_state absent0 || restore_result=$?
 [ "$restore_result" -eq 2 ] || fail "unavailable offload device was not deferred"
@@ -202,6 +230,8 @@ mw_qos_teardown_runtime || teardown_result=$?
 [ "$CLEANED_DEVICES" = 'wan0 wan1' ] || fail "teardown did not deduplicate config and ledger ownership"
 [ "$(cat "$MULTIWAN_QOS_QDISC_LEDGER")" = wan1 ] || fail "teardown did not retain only failed ownership"
 [ "$NFT_DESTROYS" = 'inet/multiwan_qos_mcast inet/dscptag netdev/multiwan_qos_ingress' ] || fail "teardown skipped an owned nft table"
+type collect_teardown_device >/dev/null 2>&1 && fail "teardown leaked a generic callback into the global ash namespace"
+type collect_configured_device >/dev/null 2>&1 && fail "teardown leaked its config callback into the global ash namespace"
 
 TEARDOWN_FAIL_WAN1=0
 CLEANED_DEVICES=

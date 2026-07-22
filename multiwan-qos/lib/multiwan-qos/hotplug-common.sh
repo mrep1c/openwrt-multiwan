@@ -111,7 +111,9 @@ wait_for_l3_device() {
         network_flush_cache
         resolved_device=
         network_get_device resolved_device "$event_interface" 2>/dev/null
-        mtu="$(cat "/sys/class/net/$event_device/mtu" 2>/dev/null)"
+        mtu=
+        [ ! -r "/sys/class/net/$event_device/mtu" ] ||
+            { IFS= read -r mtu < "/sys/class/net/$event_device/mtu"; } 2>/dev/null
         if network_is_up "$event_interface" &&
             [ "$resolved_device" = "$event_device" ] &&
             ip link show "$event_device" >/dev/null 2>&1; then

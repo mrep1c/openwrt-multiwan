@@ -19,7 +19,8 @@ mw_process_start_time() {
 		""|*[!0-9]*) return 1 ;;
 	esac
 	[ -r "/proc/$pid/stat" ] || return 1
-	stat="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+	stat=""
+	{ IFS= read -r stat < "/proc/$pid/stat" || [ -n "$stat" ]; } 2>/dev/null || return 1
 	rest="${stat##*) }"
 	set -- $rest
 	[ "$#" -ge 20 ] || return 1
@@ -92,7 +93,9 @@ mw_lock_guard_acquire() {
 
 	self_start="$(mw_process_start_time "$$")" || return 1
 	MW_LOCK_SEQUENCE=$((MW_LOCK_SEQUENCE + 1))
-	token="guard:$$:$self_start:$(date +%s 2>/dev/null):$MW_LOCK_SEQUENCE"
+	# PID plus /proc start time identifies this process uniquely. The sequence
+	# distinguishes multiple locks without forking date(1) on a small router.
+	token="guard:$$:$self_start:$MW_LOCK_SEQUENCE"
 
 	while [ "$attempts" -lt 3 ]; do
 		if mkdir "$guard_dir" 2>/dev/null; then
@@ -160,7 +163,7 @@ mw_lock_acquire() {
 
 	self_start="$(mw_process_start_time "$$")" || return 1
 	MW_LOCK_SEQUENCE=$((MW_LOCK_SEQUENCE + 1))
-	token="lock:$$:$self_start:$(date +%s 2>/dev/null):$MW_LOCK_SEQUENCE"
+	token="lock:$$:$self_start:$MW_LOCK_SEQUENCE"
 	mw_lock_acquire_for "$lock_dir" "$$" "$self_start" "$token" || return 1
 	MW_LOCK_DIR="$lock_dir"
 	MW_LOCK_TOKEN="$token"

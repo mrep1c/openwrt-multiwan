@@ -1,0 +1,62 @@
+name: Test QoS shell compatibility
+
+on:
+  pull_request:
+    paths:
+      - "multiwan-qos/**"
+      - "scripts/install-qos.sh"
+      - "tests/test-qos-*.sh"
+      - ".github/workflows/test-qos-shell.yml"
+  push:
+    branches: [main]
+    paths:
+      - "multiwan-qos/**"
+      - "scripts/install-qos.sh"
+      - "tests/test-qos-*.sh"
+      - ".github/workflows/test-qos-shell.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  busybox-shell:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shell runtimes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y busybox-static dash
+
+      - name: Check installed script syntax
+        run: |
+          files="
+            multiwan-qos/lib/multiwan-qos/runtime-state.sh
+            multiwan-qos/lib/multiwan-qos/process-lock.sh
+            multiwan-qos/lib/multiwan-qos/hotplug-common.sh
+            multiwan-qos/lib/multiwan-qos/realtime.sh
+            multiwan-qos/etc/init.d/multiwan-qos
+            multiwan-qos/etc/multiwan-qos.sh
+            multiwan-qos/usr/sbin/multiwan-qos-adaptive
+            multiwan-qos/usr/sbin/multiwan-qos-agent-watchdog
+            multiwan-qos/etc/hotplug.d/iface/13-multiwan-qos-hotplug
+            scripts/install-qos.sh
+          "
+          for file in $files; do
+            dash -n "$file"
+            busybox ash -n "$file"
+          done
+
+      - name: Run QoS regression tests with BusyBox ash
+        run: |
+          busybox ash tests/test-qos-process-lock.sh
+          busybox ash tests/test-qos-runtime-state.sh
+          busybox ash tests/test-qos-lifecycle.sh
+
+      - name: Run QoS regression tests with dash
+        run: |
+          dash tests/test-qos-process-lock.sh
+          dash tests/test-qos-runtime-state.sh
+          dash tests/test-qos-lifecycle.sh
