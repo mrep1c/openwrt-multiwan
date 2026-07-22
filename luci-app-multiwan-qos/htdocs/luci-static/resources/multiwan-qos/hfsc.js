@@ -190,7 +190,7 @@ return view.extend({
         o.readonly = (realtimeRateMode === 'adaptive');
 
         o = s.option(form.ListValue, 'realtime_rate_mode', _('Realtime Rate Mode'),
-            _('Default uses a fixed 1500 kbit/s reserve capped at 25% of the link. Manual uses the overrides below. Adaptive idles and starts new realtime sessions at the selected Adaptive Start / Idle Rate. While realtime packets are present, measured demand may adjust the HFSC rate from 300 to 1800 kbit/s, capped at 25% of the link. The first one-second sample without realtime traffic returns the rate to the selected baseline; the 20-second session grace tracks continuity only and cannot lower the rate. Increases use the highest one-second demand sample from the last 3 seconds plus a 300 kbit/s reserve. Decreases use 30-second smoothed demand and 5-second burst memory, require clean drop and backlog history, and move in 50 kbit/s steps no faster than every 10 seconds. BFIFO and PFIFO use a fixed queue profile calculated at 1000 kbit/s; Adaptive changes only the HFSC class and never resizes the selected game qdisc.'));
+            _('Default uses a fixed 1500 kbit/s reserve capped at 25% of the link. Manual uses the overrides below. Adaptive idles and starts new realtime sessions at the selected Adaptive Start / Idle Rate. While realtime packets are present, measured demand may adjust the HFSC rate from 300 to 1800 kbit/s, capped at 25% of the link. The first one-second sample without realtime traffic returns the rate to the selected baseline; the 20-second session grace tracks continuity only and cannot lower the rate. Increases use the highest one-second demand sample from the last 3 seconds plus the configured Adaptive Demand Reserve. Decreases use 30-second smoothed demand and 5-second burst memory, require clean drop and backlog history, and move in 50 kbit/s steps no faster than every 10 seconds. BFIFO and PFIFO use a fixed queue profile calculated at 1000 kbit/s; Adaptive changes only the HFSC class and never resizes the selected game qdisc.'));
         o.value('default', _('Default'));
         o.value('manual', _('Manual'));
         o.value('adaptive', _('Adaptive'));
@@ -201,6 +201,14 @@ return view.extend({
         o.value('1000', _('1000 kbit/s'));
         o.value('1500', _('1500 kbit/s'));
         o.default = '1000';
+        o.rmempty = false;
+        o.depends('realtime_rate_mode', 'adaptive');
+
+        o = s.option(form.Value, 'adaptive_demand_reserve', _('Adaptive Demand Reserve (kbit/s)'),
+            _('Fixed safety margin added to measured realtime demand when Adaptive calculates increases and decreases. It applies to both the 1000 and 1500 start/idle baselines. Higher values react with more spare capacity; lower values reserve less bandwidth. The final rate remains limited by the 1800 kbit/s Adaptive ceiling and the 25% link cap.'));
+        o.default = '300';
+        o.placeholder = '300';
+        o.datatype = 'range(0, 1800)';
         o.rmempty = false;
         o.depends('realtime_rate_mode', 'adaptive');
 
@@ -229,10 +237,19 @@ return view.extend({
         o = createOption('freshness_target_ms', _('Custom Freshness Target (ms)'), _('Manual finite realtime queue target. The HFSC burst remains 25 ms and game FQ_CODEL keeps its independent 5 ms target.'), _('Default: 18'), 'uinteger');
         o.depends('freshness_mode', 'custom');
 
-        createOption('PFIFOMIN', _('PFIFO Min'), _('Minimum packet count for PFIFO queue'), _('Default: 5'), 'uinteger');
-        createOption('PACKETSIZE', _('Avg Packet Size (B)'), _('Used to convert byte budgets for PFIFO, RED, NETEM, and QFQ child queues. Default: 450 bytes.'), _('Default: 450'), 'uinteger');
-        createOption('netemdelayms', _('NETEM Delay (ms)'), _('NETEM delay in milliseconds'), _('Default: 30'), 'uinteger');
-        createOption('netemjitterms', _('NETEM Jitter (ms)'), _('NETEM jitter in milliseconds'), _('Default: 7'), 'uinteger');
+        o = createOption('PFIFOMIN', _('PFIFO Min'), _('Minimum packet count for PFIFO queue'), _('Default: 5'), 'uinteger');
+        o.depends('gameqdisc', 'pfifo');
+
+        o = createOption('PACKETSIZE', _('Avg Packet Size (B)'), _('Used to convert byte budgets for PFIFO, RED, NETEM, and QFQ child queues. Default: 450 bytes.'), _('Default: 450'), 'uinteger');
+        o.depends('gameqdisc', 'pfifo');
+        o.depends('gameqdisc', 'red');
+        o.depends('gameqdisc', 'netem');
+        o.depends('gameqdisc', 'qfq');
+
+        o = createOption('netemdelayms', _('NETEM Delay (ms)'), _('NETEM delay in milliseconds'), _('Default: 30'), 'uinteger');
+        o.depends('gameqdisc', 'netem');
+        o = createOption('netemjitterms', _('NETEM Jitter (ms)'), _('NETEM jitter in milliseconds'), _('Default: 7'), 'uinteger');
+        o.depends('gameqdisc', 'netem');
 
         o = s.option(form.ListValue, 'netem_direction', _('NETEM Direction'), 
             addRelevanceInfo(_('Select which direction to apply the NETEM delay/jitter settings'), 'netem_direction', rootQdisc, gameqdisc));
@@ -249,8 +266,10 @@ return view.extend({
         o.value('pareto', _('Pareto'));
         o.value('paretonormal', _('Pareto Normal'));
         o.default = 'normal';
+        o.depends('gameqdisc', 'netem');
 
-        createOption('pktlossp', _('Packet Loss Percentage'), _('Percentage of packet loss'), _('Default: none'));
+        o = createOption('pktlossp', _('Packet Loss Percentage'), _('Percentage of packet loss'), _('Default: none'));
+        o.depends('gameqdisc', 'netem');
 
         return m.render();
         });

@@ -827,6 +827,17 @@ case "$ADAPTIVE_START_RATE" in
     1000|1500) ;;
     *) log "ERROR: unsupported adaptive_start_rate '$ADAPTIVE_START_RATE'"; exit 1 ;;
 esac
+config_get TARGET_RESERVE_KBIT hfsc adaptive_demand_reserve 300
+case "$TARGET_RESERVE_KBIT" in
+    ''|*[!0-9]*)
+        log "ERROR: invalid adaptive_demand_reserve '$TARGET_RESERVE_KBIT'; expected 0-1800 kbit/s"
+        exit 1
+        ;;
+esac
+if [ "$TARGET_RESERVE_KBIT" -gt 1800 ]; then
+    log "ERROR: invalid adaptive_demand_reserve '$TARGET_RESERVE_KBIT'; expected 0-1800 kbit/s"
+    exit 1
+fi
 config_get GAME_QDISC hfsc gameqdisc bfifo
 config_get FRESHNESS_MODE hfsc freshness_mode auto
 config_get FRESHNESS_TARGET_MS hfsc freshness_target_ms 18

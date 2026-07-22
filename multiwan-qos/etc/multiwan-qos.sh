@@ -14,7 +14,7 @@ IFS="$DEFAULT_IFS"
 : "${VERSION}" "${global_enabled:=}" "${nongameqdisc:=}" "${nongameqdiscoptions:=}" "${OVERHEAD:=}"
 : "${gameqdisc:=pfifo}" "${gameqdisc_child:=red}" "${nongameqdisc:=fq_codel}" "${ACK_FILTER_EGRESS:=auto}"
 : "${freshness_mode:=auto}" "${freshness_target_ms:=18}"
-: "${realtime_rate_mode:=default}" "${realtime_first_scheduling:=0}" "${adaptive_start_rate:=1000}"
+: "${realtime_rate_mode:=default}" "${realtime_first_scheduling:=0}" "${adaptive_start_rate:=1000}" "${adaptive_demand_reserve:=300}"
 : "${MAXDEL:=24}" "${PFIFOMIN:=5}" "${PACKETSIZE:=450}"
 : "${DOWNLOAD_IFB_STAB:=0}"
 : "${DISABLE_QOS_OFFLOADS:=1}"
@@ -3252,6 +3252,17 @@ case "$adaptive_start_rate" in
     1000|1500) ;;
     *) error_out "Unsupported adaptive_start_rate '$adaptive_start_rate'. Expected 1000 or 1500."; exit 1 ;;
 esac
+
+case "$adaptive_demand_reserve" in
+    ''|*[!0-9]*)
+        error_out "Invalid adaptive_demand_reserve '$adaptive_demand_reserve'. Expected 0-1800 kbit/s."
+        exit 1
+        ;;
+esac
+if [ "$adaptive_demand_reserve" -gt 1800 ]; then
+    error_out "Invalid adaptive_demand_reserve '$adaptive_demand_reserve'. Expected 0-1800 kbit/s."
+    exit 1
+fi
 
 case "${realtime_first_scheduling:-0}" in
     0|1) ;;

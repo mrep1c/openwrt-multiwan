@@ -27,12 +27,35 @@ grep -Fq "o.value('1500', _('1500 kbit/s'))" \
 grep -Fq 'mw_realtime_adaptive_range "$line_rate" "$ADAPTIVE_START_RATE"' \
     "$REPO_ROOT/multiwan-qos/usr/sbin/multiwan-qos-adaptive" ||
     fail "Adaptive monitor does not pass the configured baseline"
-grep -Fq 'TARGET_RESERVE_KBIT=300' \
-    "$REPO_ROOT/multiwan-qos/usr/sbin/multiwan-qos-adaptive" ||
-    fail "Adaptive monitor does not use the 300 kbit/s demand reserve"
-grep -Fq 'plus a 300 kbit/s reserve' \
+grep -Fq "option adaptive_demand_reserve '300'" \
+    "$REPO_ROOT/multiwan-qos/etc/config/multiwan-qos" ||
+    fail "default config does not preserve the 300 kbit/s Adaptive demand reserve"
+grep -Fq "form.Value, 'adaptive_demand_reserve'" \
     "$REPO_ROOT/luci-app-multiwan-qos/htdocs/luci-static/resources/multiwan-qos/hfsc.js" ||
-    fail "LuCI does not describe the 300 kbit/s demand reserve"
+    fail "LuCI Adaptive demand reserve input is missing"
+grep -Fq "o.datatype = 'range(0, 1800)'" \
+    "$REPO_ROOT/luci-app-multiwan-qos/htdocs/luci-static/resources/multiwan-qos/hfsc.js" ||
+    fail "LuCI Adaptive demand reserve range is missing"
+grep -Fq 'config_get TARGET_RESERVE_KBIT hfsc adaptive_demand_reserve 300' \
+    "$REPO_ROOT/multiwan-qos/usr/sbin/multiwan-qos-adaptive" ||
+    fail "Adaptive monitor does not load the configured demand reserve"
+grep -Fq 'plus the configured Adaptive Demand Reserve' \
+    "$REPO_ROOT/luci-app-multiwan-qos/htdocs/luci-static/resources/multiwan-qos/hfsc.js" ||
+    fail "LuCI does not describe the configured demand reserve"
+grep -A1 "createOption('PFIFOMIN'" \
+    "$REPO_ROOT/luci-app-multiwan-qos/htdocs/luci-static/resources/multiwan-qos/hfsc.js" |
+    grep -Fq "o.depends('gameqdisc', 'pfifo')" ||
+    fail "LuCI PFIFO options are not conditional on PFIFO selection"
+for netem_option in netemdelayms netemjitterms pktlossp; do
+    grep -A1 "createOption('$netem_option'" \
+        "$REPO_ROOT/luci-app-multiwan-qos/htdocs/luci-static/resources/multiwan-qos/hfsc.js" |
+        grep -Fq "o.depends('gameqdisc', 'netem')" ||
+        fail "LuCI $netem_option is not conditional on NETEM selection"
+done
+grep -A8 "form.ListValue, 'netemdist'" \
+    "$REPO_ROOT/luci-app-multiwan-qos/htdocs/luci-static/resources/multiwan-qos/hfsc.js" |
+    grep -Fq "o.depends('gameqdisc', 'netem')" ||
+    fail "LuCI NETEM distribution is not conditional on NETEM selection"
 
 mw_realtime_adaptive_range 100000
 [ "$MW_RT_FLOOR:$MW_RT_START:$MW_RT_CEILING" = 300:1000:1800 ] ||
