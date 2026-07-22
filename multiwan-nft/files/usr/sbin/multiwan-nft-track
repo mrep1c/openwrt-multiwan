@@ -16,6 +16,11 @@ SLEEP_PID=""
 SLEEP_START=""
 TRACK_PID=""
 TRACK_START=""
+TRACKER_SELF_START=""
+TRACKER_OWNER_FILE=""
+TRACKER_OWNER_TOKEN=""
+MULTIWAN_NFT_TRACK_IP_LIST=""
+MULTIWAN_NFT_TRACK_IP_COUNT=0
 
 stop_child() {
 	local pid="$1" start="$2" label="$3" count=0
@@ -48,7 +53,7 @@ WRAP() {
 	# If libwrap exists, use it for proper fwmark binding
 	if [ -f /lib/multiwan-nft/libwrap_mwan3_sockopt.so.1.0 ]; then
 		# shellcheck disable=SC2048
-		FAMILY=$FAMILY DEVICE=$DEVICE SRCIP=$SRC_IP FWMARK=$MMX_DEFAULT LD_PRELOAD=/lib/multiwan-nft/libwrap_mwan3_sockopt.so.1.0 $*
+		FAMILY=$FAMILY DEVICE=$DEVICE SRCIP=$SRC_IP FWMARK=$MMX_DEFAULT LD_PRELOAD=/lib/multiwan-nft/libwrap_mwan3_sockopt.so.1.0 "$@"
 	else
 		# Fallback: use native interface binding (#23: handle all track methods)
 		local cmd="$1"
@@ -81,9 +86,44 @@ WRAP() {
 	fi
 }
 
-clean_up() {
+multiwan_nft_tracker_publish_owner() {
+	local owner_tmp
+
+	TRACKER_SELF_START="$(mw_process_start_time "$$")" || return 1
+	TRACKER_OWNER_FILE="$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/OWNER"
+	TRACKER_OWNER_TOKEN="tracker:$INTERFACE:$$:$TRACKER_SELF_START"
+	owner_tmp="$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/.OWNER.$$"
+	printf '%s %s %s\n' "$$" "$TRACKER_SELF_START" "$TRACKER_OWNER_TOKEN" > "$owner_tmp" || {
+		rm -f "$owner_tmp"
+		return 1
+	}
+	mv "$owner_tmp" "$TRACKER_OWNER_FILE" || {
+		rm -f "$owner_tmp"
+		return 1
+	}
+}
+
+multiwan_nft_tracker_remove_owner() {
+	local pid start token
+
+	[ -n "$TRACKER_OWNER_FILE" ] && [ -r "$TRACKER_OWNER_FILE" ] || return 0
+	pid=""
+	start=""
+	token=""
+	read -r pid start token < "$TRACKER_OWNER_FILE" || return 0
+	[ "$pid" = "$$" ] && [ "$start" = "$TRACKER_SELF_START" ] &&
+		[ "$token" = "$TRACKER_OWNER_TOKEN" ] || return 0
+	rm -f "$TRACKER_OWNER_FILE" "$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/.OWNER.$$"
+}
+
+multiwan_nft_tracker_cleanup() {
+	trap - EXIT HUP INT TERM
 	LOG notice "Stopping multiwan-nft-track for interface \"${INTERFACE}\". Status was \"${STATUS}\""
 	stop_subprocs
+	multiwan_nft_tracker_remove_owner
+}
+
+multiwan_nft_tracker_signal() {
 	exit 0
 }
 
@@ -110,7 +150,7 @@ ping_test_host() {
 }
 
 get_ping_command() {
-	if [ -x "/usr/bin/ping" ] && /usr/bin/ping -${FAMILY#ipv} -c1 -q $(ping_test_host) &>/dev/null; then
+	if [ -x "/usr/bin/ping" ] && /usr/bin/ping -${FAMILY#ipv} -c1 -q "$(ping_test_host)" >/dev/null 2>&1; then
 		# -4 option added in iputils c3e68ac6 so need to check if we can use it
 		# or if we must use ping and ping6
 		echo "/usr/bin/ping -${FAMILY#ipv}"
@@ -166,9 +206,14 @@ validate_wrap() {
 }
 
 disconnected() {
-	local status="$(cat ${MULTIWAN_NFT_TRACK_STATUS_DIR}/${INTERFACE}/STATUS 2>/dev/null)"
-	local quiet="${1:-0}"
-	local reason="${2:-probe}"
+	local status quiet reason
+
+	status=""
+	if [ -r "$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/STATUS" ]; then
+		{ IFS= read -r status < "$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/STATUS" || [ -n "$status" ]; } 2>/dev/null || status=
+	fi
+	quiet="${1:-0}"
+	reason="${2:-probe}"
 
 	STATUS='offline'
 	echo "offline" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/STATUS
@@ -286,6 +331,11 @@ log_tracking_failure_context() {
 	LOG debug "tracking failure context: interface=$INTERFACE device=$DEVICE next_state=$next_state target=$target src=$SRC_IP score=$current_score lost=$current_lost reliability=$reliability mmx_default=$MMX_DEFAULT/$MMX_MASK route_default=[$route_default] route_src=[$route_src] route_oif=[$route_oif] route_marked=[$route_marked]"
 }
 
+multiwan_nft_tracker_collect_target() {
+	MULTIWAN_NFT_TRACK_IP_LIST="${MULTIWAN_NFT_TRACK_IP_LIST}${MULTIWAN_NFT_TRACK_IP_LIST:+ }$1"
+	MULTIWAN_NFT_TRACK_IP_COUNT=$((MULTIWAN_NFT_TRACK_IP_COUNT + 1))
+}
+
 main() {
 	local reliability count timeout interval failure_interval
 	local recovery_interval down up size
@@ -304,9 +354,14 @@ main() {
 
 	mkdir -p "$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE"
 
-	trap clean_up HUP INT TERM
+	trap multiwan_nft_tracker_cleanup EXIT
+	trap multiwan_nft_tracker_signal HUP INT TERM
 	trap if_down USR1
 	trap if_up USR2
+	multiwan_nft_tracker_publish_owner || {
+		LOG error "Unable to publish tracker process identity for interface $INTERFACE"
+		return 1
+	}
 
 	config_get FAMILY $INTERFACE family ipv4
 	config_get track_method $INTERFACE track_method ping
@@ -337,13 +392,11 @@ main() {
 	config_get failure_loss $INTERFACE failure_loss 40
 	config_get recovery_loss $INTERFACE recovery_loss 10
 	local sleep_time result ping_status loss latency quality_sample
-	target_count=0
-	multiwan_nft_list_track_ips()
-	{
-		track_ips="$track_ips $1"
-		target_count=$((target_count + 1))
-	}
-	config_list_foreach "$1" track_ip multiwan_nft_list_track_ips
+	MULTIWAN_NFT_TRACK_IP_LIST=""
+	MULTIWAN_NFT_TRACK_IP_COUNT=0
+	config_list_foreach "$1" track_ip multiwan_nft_tracker_collect_target
+	track_ips="$MULTIWAN_NFT_TRACK_IP_LIST"
+	target_count=$MULTIWAN_NFT_TRACK_IP_COUNT
 
 	case "$reliability:$count:$timeout:$interval:$down:$up:$failure_interval:$recovery_interval:$failure_latency:$recovery_latency:$failure_loss:$recovery_loss" in
 		*[!0-9:]*|:*|*::*)
@@ -411,7 +464,7 @@ main() {
 				case "$track_method" in
 					ping)
 						if [ "$check_quality" -eq 0 ]; then
-							WRAP $PING -n -c $count -W $timeout -s $size -t $max_ttl -q $track_ip &> /dev/null &
+							WRAP $PING -n -c $count -W $timeout -s $size -t $max_ttl -q $track_ip >/dev/null 2>&1 &
 							TRACK_PID=$!
 							TRACK_START="$(mw_process_start_time "$TRACK_PID")"
 							wait "$TRACK_PID"
@@ -437,7 +490,7 @@ main() {
 						fi
 					;;
 					arping)
-						WRAP arping -I $DEVICE -c $count -w $timeout -q $track_ip &> /dev/null &
+						WRAP arping -I $DEVICE -c $count -w $timeout -q $track_ip >/dev/null 2>&1 &
 						TRACK_PID=$!
 						TRACK_START="$(mw_process_start_time "$TRACK_PID")"
 						wait "$TRACK_PID"
@@ -447,9 +500,9 @@ main() {
 					;;
 					httping)
 						if [ "$httping_ssl" -eq 1 ]; then
-							WRAP httping -c $count -t $timeout -q "https://$track_ip" &> /dev/null &
+							WRAP httping -c $count -t $timeout -q "https://$track_ip" >/dev/null 2>&1 &
 						else
-							WRAP httping -c $count -t $timeout -q "http://$track_ip" &> /dev/null &
+							WRAP httping -c $count -t $timeout -q "http://$track_ip" >/dev/null 2>&1 &
 						fi
 						TRACK_PID=$!
 						TRACK_START="$(mw_process_start_time "$TRACK_PID")"
@@ -471,13 +524,13 @@ main() {
 				do_log=""
 				if [ "$check_quality" -eq 0 ] || [ "$quality_sample" -eq 0 ]; then
 					if [ "$result" -eq 0 ]; then
-						let host_up_count++
+						host_up_count=$((host_up_count + 1))
 						update_status "$track_ip" "up"
 
 						[ "$score" -le "$up" ] && do_log="success"
 					else
-						let lost++
-						let host_down_count++
+						lost=$((lost + 1))
+						host_down_count=$((host_down_count + 1))
 						last_failed_target="$track_ip"
 						update_status "$track_ip" "down"
 
@@ -490,14 +543,14 @@ main() {
 						*[!0-9:]*|:*|*::*) loss=100; latency=999999 ;;
 					esac
 					if [ "$loss" -ge "$failure_loss" ] || [ "$latency" -ge "$failure_latency" ]; then
-						let lost++
-						let host_down_count++
+						lost=$((lost + 1))
+						host_down_count=$((host_down_count + 1))
 						last_failed_target="$track_ip"
 						update_status "$track_ip" "down" $latency $loss
 
 						[ "$score" -gt "$up" ] && do_log="failed"
 					elif [ "$loss" -le "$recovery_loss" ] && [ "$latency" -le "$recovery_latency" ]; then
-						let host_up_count++
+						host_up_count=$((host_up_count + 1))
 						update_status "$track_ip" "up" $latency $loss
 
 						[ "$score" -le "$up" ] && do_log="success"
@@ -519,7 +572,7 @@ main() {
 		echo "$round_state" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/LAST_PROBE_RESULT
 
 		if [ "$round_state" = "down" ]; then
-			let score--
+			score=$((score - 1))
 
 			if [ "$score" -lt "$up" ]; then
 				score=0
@@ -539,7 +592,7 @@ main() {
 				LOG info "Lost $((lost*count)) ping(s) on interface $INTERFACE ($DEVICE). Current score: $score"
 			fi
 
-			let score++
+			score=$((score + 1))
 			lost=0
 
 			if [ "$score" -lt "$up" ]; then
@@ -559,8 +612,7 @@ main() {
 			esac
 		fi
 
-		let turn++
-		mkdir -p "$MULTIWAN_NFT_TRACK_STATUS_DIR/${1}"
+		turn=$((turn + 1))
 		echo "${lost}" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/LOST
 		echo "${score}" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/SCORE
 		echo "${turn}" > $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/TURN

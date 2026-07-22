@@ -1,12 +1,15 @@
 #!/bin/sh
 
-IP4="ip -4"
-IP6="ip -6"
-SCRIPTNAME="$(basename "$0")"
+IP4="${IP4:-ip -4}"
+IP6="${IP6:-ip -6}"
+SCRIPTNAME="${SCRIPTNAME:-${0##*/}}"
 
-MULTIWAN_NFT_STATUS_DIR="/var/run/multiwan_nft"
+MULTIWAN_NFT_STATUS_DIR="${MULTIWAN_NFT_STATUS_DIR:-/var/run/multiwan_nft}"
 MULTIWAN_NFT_STATUS_NFT_LOG_DIR="${MULTIWAN_NFT_STATUS_DIR}/nft_log"
-MULTIWAN_NFT_TRACK_STATUS_DIR="/var/run/multiwan-nft-track"
+MULTIWAN_NFT_TRACK_STATUS_DIR="${MULTIWAN_NFT_TRACK_STATUS_DIR:-/var/run/multiwan-nft-track}"
+MULTIWAN_NFT_TRACK_OWNER_FORMAT_FILE="${MULTIWAN_NFT_STATUS_DIR}/tracker-owner-v1"
+MULTIWAN_NFT_PROC_ROOT="${MULTIWAN_NFT_PROC_ROOT:-/proc}"
+MULTIWAN_NFT_UPTIME_FILE="${MULTIWAN_NFT_UPTIME_FILE:-${MULTIWAN_NFT_PROC_ROOT}/uptime}"
 
 MULTIWAN_NFT_INTERFACE_MAX=""
 
@@ -22,13 +25,15 @@ MAX_SLEEP=$(((1<<31)-1))
 
 # Check for kernel IPv6 support. Configured MultiWAN IPv6 use is checked
 # separately after UCI has been loaded.
-[ -f /proc/net/if_inet6 ]
-NO_IPV6=$?
+if [ -z "${NO_IPV6+x}" ]; then
+	[ -f "${MULTIWAN_NFT_PROC_ROOT}/net/if_inet6" ]
+	NO_IPV6=$?
+fi
 
 # nftables commands
-NFT="nft"
-NFT_TABLE="multiwan_nft"
-NFT_FAMILY="inet"
+NFT="${NFT:-nft}"
+NFT_TABLE="${NFT_TABLE:-multiwan_nft}"
+NFT_FAMILY="${NFT_FAMILY:-inet}"
 
 # Atomic ruleset buffer
 MULTIWAN_NFT_NFT_BUF=""
@@ -95,7 +100,7 @@ multiwan_nft_get_true_iface()
 	elif [ "$family" = "ipv6" ]; then
 		V=6
 	fi
-	ubus call "network.interface.${2}_${V}" status &>/dev/null && _true_iface="${2}_${V}"
+	ubus call "network.interface.${2}_${V}" status >/dev/null 2>&1 && _true_iface="${2}_${V}"
 	export "$1=$_true_iface"
 }
 
@@ -133,48 +138,138 @@ multiwan_nft_get_src_ip()
 	export "$1=$_src_ip"
 }
 
+MULTIWAN_NFT_TRACKING_CONFIGURED=0
+MULTIWAN_NFT_LEGACY_TRACK_STATUS=""
+
+multiwan_nft_collect_track_ip()
+{
+	MULTIWAN_NFT_TRACKING_CONFIGURED=1
+}
+
+# Keep tracker status queries cheap: the tracker publishes its PID and kernel
+# start time in tmpfs. The start time prevents a reused PID from being treated
+# as the old tracker process.
+multiwan_nft_process_start_time()
+{
+	local pid="$1" stat rest
+
+	case "$pid" in
+		""|*[!0-9]*) return 1 ;;
+	esac
+	[ -r "${MULTIWAN_NFT_PROC_ROOT}/$pid/stat" ] || return 1
+	stat=""
+	{ IFS= read -r stat < "${MULTIWAN_NFT_PROC_ROOT}/$pid/stat" || [ -n "$stat" ]; } 2>/dev/null || return 1
+	rest="${stat##*) }"
+	set -- $rest
+	[ "$#" -ge 20 ] || return 1
+	shift 19
+	case "$1" in
+		""|*[!0-9]*) return 1 ;;
+	esac
+	printf '%s\n' "$1"
+}
+
+multiwan_nft_process_identity_alive()
+{
+	local pid="$1" expected_start="$2" current_start
+
+	case "$pid:$expected_start" in
+		*[!0-9:]*|:|*:) return 1 ;;
+	esac
+	kill -0 "$pid" 2>/dev/null || return 1
+	current_start="$(multiwan_nft_process_start_time "$pid")" || return 1
+	[ "$current_start" = "$expected_start" ]
+}
+
+# Compatibility fallback for a tracker that was already running while the
+# package was upgraded. New tracker processes always use the owner journal.
+multiwan_nft_get_legacy_track_status()
+{
+	local interface="$1" pid pid_dir cmdline child_dir child_ppid child_cmdline
+
+	pid=""
+	for pid_dir in "${MULTIWAN_NFT_PROC_ROOT}"/[0-9]*; do
+		[ -r "$pid_dir/cmdline" ] || continue
+		cmdline="$(tr '\0' ' ' 2>/dev/null < "$pid_dir/cmdline")"
+		case "$cmdline" in
+			*"/usr/sbin/multiwan-nft-track $interface"|*"/usr/sbin/multiwan-nft-track $interface ")
+				pid="${pid_dir##*/}"
+				break
+				;;
+		esac
+	done
+	[ -n "$pid" ] || return 1
+
+	MULTIWAN_NFT_LEGACY_TRACK_STATUS="active"
+	for child_dir in "${MULTIWAN_NFT_PROC_ROOT}"/[0-9]*; do
+		[ -r "$child_dir/status" ] || continue
+		child_ppid="$(sed -n 's/^PPid:[[:space:]]*//p' "$child_dir/status" 2>/dev/null)"
+		[ "$child_ppid" = "$pid" ] || continue
+		child_cmdline="$(tr '\0' ' ' 2>/dev/null < "$child_dir/cmdline")"
+		case "$child_cmdline" in
+			"sleep $MAX_SLEEP"|"sleep $MAX_SLEEP ")
+				MULTIWAN_NFT_LEGACY_TRACK_STATUS="paused"
+				break
+				;;
+		esac
+	done
+	return 0
+}
+
 multiwan_nft_get_track_status()
 {
-	local track_ips pid pid_dir cmdline child_dir child_ppid child_cmdline
-	multiwan_nft_list_track_ips()
-	{
-		track_ips="$1 $track_ips"
-	}
-	config_list_foreach "$1" track_ip multiwan_nft_list_track_ips
+	local interface="$1" owner_file pid start token
 
-	if [ -n "$track_ips" ]; then
-		pid=""
-		for pid_dir in /proc/[0-9]*; do
-			[ -r "$pid_dir/cmdline" ] || continue
-			cmdline="$(tr '\0' ' ' 2>/dev/null < "$pid_dir/cmdline")"
-			case "$cmdline" in
-				*"/usr/sbin/multiwan-nft-track $1"|*"/usr/sbin/multiwan-nft-track $1 ")
-					pid="${pid_dir##*/}"
-					break
-					;;
-			esac
-		done
-		if [ -n "$pid" ]; then
-			tracking="active"
-			for child_dir in /proc/[0-9]*; do
-				[ -r "$child_dir/status" ] || continue
-				child_ppid="$(sed -n 's/^PPid:[[:space:]]*//p' "$child_dir/status" 2>/dev/null)"
-				[ "$child_ppid" = "$pid" ] || continue
-				child_cmdline="$(tr '\0' ' ' 2>/dev/null < "$child_dir/cmdline")"
-				case "$child_cmdline" in
-					"sleep $MAX_SLEEP"|"sleep $MAX_SLEEP ")
-						tracking="paused"
-						break
-						;;
-				esac
-			done
-		else
-			tracking="down"
-		fi
-	else
-		tracking="not enabled"
+	MULTIWAN_NFT_TRACKING_CONFIGURED=0
+	config_list_foreach "$interface" track_ip multiwan_nft_collect_track_ip
+	if [ "$MULTIWAN_NFT_TRACKING_CONFIGURED" -eq 0 ]; then
+		printf '%s\n' "not enabled"
+		return 0
 	fi
-	echo "$tracking"
+
+	owner_file="${MULTIWAN_NFT_TRACK_STATUS_DIR}/${interface}/OWNER"
+	pid=""
+	start=""
+	token=""
+	if [ -r "$owner_file" ]; then
+		read -r pid start token < "$owner_file" || true
+	fi
+	case "$token" in
+		"tracker:${interface}:"*)
+			if multiwan_nft_process_identity_alive "$pid" "$start"; then
+				printf '%s\n' "active"
+				return 0
+			fi
+			;;
+	esac
+
+	# start_service creates this marker only after procd has replaced any
+	# pre-upgrade trackers. From then on, a missing/dead owner means down and
+	# does not require a compatibility scan of /proc.
+	if [ -e "$MULTIWAN_NFT_TRACK_OWNER_FORMAT_FILE" ]; then
+		printf '%s\n' "down"
+		return 0
+	fi
+
+	if multiwan_nft_get_legacy_track_status "$interface"; then
+		printf '%s\n' "$MULTIWAN_NFT_LEGACY_TRACK_STATUS"
+	else
+		printf '%s\n' "down"
+	fi
+}
+
+MULTIWAN_NFT_ENABLED_FAMILY_WANTED=""
+MULTIWAN_NFT_ENABLED_FAMILY_FOUND=0
+
+multiwan_nft_check_enabled_family()
+{
+	local section="$1" enabled family
+
+	config_get_bool enabled "$section" enabled 0
+	[ "$enabled" -eq 1 ] || return
+	config_get family "$section" family ipv4
+	[ "$family" = "$MULTIWAN_NFT_ENABLED_FAMILY_WANTED" ] &&
+		MULTIWAN_NFT_ENABLED_FAMILY_FOUND=1
 }
 
 multiwan_nft_has_enabled_family()
@@ -186,18 +281,8 @@ multiwan_nft_has_enabled_family()
 		*) return 1 ;;
 	esac
 
+	MULTIWAN_NFT_ENABLED_FAMILY_WANTED="$wanted_family"
 	MULTIWAN_NFT_ENABLED_FAMILY_FOUND=0
-	multiwan_nft_check_enabled_family()
-	{
-		local section="$1" enabled family
-
-		config_get_bool enabled "$section" enabled 0
-		[ "$enabled" -eq 1 ] || return
-		config_get family "$section" family ipv4
-		[ "$family" = "$wanted_family" ] &&
-			MULTIWAN_NFT_ENABLED_FAMILY_FOUND=1
-	}
-
 	config_foreach multiwan_nft_check_enabled_family interface
 	[ "$MULTIWAN_NFT_ENABLED_FAMILY_FOUND" -eq 1 ]
 }
@@ -208,13 +293,18 @@ multiwan_nft_init()
 
 	config_load 'multiwan-nft'
 
-	[ -d $MULTIWAN_NFT_STATUS_DIR ] || mkdir -p $MULTIWAN_NFT_STATUS_DIR/iface_state
-	[ -d "$MULTIWAN_NFT_STATUS_NFT_LOG_DIR" ] || mkdir -p "$MULTIWAN_NFT_STATUS_NFT_LOG_DIR"
+	if [ ! -d "$MULTIWAN_NFT_STATUS_DIR/iface_state" ] ||
+		[ ! -d "$MULTIWAN_NFT_STATUS_NFT_LOG_DIR" ]; then
+		mkdir -p "$MULTIWAN_NFT_STATUS_DIR/iface_state" \
+			"$MULTIWAN_NFT_STATUS_NFT_LOG_DIR" || return 1
+	fi
 
 	# MultiWAN NFT routing mark mask. The lower byte is reserved for MultiWAN QoS.
 	mask_file="${MULTIWAN_NFT_STATUS_DIR}/mmx_mask"
 	cached_mask=
-	[ -s "$mask_file" ] && cached_mask="$(cat "$mask_file" 2>/dev/null)"
+	if [ -s "$mask_file" ]; then
+		{ IFS= read -r cached_mask < "$mask_file" || [ -n "$cached_mask" ]; } 2>/dev/null || cached_mask=
+	fi
 	if [ -n "$cached_mask" ] &&
 		normalized_mask="$(multiwan_nft_normalize_mask "$cached_mask" 2>/dev/null)"; then
 		MMX_MASK="$normalized_mask"
@@ -225,20 +315,23 @@ multiwan_nft_init()
 		MMX_MASK="$normalized_mask"
 	fi
 
-	mask_tmp="$(mktemp "${MULTIWAN_NFT_STATUS_DIR}/mmx_mask.XXXXXX")" || {
-		LOG error "Failed to create temporary firewall mask state file"
-		return 1
-	}
-	if echo "$MMX_MASK" | tr 'A-F' 'a-f' > "$mask_tmp"; then
-		mv "$mask_tmp" "$mask_file" || {
-			rm -f "$mask_tmp"
-			LOG error "Failed to update firewall mask state file"
+	# Avoid rewriting the tmpfs cache on every CLI, hotplug, and monitor init.
+	if [ "$cached_mask" != "$MMX_MASK" ]; then
+		mask_tmp="$(mktemp "${MULTIWAN_NFT_STATUS_DIR}/mmx_mask.XXXXXX")" || {
+			LOG error "Failed to create temporary firewall mask state file"
 			return 1
 		}
-	else
-		rm -f "$mask_tmp"
-		LOG error "Failed to write firewall mask state file"
-		return 1
+		if printf '%s\n' "$MMX_MASK" > "$mask_tmp"; then
+			mv "$mask_tmp" "$mask_file" || {
+				rm -f "$mask_tmp"
+				LOG error "Failed to update firewall mask state file"
+				return 1
+			}
+		else
+			rm -f "$mask_tmp"
+			LOG error "Failed to write firewall mask state file"
+			return 1
+		fi
 	fi
 	LOG debug "Using firewall mask ${MMX_MASK}"
 
@@ -254,7 +347,7 @@ multiwan_nft_init()
 	MULTIWAN_NFT_ROUTE_LINE_EXP="s/offload//; s/linkdown //; s/expires [0-9]\+sec//; s/error [0-9]\+//; ${source_routing:+s/default\(.*\) from [^ ]*/default\1/;} p"
 
 	# mark mask constants
-	bitcnt=$(multiwan_nft_count_one_bits MMX_MASK)
+	bitcnt=$(multiwan_nft_count_one_bits "$MMX_MASK")
 	mmdefault=$(((1<<bitcnt)-1))
 	MM_BLACKHOLE=$((mmdefault-2))
 	MM_UNREACHABLE=$((mmdefault-1))
@@ -347,16 +440,22 @@ multiwan_nft_count_one_bits()
 }
 
 get_uptime() {
-	local uptime=$(cat /proc/uptime)
-	echo "${uptime%%.*}"
+	local uptime
+
+	uptime=""
+	{ IFS=' ' read -r uptime _ < "$MULTIWAN_NFT_UPTIME_FILE" || [ -n "$uptime" ]; } 2>/dev/null || return 1
+	printf '%s\n' "${uptime%%.*}"
 }
 
 get_online_time() {
 	local time_n time_u iface
 	iface="$1"
-	time_u="$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/ONLINE" 2>/dev/null)"
+	time_u=""
+	if [ -r "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/ONLINE" ]; then
+		{ IFS= read -r time_u < "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/ONLINE" || [ -n "$time_u" ]; } 2>/dev/null || time_u=
+	fi
 	[ -z "${time_u}" ] || [ "${time_u}" = "0" ] || {
 		time_n="$(get_uptime)"
-		echo $((time_n-time_u))
+		printf '%s\n' $((time_n-time_u))
 	}
 }

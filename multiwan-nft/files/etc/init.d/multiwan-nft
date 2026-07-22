@@ -189,33 +189,38 @@ multiwan_nft_is_package_script_context() {
 	return 1
 }
 
+MULTIWAN_NFT_NETWORK_HAS_DEVICE=0
+
+multiwan_nft_check_network_device() {
+	local device
+
+	network_get_device device "$1" 2>/dev/null
+	[ -n "$device" ] && MULTIWAN_NFT_NETWORK_HAS_DEVICE=1
+}
+
 # Wait for basic network readiness (at least one interface + routes)
 # Does NOT wait for all interfaces - late PPPoE connections handled by hotplug
 # This allows multiwan_nft to start quickly and add interfaces as they come online
 wait_for_network() {
 	local timeout=5
 	local count=0
-	local device
+	local has_routes
 	
 	# Initialize multiwan_nft config loading for check_iface
 	config_load 'multiwan-nft'
 	
 	while [ "$count" -lt "$timeout" ]; do
 		# Check if at least one multiwan_nft interface has a device
-		local has_device=0
-		check_iface() {
-			network_get_device device "$1" 2>/dev/null
-			[ -n "$device" ] && has_device=1
-		}
-		config_foreach check_iface interface
+		MULTIWAN_NFT_NETWORK_HAS_DEVICE=0
+		config_foreach multiwan_nft_check_network_device interface
 		
 		# Check if basic routes exist (LAN at minimum)
-		local has_routes=0
+		has_routes=0
 		[ -n "$($IP4 route show 2>/dev/null | head -1)" ] && has_routes=1
 		
 		# If any device + routes available, we're ready
 		# Late interfaces (slow PPPoE) will be handled by hotplug
-		if [ "$has_device" = "1" ] && [ "$has_routes" = "1" ]; then
+		if [ "$MULTIWAN_NFT_NETWORK_HAS_DEVICE" = "1" ] && [ "$has_routes" = "1" ]; then
 			LOG notice "Network ready after ${count}s - late interfaces handled by hotplug"
 			return 0
 		fi
@@ -357,6 +362,10 @@ start_service() {
 	multiwan_nft_check_required_packages || return 1
 
 	multiwan_nft_init || return 1
+	# All trackers registered below use the PID/start-time owner journal. This
+	# marker lets status queries report a stopped tracker without scanning /proc;
+	# its absence still enables the rolling-upgrade compatibility fallback.
+	printf '%s\n' 1 > "$MULTIWAN_NFT_TRACK_OWNER_FORMAT_FILE" || return 1
 	config_foreach start_tracker interface
 
 	multiwan_nft_update_iface_to_table

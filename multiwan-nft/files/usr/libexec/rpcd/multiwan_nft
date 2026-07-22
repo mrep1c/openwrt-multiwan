@@ -11,14 +11,14 @@ NFT_TABLE="multiwan_nft"
 NFT_FAMILY="inet"
 
 report_connected_v4() {
-	if $NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v4 &>/dev/null; then
+	if $NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v4 >/dev/null 2>&1; then
 		$NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v4 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?'
 	fi
 }
 
 report_connected_v6() {
 	[ "$NO_IPV6" -ne 0 ] && return
-	if $NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v6 &>/dev/null; then
+	if $NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v6 >/dev/null 2>&1; then
 		$NFT list set $NFT_FAMILY $NFT_TABLE multiwan_nft_connected_v6 | grep -oE '[0-9a-fA-F:]+(/[0-9]+)?'
 	fi
 }
@@ -88,9 +88,21 @@ track_file_value() {
 	local iface="$1"
 	local name="$2"
 	local default="${3:-}"
-	local value
+	local value line first
 
-	value="$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/${name}" 2>/dev/null)"
+	value=""
+	if [ -r "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/${name}" ]; then
+		first=1
+		while IFS= read -r line || [ -n "$line" ]; do
+			if [ "$first" -eq 1 ]; then
+				value="$line"
+				first=0
+			else
+				value="$value
+$line"
+			fi
+		done < "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/${name}"
+	fi
 	[ -n "$value" ] && printf '%s\n' "$value" || printf '%s\n' "$default"
 }
 
@@ -151,8 +163,8 @@ get_multiwan_nft_status() {
 	if [ -d "${MULTIWAN_NFT_STATUS_DIR}" ]; then
 		network_get_uptime uptime "$iface"
 		network_is_up "$iface" && up="1"
-		if [ -f "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/STATUS" ]; then
-			status="$(cat "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/STATUS")"
+		if [ -r "$MULTIWAN_NFT_TRACK_STATUS_DIR/${iface}/STATUS" ]; then
+			status="$(track_file_value "$iface" STATUS notracking)"
 		else
 			status="notracking"
 		fi

@@ -31,7 +31,7 @@ multiwan_nft_init
 	exit 0
 }
 
-$NFT list chain $NFT_FAMILY $NFT_TABLE multiwan_nft_hook &>/dev/null || {
+$NFT list chain $NFT_FAMILY $NFT_TABLE multiwan_nft_hook >/dev/null 2>&1 || {
 	LOG warn "hotplug called on $INTERFACE before multiwan_nft has been set up"
 	exit 0
 }
@@ -48,7 +48,11 @@ config_get_bool enabled $INTERFACE 'enabled' '0'
 
 config_get initial_state $INTERFACE initial_state "online"
 if [ "$initial_state" = "offline" ]; then
-	status=$(cat $MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/STATUS 2>/dev/null || echo unknown)
+	status=""
+	if [ -r "$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/STATUS" ]; then
+		{ IFS= read -r status < "$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/STATUS" || [ -n "$status" ]; } 2>/dev/null || status=
+	fi
+	status="${status:-unknown}"
 	[ "$status" = "online" ] || status=offline
 else
 	status=online
@@ -59,7 +63,10 @@ LOG notice "Execute $ACTION event on interface $INTERFACE (${DEVICE:-unknown})"
 status_dir="$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE"
 mkdir -p "$status_dir"
 old_state="$(multiwan_nft_get_iface_hotplug_state "$INTERFACE")"
-previous_session_action="$(cat "$status_dir/SESSION_ACTION" 2>/dev/null)"
+previous_session_action=""
+if [ -r "$status_dir/SESSION_ACTION" ]; then
+	{ IFS= read -r previous_session_action < "$status_dir/SESSION_ACTION" || [ -n "$previous_session_action" ]; } 2>/dev/null || previous_session_action=
+fi
 case "$previous_session_action" in
 	purged|already-purged) failure_already_purged=1 ;;
 	*) failure_already_purged=0 ;;
