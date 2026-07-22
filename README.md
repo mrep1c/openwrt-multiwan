@@ -27,8 +27,11 @@ HFSC and Hybrid also offer optional Realtime First Scheduling on OpenWrt 24.10
 and newer. It places an ETS scheduler below the HFSC link shaper, sends
 EF/CS5/CS6/CS7 traffic through one strict realtime band, and keeps the selected
 game qdisc as that band's leaf. Adaptive mode retains the bounded HFSC topology
-and takes precedence over this option. OpenWrt 23.05 remains supported for the
-normal QoS modes but does not ship the required `sch_ets` module.
+and takes precedence over this option. Its HFSC start/idle baseline can be
+selected as 1000 or 1500 kbit/s, remains capped at 25% of each link, and
+does not resize the fixed 1000 kbit/s finite-queue profile. OpenWrt 23.05
+remains supported for the normal QoS modes but does not ship the required
+`sch_ets` module.
 
 The two services are designed to coexist. MultiWAN QoS uses the lower byte of
 conntrack marks for DSCP state, while MultiWAN NFT uses separate upper routing

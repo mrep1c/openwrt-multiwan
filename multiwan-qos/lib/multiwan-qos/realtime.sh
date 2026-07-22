@@ -64,16 +64,17 @@ mw_realtime_auto_rate() {
 }
 
 mw_realtime_adaptive_range() {
-    local line_rate="$1" cap
+    local line_rate="$1" start_rate="${2:-1000}" cap
 
     case "$line_rate" in ''|*[!0-9]*) line_rate=1 ;; esac
     [ "$line_rate" -gt 0 ] 2>/dev/null || line_rate=1
+    case "$start_rate" in 1000|1500) ;; *) start_rate=1000 ;; esac
     cap=$((line_rate * 25 / 100))
     [ "$cap" -lt 1 ] && cap=1
 
     MW_RT_FLOOR=300
     [ "$MW_RT_FLOOR" -gt "$cap" ] && MW_RT_FLOOR="$cap"
-    MW_RT_START=1000
+    MW_RT_START="$start_rate"
     [ "$MW_RT_START" -gt "$cap" ] && MW_RT_START="$cap"
     [ "$MW_RT_START" -lt "$MW_RT_FLOOR" ] && MW_RT_START="$MW_RT_FLOOR"
     MW_RT_CEILING=1800

@@ -163,7 +163,7 @@ MULTIWAN_QOS_EXEC_FILES_FRONTEND="
     "$MULTIWAN_QOS_EXEC_FILES_BACKEND" "$MULTIWAN_QOS_EXTRA_FILES_BACKEND" "$MULTIWAN_QOS_FILE_TYPES_FRONTEND" \
     "$MULTIWAN_QOS_GEN_FILES_FRONTEND" "$MULTIWAN_QOS_EXTRA_FILES_FRONTEND" "$MULTIWAN_QOS_EXEC_FILES_FRONTEND" \
     "${global_enabled:=}" "${ROOT_QDISC:=}" "${gameqdisc:=}" "${gameqdisc_child:=}" \
-    "${realtime_rate_mode:=default}" "${realtime_first_scheduling:=0}"
+    "${realtime_rate_mode:=default}" "${realtime_first_scheduling:=0}" "${adaptive_start_rate:=1000}"
 
 
 ### Utility functions

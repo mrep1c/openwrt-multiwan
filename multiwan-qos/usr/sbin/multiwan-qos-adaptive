@@ -13,7 +13,7 @@ IDLE_POLL_INTERVAL=5
 SESSION_GRACE_MS=20000
 IDLE_POLL_AFTER_MS="$SESSION_GRACE_MS"
 DEMAND_WINDOW_SAMPLES=3
-TARGET_RESERVE_KBIT=200
+TARGET_RESERVE_KBIT=300
 DROP_INCREASE_KBIT=150
 BACKLOG_INCREASE_KBIT=100
 DECREASE_CONFIRM_MS=5000
@@ -272,7 +272,7 @@ process_direction() {
     force_start=0
     [ "$monitor_pid" -eq "$$" ] || force_start=1
 
-    mw_realtime_adaptive_range "$line_rate"
+    mw_realtime_adaptive_range "$line_rate" "$ADAPTIVE_START_RATE"
     rate_needs_write=0
     if [ "$force_start" -eq 1 ]; then
         current="$MW_RT_START"
@@ -822,6 +822,11 @@ while [ -f "$RESTARTING" ]; do sleep 1; done
 config_load multiwan-qos
 config_get RATE_MODE hfsc realtime_rate_mode default
 [ "$RATE_MODE" = adaptive ] || exit 0
+config_get ADAPTIVE_START_RATE hfsc adaptive_start_rate 1000
+case "$ADAPTIVE_START_RATE" in
+    1000|1500) ;;
+    *) log "ERROR: unsupported adaptive_start_rate '$ADAPTIVE_START_RATE'"; exit 1 ;;
+esac
 config_get GAME_QDISC hfsc gameqdisc bfifo
 config_get FRESHNESS_MODE hfsc freshness_mode auto
 config_get FRESHNESS_TARGET_MS hfsc freshness_target_ms 18

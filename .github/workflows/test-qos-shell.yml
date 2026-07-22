@@ -52,11 +52,13 @@ jobs:
       - name: Run QoS regression tests with BusyBox ash
         run: |
           busybox ash tests/test-qos-process-lock.sh
+          busybox ash tests/test-qos-realtime.sh
           busybox ash tests/test-qos-runtime-state.sh
           busybox ash tests/test-qos-lifecycle.sh
 
       - name: Run QoS regression tests with dash
         run: |
           dash tests/test-qos-process-lock.sh
+          dash tests/test-qos-realtime.sh
           dash tests/test-qos-runtime-state.sh
           dash tests/test-qos-lifecycle.sh

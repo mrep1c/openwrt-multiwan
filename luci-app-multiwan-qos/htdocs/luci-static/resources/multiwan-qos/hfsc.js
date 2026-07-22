@@ -190,11 +190,19 @@ return view.extend({
         o.readonly = (realtimeRateMode === 'adaptive');
 
         o = s.option(form.ListValue, 'realtime_rate_mode', _('Realtime Rate Mode'),
-            _('Default uses a fixed 1500 kbit/s reserve capped at 25% of the link. Manual uses the overrides below. Adaptive idles and starts new realtime sessions at 1000 kbit/s. While realtime packets are present, measured demand may adjust the HFSC rate from 300 to 1800 kbit/s, capped at 25% of the link. The first one-second sample without realtime traffic returns the rate to 1000 kbit/s; the 20-second session grace tracks continuity only and cannot lower the rate. Increases use the highest one-second demand sample from the last 3 seconds plus a 200 kbit/s reserve. Decreases use 30-second smoothed demand and 5-second burst memory, require clean drop and backlog history, and move in 50 kbit/s steps no faster than every 10 seconds. BFIFO and PFIFO use a fixed queue profile calculated at 1000 kbit/s; Adaptive changes only the HFSC class and never resizes the selected game qdisc.'));
+            _('Default uses a fixed 1500 kbit/s reserve capped at 25% of the link. Manual uses the overrides below. Adaptive idles and starts new realtime sessions at the selected Adaptive Start / Idle Rate. While realtime packets are present, measured demand may adjust the HFSC rate from 300 to 1800 kbit/s, capped at 25% of the link. The first one-second sample without realtime traffic returns the rate to the selected baseline; the 20-second session grace tracks continuity only and cannot lower the rate. Increases use the highest one-second demand sample from the last 3 seconds plus a 300 kbit/s reserve. Decreases use 30-second smoothed demand and 5-second burst memory, require clean drop and backlog history, and move in 50 kbit/s steps no faster than every 10 seconds. BFIFO and PFIFO use a fixed queue profile calculated at 1000 kbit/s; Adaptive changes only the HFSC class and never resizes the selected game qdisc.'));
         o.value('default', _('Default'));
         o.value('manual', _('Manual'));
         o.value('adaptive', _('Adaptive'));
         o.default = 'default';
+
+        o = s.option(form.ListValue, 'adaptive_start_rate', _('Adaptive Start / Idle Rate'),
+            _('Select the HFSC realtime baseline used when Adaptive starts and whenever realtime traffic becomes idle. The selected rate is capped at 25% of each link. It changes only the Adaptive HFSC rate and does not resize the fixed 1000 kbit/s BFIFO/PFIFO queue profile.'));
+        o.value('1000', _('1000 kbit/s'));
+        o.value('1500', _('1500 kbit/s'));
+        o.default = '1000';
+        o.rmempty = false;
+        o.depends('realtime_rate_mode', 'adaptive');
 
         o = createOption('GAMEUP', _('Realtime Upload Reserve Override (kbit/s)'), _('Manual upload reserve. A blank value keeps the default reserve for this direction.'), _('Default: fixed 1500 kbit/s'), 'uinteger');
         o.depends('realtime_rate_mode', 'manual');
