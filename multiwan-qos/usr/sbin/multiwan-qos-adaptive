@@ -15,11 +15,11 @@ IDLE_POLL_AFTER_MS="$SESSION_GRACE_MS"
 DEMAND_WINDOW_SAMPLES=3
 TARGET_RESERVE_KBIT=300
 DROP_INCREASE_KBIT=150
-BACKLOG_INCREASE_KBIT=100
+BACKLOG_DRAIN_MS=200
 DECREASE_CONFIRM_MS=5000
-DECREASE_DROP_FREE_MS=30000
-DECREASE_INTERVAL_MS=10000
-DECREASE_REARM_MS=15000
+DECREASE_DROP_FREE_MS=10000
+DECREASE_INTERVAL_MS=5000
+DECREASE_REARM_MS=10000
 DECREASE_BACKLOG_FREE_MS=5000
 SLOW_DEMAND_WINDOW_MS=30000
 SESSION_IDLE_MS="$SESSION_GRACE_MS"
@@ -69,36 +69,21 @@ read_monotonic_ms() {
 }
 
 read_realtime_stats() {
-    local dev="$1" output line bytes="" drops="" backlog="" tail
+    local dev="$1" output
 
     output="$(tc -s class show dev "$dev" classid 1:11 2>/dev/null)" || {
         MW_ADAPTIVE_STATS=""
         return 1
     }
-    while IFS= read -r line; do
-        set -- $line
-        case "$1" in
-            Sent)
-                bytes="$2"
-                tail="${line#*dropped }"
-                [ "$tail" != "$line" ] && drops="${tail%%,*}"
-                ;;
-            backlog)
-                backlog="${3%p}"
-                ;;
-        esac
-    done <<EOF
-$output
-EOF
-    [ -n "$bytes" ] && [ -n "$drops" ] && [ -n "$backlog" ] || {
+    mw_realtime_parse_tc_class_stats "$output" || {
         MW_ADAPTIVE_STATS=""
         return 1
     }
-    case "$bytes:$drops:$backlog:$MW_ADAPTIVE_LOOP_NOW_MS" in
+    case "$MW_RT_STATS_BYTES:$MW_RT_STATS_DROPS:$MW_RT_STATS_BACKLOG_BYTES:$MW_RT_STATS_BACKLOG_PACKETS:$MW_ADAPTIVE_LOOP_NOW_MS" in
         *[!0-9:]*) MW_ADAPTIVE_STATS=""; return 1 ;;
     esac
     [ "$MW_ADAPTIVE_LOOP_NOW_MS" -gt 0 ] || return 1
-    MW_ADAPTIVE_STATS="$bytes $drops $backlog $MW_ADAPTIVE_LOOP_NOW_MS"
+    MW_ADAPTIVE_STATS="$MW_RT_STATS_BYTES $MW_RT_STATS_DROPS $MW_RT_STATS_BACKLOG_BYTES $MW_RT_STATS_BACKLOG_PACKETS $MW_ADAPTIVE_LOOP_NOW_MS"
 }
 
 record_tc_failure() {
@@ -170,23 +155,25 @@ write_status() {
     local state_dir="$1" direction="$2" dev="$3" current="$4" shaper="$5"
     local state="$6" peak="$7" desired="$8" backlog="$9" drop_delta="${10}"
     local priority_mode=adaptive scheduler_rate="$current"
-    printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s recommended_rate=%s queue_budget_rate=%s profile_mode=%s profile_rate=%s profile_limit=%s profile_drop_streak=%s profile_state=%s session_source=%s session_state=%s session_grace=%ss session_pending=%s activity=%s activity_source=%s idle_rate=%skbit floor=%s start=%s ceiling=%s poll_interval=%ss idle_poll_interval=%ss poll_state=%s demand_window=%ss reserve=%skbit peak=%s desired=%s backlog=%s drop_delta=%s stats_last_ok_ms=%s stats_failures=%s stats_retry=%s tc_failures=%s tc_retry=%s state=%s\n' \
+    printf 'mode=adaptive priority=%s direction=%s device=%s scheduler_rate=%s recommended_rate=%s queue_budget_rate=%s profile_mode=%s profile_rate=%s profile_limit=%s profile_drop_streak=%s profile_state=%s session_source=%s session_state=%s session_grace=%ss session_pending=%s activity=%s activity_source=%s idle_rate=%skbit floor=%s start=%s ceiling=%s poll_interval=%ss idle_poll_interval=%ss poll_state=%s demand_window=%ss reserve=%skbit peak=%s desired=%s backlog=%s backlog_bytes=%s instant_demand=%skbit backlog_drain=%skbit idle_hold=%s idle_hold_remaining_ms=%s drop_delta=%s stats_last_ok_ms=%s stats_failures=%s stats_retry=%s tc_failures=%s tc_retry=%s state=%s\n' \
         "$priority_mode" "$direction" "$dev" "$scheduler_rate" "$desired" "${ADAPTIVE_PROFILE_RATE:-$MW_RT_START}" \
         "${ADAPTIVE_LEAF_MODE:-static}" "${ADAPTIVE_PROFILE_RATE:-$MW_RT_START}" "${ADAPTIVE_PROFILE_LIMIT:-0}" "${ADAPTIVE_PROFILE_DROP_STREAK:-0}" "${ADAPTIVE_PROFILE_STATE:-fixed}" \
         "${ADAPTIVE_SESSION_SOURCE:-none}" "${ADAPTIVE_SESSION_STATE:-idle}" "$((SESSION_GRACE_MS / 1000))" "${ADAPTIVE_SESSION_PENDING:-0}" \
         "${ADAPTIVE_ACTIVITY_STATE:-idle}" "${ADAPTIVE_ACTIVITY_SOURCE:-none}" "$MW_RT_START" \
         "$MW_RT_FLOOR" "$MW_RT_START" "$MW_RT_CEILING" "$SAMPLE_INTERVAL" "$IDLE_POLL_INTERVAL" "${ADAPTIVE_POLL_STATE:-active}" "$DEMAND_WINDOW_SAMPLES" \
-        "$TARGET_RESERVE_KBIT" "$peak" "$desired" "$backlog" "$drop_delta" \
+        "$TARGET_RESERVE_KBIT" "$peak" "$desired" "$backlog" "${ADAPTIVE_BACKLOG_BYTES:-0}" \
+        "${ADAPTIVE_INSTANT_DEMAND:-0}" "${ADAPTIVE_BACKLOG_DRAIN_KBIT:-0}" "${ADAPTIVE_IDLE_HOLD:-0}" "${ADAPTIVE_IDLE_HOLD_REMAINING_MS:-0}" "$drop_delta" \
         "${ADAPTIVE_STATS_LAST_OK:-0}" "${ADAPTIVE_STATS_FAILURES:-0}" "${ADAPTIVE_STATS_RETRY:-0}" \
         "${ADAPTIVE_TC_FAILURES:-0}" "${ADAPTIVE_TC_RETRY:-0}" "$state" \
         > "$state_dir/status"
 }
 
 reset_sample_state() {
-    local state_dir="$1" bytes="$2" drops="$3" now="$4" current="$5"
+    local state_dir="$1" bytes="$2" drops="$3" backlog_bytes="$4" now="$5" current="$6"
 
     printf '%s\n' "$bytes" > "$state_dir/bytes"
     printf '%s\n' "$drops" > "$state_dir/drops"
+    printf '%s\n' "$backlog_bytes" > "$state_dir/backlog_bytes"
     printf '%s\n' "$now" > "$state_dir/sample_ms"
     printf '%s\n' "$now" > "$state_dir/window_ms"
     printf '0\n' > "$state_dir/peak"
@@ -212,10 +199,10 @@ reset_sample_state() {
 
 process_direction() {
     local dev="$1" line_rate="$2" shaper="$3" direction="$4"
-    local key state_dir current saved_current rate_needs_write stats bytes drops backlog now previous_bytes previous_drops previous_ms elapsed
+    local key state_dir current saved_current rate_needs_write stats bytes drops backlog backlog_bytes now previous_bytes previous_drops previous_backlog_bytes previous_ms elapsed
     local monitor_pid force_start
-    local delta_bytes delta_drops sample_rate window_ms peak peak_1 peak_2 peak_3 peak_4 current_peak rolling_peak recent_peak desired down_target demand_input window_complete
-    local backlog_samples backlog_free_since lower_since last_decrease last_increase idle_since new_session slow_rate slow_weight last_drop rollback_rate rollback_until drop_step new state rv
+    local delta_bytes delta_drops instant_demand backlog_drain window_ms peak peak_1 peak_2 peak_3 peak_4 current_peak rolling_peak recent_peak desired down_target window_complete
+    local backlog_samples backlog_step backlog_free_since lower_since last_decrease last_increase idle_since idle_elapsed new_session slow_rate slow_weight last_drop rollback_rate rollback_until drop_step new state rv
     local mtu profile_rate
     local stats_last_ok stats_failures stats_retry_after tc_failures tc_retry_after tc_backoff startup_state
     local agent_session_id saved_agent_session_id agent_session_changed agent_session_pending next_sample_ms
@@ -266,13 +253,18 @@ process_direction() {
     ADAPTIVE_SESSION_PENDING=0
     ADAPTIVE_ACTIVITY_STATE=idle
     ADAPTIVE_ACTIVITY_SOURCE=none
+    ADAPTIVE_BACKLOG_BYTES=0
+    ADAPTIVE_INSTANT_DEMAND=0
+    ADAPTIVE_BACKLOG_DRAIN_KBIT=0
+    ADAPTIVE_IDLE_HOLD=0
+    ADAPTIVE_IDLE_HOLD_REMAINING_MS=0
 
     read_number "$state_dir/monitor_pid" 0
     monitor_pid="$MW_ADAPTIVE_NUMBER"
     force_start=0
     [ "$monitor_pid" -eq "$$" ] || force_start=1
 
-    mw_realtime_adaptive_range "$line_rate" "$ADAPTIVE_START_RATE"
+    mw_realtime_adaptive_range "$line_rate" "$ADAPTIVE_START_RATE" "$ADAPTIVE_CUSTOM_START_RATE"
     rate_needs_write=0
     if [ "$force_start" -eq 1 ]; then
         current="$MW_RT_START"
@@ -349,7 +341,8 @@ process_direction() {
         return 0
     fi
     set -- $MW_ADAPTIVE_STATS
-    bytes="$1"; drops="$2"; backlog="$3"; now="$4"
+    bytes="$1"; drops="$2"; backlog_bytes="$3"; backlog="$4"; now="$5"
+    ADAPTIVE_BACKLOG_BYTES="$backlog_bytes"
     stats_last_ok="$now"
     stats_failures=0
     stats_retry_after=0
@@ -389,7 +382,7 @@ process_direction() {
         ADAPTIVE_TC_RETRY=0
         rm -f "$state_dir/error"
         startup_state=initializing
-        reset_sample_state "$state_dir" "$bytes" "$drops" "$now" "$current"
+        reset_sample_state "$state_dir" "$bytes" "$drops" "$backlog_bytes" "$now" "$current"
         [ -z "$agent_session_id" ] || printf '%s\n' "$agent_session_id" > "$state_dir/agent_session_id"
         ADAPTIVE_TC_FAILURES="$tc_failures"
         ADAPTIVE_TC_RETRY="$tc_retry_after"
@@ -401,10 +394,12 @@ process_direction() {
     previous_bytes="$MW_ADAPTIVE_NUMBER"
     read_number "$state_dir/drops" 0
     previous_drops="$MW_ADAPTIVE_NUMBER"
+    read_number "$state_dir/backlog_bytes" "$backlog_bytes"
+    previous_backlog_bytes="$MW_ADAPTIVE_NUMBER"
     read_number "$state_dir/sample_ms" 0
     previous_ms="$MW_ADAPTIVE_NUMBER"
     if [ "$previous_ms" -eq 0 ]; then
-        reset_sample_state "$state_dir" "$bytes" "$drops" "$now" "$current"
+        reset_sample_state "$state_dir" "$bytes" "$drops" "$backlog_bytes" "$now" "$current"
         write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" initializing 0 "$current" "$backlog" 0
         return 0
     fi
@@ -425,7 +420,7 @@ process_direction() {
         printf '%s\n' "$current" > "$state_dir/rate"
         rm -f "$state_dir/error"
         clear_tc_failure
-        reset_sample_state "$state_dir" "$bytes" "$drops" "$now" "$current"
+        reset_sample_state "$state_dir" "$bytes" "$drops" "$backlog_bytes" "$now" "$current"
         log "Resynchronized $direction realtime HFSC rate on $dev after qdisc counters reset"
         write_status "$state_dir" "$direction" "$dev" "$current" "$shaper" counter-reset 0 "$current" "$backlog" 0
         return 0
@@ -435,19 +430,31 @@ process_direction() {
     [ "$elapsed" -gt 0 ] || return 0
     delta_bytes=$((bytes - previous_bytes))
     delta_drops=$((drops - previous_drops))
-    sample_rate=$((delta_bytes * 8 / elapsed))
+    mw_realtime_adaptive_demand "$delta_bytes" "$elapsed" "$backlog_bytes" "$previous_backlog_bytes" "$BACKLOG_DRAIN_MS"
+    instant_demand="$MW_RT_INSTANT_DEMAND"
+    backlog_drain="$MW_RT_BACKLOG_DRAIN_RATE"
+    ADAPTIVE_INSTANT_DEMAND="$instant_demand"
+    ADAPTIVE_BACKLOG_DRAIN_KBIT="$backlog_drain"
     printf '%s\n' "$bytes" > "$state_dir/bytes"
     printf '%s\n' "$drops" > "$state_dir/drops"
+    printf '%s\n' "$backlog_bytes" > "$state_dir/backlog_bytes"
     printf '%s\n' "$now" > "$state_dir/sample_ms"
+
+    traffic_active=0
+    if [ "$delta_bytes" -gt 0 ] || [ "$backlog" -gt 0 ] || [ "$backlog_bytes" -gt 0 ] || [ "$delta_drops" -gt 0 ]; then
+        traffic_active=1
+    fi
 
     read_number "$state_dir/slow_rate" 0
     slow_rate="$MW_ADAPTIVE_NUMBER"
-    if [ "$slow_rate" -le 0 ]; then
-        slow_rate="$sample_rate"
-    else
-        slow_weight="$elapsed"
-        [ "$slow_weight" -gt "$SLOW_DEMAND_WINDOW_MS" ] && slow_weight="$SLOW_DEMAND_WINDOW_MS"
-        slow_rate=$(((slow_rate * (SLOW_DEMAND_WINDOW_MS - slow_weight) + sample_rate * slow_weight + (SLOW_DEMAND_WINDOW_MS / 2)) / SLOW_DEMAND_WINDOW_MS))
+    if [ "$traffic_active" -eq 1 ]; then
+        if [ "$slow_rate" -le 0 ]; then
+            slow_rate="$instant_demand"
+        else
+            slow_weight="$elapsed"
+            [ "$slow_weight" -gt "$SLOW_DEMAND_WINDOW_MS" ] && slow_weight="$SLOW_DEMAND_WINDOW_MS"
+            slow_rate=$(((slow_rate * (SLOW_DEMAND_WINDOW_MS - slow_weight) + instant_demand * slow_weight + (SLOW_DEMAND_WINDOW_MS / 2)) / SLOW_DEMAND_WINDOW_MS))
+        fi
     fi
 
     read_number "$state_dir/last_drop" 0
@@ -461,17 +468,12 @@ process_direction() {
 
     read_number "$state_dir/backlog_free_since" 0
     backlog_free_since="$MW_ADAPTIVE_NUMBER"
-    if [ "$backlog" -gt 0 ]; then
+    if [ "$backlog" -gt 0 ] || [ "$backlog_bytes" -gt 0 ]; then
         backlog_free_since=0
     elif [ "$backlog_free_since" -eq 0 ]; then
         backlog_free_since="$now"
     fi
     printf '%s\n' "$backlog_free_since" > "$state_dir/backlog_free_since"
-
-    traffic_active=0
-    if [ "$delta_bytes" -gt 0 ] || [ "$backlog" -gt 0 ] || [ "$delta_drops" -gt 0 ]; then
-        traffic_active=1
-    fi
 
     saved_agent_session_id=""
     if [ -r "$state_dir/agent_session_id" ]; then
@@ -518,6 +520,16 @@ process_direction() {
         idle_since="$previous_ms"
     fi
     printf '%s\n' "$idle_since" > "$state_dir/idle_since"
+    idle_elapsed=0
+    if [ "$traffic_active" -eq 0 ] && [ "$idle_since" -gt 0 ]; then
+        idle_elapsed=$((now - idle_since))
+        mw_realtime_adaptive_idle_state "$idle_elapsed" "$SESSION_GRACE_MS" "$current" "$MW_RT_START"
+        ADAPTIVE_IDLE_HOLD="$MW_RT_IDLE_HOLD"
+        ADAPTIVE_IDLE_HOLD_REMAINING_MS="$MW_RT_IDLE_REMAINING_MS"
+    else
+        ADAPTIVE_IDLE_HOLD=0
+        ADAPTIVE_IDLE_HOLD_REMAINING_MS=0
+    fi
     if [ "$idle_since" -gt 0 ] && [ $((now - idle_since)) -ge "$IDLE_POLL_AFTER_MS" ]; then
         next_sample_ms=$((now + IDLE_POLL_INTERVAL * 1000))
         printf '%s\n' "$next_sample_ms" > "$state_dir/next_sample_ms"
@@ -527,10 +539,15 @@ process_direction() {
         ADAPTIVE_POLL_STATE=active
     fi
 
-    # Session continuity and current traffic are deliberately separate. Grace
-    # may identify the same flow, but only observed traffic may drive the rate.
+    # Session continuity and current traffic are deliberately separate. During
+    # grace, keep the last safe rate and freeze demand history until traffic
+    # returns or the full idle interval expires.
     read_number "$state_dir/last_activity_ms" 0
     last_activity_ms="$MW_ADAPTIVE_NUMBER"
+    if [ "$traffic_active" -eq 0 ] && [ "$last_activity_ms" -eq 0 ]; then
+        ADAPTIVE_IDLE_HOLD=0
+        ADAPTIVE_IDLE_HOLD_REMAINING_MS=0
+    fi
     session_active=0
     activity_source=none
     session_state=idle
@@ -576,17 +593,17 @@ process_direction() {
     read_number "$state_dir/desired" "$current"
     desired="$MW_ADAPTIVE_NUMBER"
     window_complete=0
-    if [ $((now - window_ms)) -ge 1000 ]; then
+    recent_peak="$rolling_peak"
+    [ "$peak_3" -gt "$recent_peak" ] && recent_peak="$peak_3"
+    [ "$peak_4" -gt "$recent_peak" ] && recent_peak="$peak_4"
+    if [ "$traffic_active" -eq 1 ] && [ $((now - window_ms)) -ge 1000 ]; then
         current_peak="$peak"
-        [ "$sample_rate" -gt "$current_peak" ] && current_peak="$sample_rate"
+        [ "$instant_demand" -gt "$current_peak" ] && current_peak="$instant_demand"
         rolling_peak="$current_peak"
         [ "$peak_1" -gt "$rolling_peak" ] && rolling_peak="$peak_1"
         [ "$peak_2" -gt "$rolling_peak" ] && rolling_peak="$peak_2"
-        demand_input=$((rolling_peak + TARGET_RESERVE_KBIT))
-        desired=$(((demand_input * 100 + 74) / 75))
-        desired=$(((desired + 49) / 50 * 50))
-        [ "$desired" -lt "$MW_RT_FLOOR" ] && desired="$MW_RT_FLOOR"
-        [ "$desired" -gt "$MW_RT_CEILING" ] && desired="$MW_RT_CEILING"
+        mw_realtime_adaptive_target "$rolling_peak" "$TARGET_RESERVE_KBIT" "$MW_RT_FLOOR" "$MW_RT_CEILING"
+        desired="$MW_RT_ADAPTIVE_TARGET"
         recent_peak="$rolling_peak"
         [ "$peak_3" -gt "$recent_peak" ] && recent_peak="$peak_3"
         [ "$peak_4" -gt "$recent_peak" ] && recent_peak="$peak_4"
@@ -597,41 +614,44 @@ process_direction() {
         peak=0
         window_ms="$now"
         window_complete=1
-    elif [ "$sample_rate" -gt "$peak" ]; then
-        peak="$sample_rate"
-        recent_peak="$rolling_peak"
-        [ "$peak_3" -gt "$recent_peak" ] && recent_peak="$peak_3"
-        [ "$peak_4" -gt "$recent_peak" ] && recent_peak="$peak_4"
-    else
-        recent_peak="$rolling_peak"
-        [ "$peak_3" -gt "$recent_peak" ] && recent_peak="$peak_3"
-        [ "$peak_4" -gt "$recent_peak" ] && recent_peak="$peak_4"
+    elif [ "$traffic_active" -eq 1 ] && [ "$instant_demand" -gt "$peak" ]; then
+        peak="$instant_demand"
     fi
     down_target="$slow_rate"
     [ "$recent_peak" -gt "$down_target" ] && down_target="$recent_peak"
-    demand_input=$((down_target + TARGET_RESERVE_KBIT))
-    down_target=$(((demand_input * 100 + 74) / 75))
-    down_target=$(((down_target + 49) / 50 * 50))
-    [ "$down_target" -lt "$MW_RT_FLOOR" ] && down_target="$MW_RT_FLOOR"
-    [ "$down_target" -gt "$MW_RT_CEILING" ] && down_target="$MW_RT_CEILING"
+    mw_realtime_adaptive_target "$down_target" "$TARGET_RESERVE_KBIT" "$MW_RT_FLOOR" "$MW_RT_CEILING"
+    down_target="$MW_RT_ADAPTIVE_TARGET"
 
     if [ "$new_session" -eq 1 ]; then
-        peak="$sample_rate"
+        peak="$instant_demand"
         peak_1=0
         peak_2=0
         peak_3=0
         peak_4=0
         rolling_peak=0
-        recent_peak="$sample_rate"
-        slow_rate="$sample_rate"
+        recent_peak="$instant_demand"
+        slow_rate="$instant_demand"
         down_target="$MW_RT_START"
         desired="$MW_RT_START"
         window_ms="$now"
         window_complete=0
     fi
     if [ "$traffic_active" -eq 0 ]; then
-        desired="$MW_RT_START"
-        down_target="$MW_RT_START"
+        desired="${MW_RT_IDLE_TARGET:-$current}"
+        down_target="$desired"
+        if [ "$ADAPTIVE_IDLE_HOLD" -eq 0 ]; then
+            desired="$MW_RT_START"
+            down_target="$MW_RT_START"
+            peak=0
+            peak_1=0
+            peak_2=0
+            peak_3=0
+            peak_4=0
+            rolling_peak=0
+            slow_rate=0
+            window_ms="$now"
+            window_complete=0
+        fi
     fi
 
     printf '%s\n' "$slow_rate" > "$state_dir/slow_rate"
@@ -646,7 +666,7 @@ process_direction() {
 
     read_number "$state_dir/backlog_samples" 0
     backlog_samples="$MW_ADAPTIVE_NUMBER"
-    if [ "$backlog" -gt 0 ]; then
+    if [ "$backlog" -gt 0 ] || [ "$backlog_bytes" -gt 0 ]; then
         backlog_samples=$((backlog_samples + 1))
     else
         backlog_samples=0
@@ -681,8 +701,11 @@ process_direction() {
             [ "$delta_drops" -ge 50 ] && drop_step=250
             [ $((current + drop_step)) -gt "$new" ] && new=$((current + drop_step))
             state=session-drop-increase
-        elif [ "$backlog" -gt 0 ]; then
-            [ $((current + BACKLOG_INCREASE_KBIT)) -gt "$new" ] && new=$((current + BACKLOG_INCREASE_KBIT))
+        elif [ "$backlog" -gt 0 ] || [ "$backlog_bytes" -gt 0 ]; then
+            mw_realtime_adaptive_backlog_step "$backlog_drain"
+            backlog_step="$MW_RT_BACKLOG_STEP"
+            [ $((current + backlog_step)) -gt "$new" ] && new=$((current + backlog_step))
+            [ "$desired" -gt "$new" ] && new="$desired"
             state=session-backlog-increase
         else
             state=session-start
@@ -695,20 +718,25 @@ process_direction() {
         printf '0\n' > "$state_dir/rollback_rate"
         printf '0\n' > "$state_dir/rollback_until"
     elif [ "$traffic_active" -eq 0 ]; then
-        new="$MW_RT_START"
         lower_since=0
-        [ "$new" -gt "$current" ] && last_increase="$now"
-        rollback_rate=0
-        rollback_until=0
-        printf '0\n' > "$state_dir/rollback_rate"
-        printf '0\n' > "$state_dir/rollback_until"
-        if [ "$new" -ne "$current" ]; then
-            state=idle-baseline
+        if [ "$ADAPTIVE_IDLE_HOLD" -eq 1 ]; then
+            new="${MW_RT_IDLE_TARGET:-$current}"
+            state=idle-hold
         else
-            state=idle
+            new="${MW_RT_IDLE_TARGET:-$MW_RT_START}"
+            [ "$new" -gt "$current" ] && last_increase="$now"
+            rollback_rate=0
+            rollback_until=0
+            printf '0\n' > "$state_dir/rollback_rate"
+            printf '0\n' > "$state_dir/rollback_until"
+            if [ "$new" -ne "$current" ]; then
+                state=idle-baseline
+            else
+                state=idle
+            fi
         fi
     elif [ "$rollback_rate" -gt "$current" ] && [ "$rollback_until" -ge "$now" ] &&
-        { [ "$delta_drops" -gt 0 ] || [ "$backlog" -gt 0 ]; }; then
+        { [ "$delta_drops" -gt 0 ] || [ "$backlog" -gt 0 ] || [ "$backlog_bytes" -gt 0 ]; }; then
         new="$rollback_rate"
         [ "$desired" -gt "$new" ] && new="$desired"
         [ "$new" -gt "$MW_RT_CEILING" ] && new="$MW_RT_CEILING"
@@ -726,7 +754,9 @@ process_direction() {
         last_increase="$now"
         state=drop-increase
     elif [ "$backlog_samples" -ge 2 ] && [ $((now - last_increase)) -ge 1000 ]; then
-        new=$((current + BACKLOG_INCREASE_KBIT))
+        mw_realtime_adaptive_backlog_step "$backlog_drain"
+        backlog_step="$MW_RT_BACKLOG_STEP"
+        new=$((current + backlog_step))
         [ "$desired" -gt "$new" ] && new="$desired"
         [ "$new" -gt "$MW_RT_CEILING" ] && new="$MW_RT_CEILING"
         lower_since=0
@@ -737,16 +767,14 @@ process_direction() {
         lower_since=0
         last_increase="$now"
         state=demand-increase
-    elif [ "$backlog" -gt 0 ]; then
+    elif [ "$backlog" -gt 0 ] || [ "$backlog_bytes" -gt 0 ]; then
         lower_since=0
     elif [ "$window_complete" -eq 1 ] && [ "$down_target" -lt "$current" ]; then
         [ "$lower_since" -eq 0 ] && lower_since="$now"
-        if [ "$backlog_free_since" -gt 0 ] &&
-            [ $((now - backlog_free_since)) -ge "$DECREASE_BACKLOG_FREE_MS" ] &&
-            [ $((now - last_drop)) -ge "$DECREASE_DROP_FREE_MS" ] &&
-            [ $((now - last_increase)) -ge "$DECREASE_REARM_MS" ] &&
-            [ $((now - lower_since)) -ge "$DECREASE_CONFIRM_MS" ] &&
-            [ $((now - last_decrease)) -ge "$DECREASE_INTERVAL_MS" ]; then
+        mw_realtime_adaptive_decrease_ready "$now" "$backlog_free_since" "$last_drop" "$last_increase" \
+            "$lower_since" "$last_decrease" "$DECREASE_BACKLOG_FREE_MS" "$DECREASE_DROP_FREE_MS" \
+            "$DECREASE_REARM_MS" "$DECREASE_CONFIRM_MS" "$DECREASE_INTERVAL_MS"
+        if [ "$MW_RT_DECREASE_READY" -eq 1 ]; then
             new=$((current - 50))
             [ "$new" -lt "$down_target" ] && new="$down_target"
             [ "$new" -lt "$MW_RT_FLOOR" ] && new="$MW_RT_FLOOR"
@@ -825,17 +853,31 @@ config_get RATE_MODE hfsc realtime_rate_mode default
 config_get ADAPTIVE_START_RATE hfsc adaptive_start_rate 1000
 case "$ADAPTIVE_START_RATE" in
     1000|1500) ;;
-    *) log "ERROR: unsupported adaptive_start_rate '$ADAPTIVE_START_RATE'"; exit 1 ;;
+    custom)
+        config_get ADAPTIVE_CUSTOM_START_RATE hfsc adaptive_custom_start_rate 1000
+        case "$ADAPTIVE_CUSTOM_START_RATE" in
+            ''|*[!0-9]*)
+                log "ERROR: invalid adaptive_custom_start_rate '$ADAPTIVE_CUSTOM_START_RATE'; expected 300-2000 kbit/s"
+                exit 1
+                ;;
+        esac
+        if [ "$ADAPTIVE_CUSTOM_START_RATE" -lt 300 ] || [ "$ADAPTIVE_CUSTOM_START_RATE" -gt 2000 ]; then
+            log "ERROR: invalid adaptive_custom_start_rate '$ADAPTIVE_CUSTOM_START_RATE'; expected 300-2000 kbit/s"
+            exit 1
+        fi
+        ;;
+    *) log "ERROR: unsupported adaptive_start_rate '$ADAPTIVE_START_RATE'; expected 1000, 1500, or custom"; exit 1 ;;
 esac
+: "${ADAPTIVE_CUSTOM_START_RATE:=1000}"
 config_get TARGET_RESERVE_KBIT hfsc adaptive_demand_reserve 300
 case "$TARGET_RESERVE_KBIT" in
     ''|*[!0-9]*)
-        log "ERROR: invalid adaptive_demand_reserve '$TARGET_RESERVE_KBIT'; expected 0-1800 kbit/s"
+        log "ERROR: invalid adaptive_demand_reserve '$TARGET_RESERVE_KBIT'; expected 0-2000 kbit/s"
         exit 1
         ;;
 esac
-if [ "$TARGET_RESERVE_KBIT" -gt 1800 ]; then
-    log "ERROR: invalid adaptive_demand_reserve '$TARGET_RESERVE_KBIT'; expected 0-1800 kbit/s"
+if [ "$TARGET_RESERVE_KBIT" -gt 2000 ]; then
+    log "ERROR: invalid adaptive_demand_reserve '$TARGET_RESERVE_KBIT'; expected 0-2000 kbit/s"
     exit 1
 fi
 config_get GAME_QDISC hfsc gameqdisc bfifo

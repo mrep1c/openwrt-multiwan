@@ -63,12 +63,145 @@ mw_realtime_auto_rate() {
     [ "$MW_RT_RATE" -gt "$cap" ] && MW_RT_RATE="$cap"
 }
 
+mw_realtime_parse_tc_class_stats() {
+    local output="$1" line tail bytes="" drops="" backlog_bytes="" backlog_packets=""
+
+    while IFS= read -r line; do
+        set -- $line
+        [ "$#" -gt 0 ] || continue
+        case "$1" in
+            Sent)
+                [ "$#" -ge 2 ] || continue
+                bytes="$2"
+                tail="${line#*dropped }"
+                [ "$tail" != "$line" ] && drops="${tail%%,*}"
+                ;;
+            backlog)
+                [ "$#" -ge 3 ] || continue
+                backlog_bytes="${2%b}"
+                backlog_packets="${3%p}"
+                ;;
+        esac
+    done <<EOF
+$output
+EOF
+
+    [ -n "$bytes" ] && [ -n "$drops" ] &&
+        [ -n "$backlog_bytes" ] && [ -n "$backlog_packets" ] || return 1
+    case "$bytes:$drops:$backlog_bytes:$backlog_packets" in
+        *[!0-9:]*) return 1 ;;
+    esac
+
+    MW_RT_STATS_BYTES="$bytes"
+    MW_RT_STATS_DROPS="$drops"
+    MW_RT_STATS_BACKLOG_BYTES="$backlog_bytes"
+    MW_RT_STATS_BACKLOG_PACKETS="$backlog_packets"
+}
+
+mw_realtime_adaptive_demand() {
+    local sent_delta="$1" elapsed_ms="$2" backlog_bytes="$3"
+    local previous_backlog_bytes="$4" drain_ms="${5:-200}" backlog_growth_bytes=0
+
+    case "$sent_delta" in ''|*[!0-9]*) sent_delta=0 ;; esac
+    case "$elapsed_ms" in ''|*[!0-9]*) elapsed_ms=1000 ;; esac
+    case "$backlog_bytes" in ''|*[!0-9]*) backlog_bytes=0 ;; esac
+    case "$previous_backlog_bytes" in ''|*[!0-9]*) previous_backlog_bytes="$backlog_bytes" ;; esac
+    case "$drain_ms" in ''|*[!0-9]*) drain_ms=200 ;; esac
+    [ "$elapsed_ms" -gt 0 ] 2>/dev/null || elapsed_ms=1000
+    [ "$drain_ms" -gt 0 ] 2>/dev/null || drain_ms=200
+
+    [ "$backlog_bytes" -le "$previous_backlog_bytes" ] ||
+        backlog_growth_bytes=$((backlog_bytes - previous_backlog_bytes))
+    MW_RT_SERVED_RATE=$((sent_delta * 8 / elapsed_ms))
+    MW_RT_BACKLOG_GROWTH_RATE=$((backlog_growth_bytes * 8 / elapsed_ms))
+    MW_RT_BACKLOG_DRAIN_RATE=$((backlog_bytes * 8 / drain_ms))
+    MW_RT_INSTANT_DEMAND=$((MW_RT_SERVED_RATE + MW_RT_BACKLOG_GROWTH_RATE + MW_RT_BACKLOG_DRAIN_RATE))
+}
+
+mw_realtime_adaptive_target() {
+    local demand="$1" reserve="$2" floor="$3" ceiling="$4" target
+
+    case "$demand" in ''|*[!0-9]*) demand=0 ;; esac
+    case "$reserve" in ''|*[!0-9]*) reserve=300 ;; esac
+    case "$floor" in ''|*[!0-9]*) floor=300 ;; esac
+    case "$ceiling" in ''|*[!0-9]*) ceiling=2000 ;; esac
+    [ "$ceiling" -ge "$floor" ] 2>/dev/null || ceiling="$floor"
+
+    target=$((demand + reserve))
+    target=$(((target + 49) / 50 * 50))
+    [ "$target" -lt "$floor" ] && target="$floor"
+    [ "$target" -gt "$ceiling" ] && target="$ceiling"
+    MW_RT_ADAPTIVE_TARGET="$target"
+}
+
+mw_realtime_adaptive_backlog_step() {
+    local drain_rate="$1" step
+
+    case "$drain_rate" in ''|*[!0-9]*) drain_rate=0 ;; esac
+    step=$(((drain_rate + 49) / 50 * 50))
+    [ "$step" -ge 50 ] || step=50
+    MW_RT_BACKLOG_STEP="$step"
+}
+
+mw_realtime_adaptive_idle_state() {
+    local idle_elapsed_ms="$1" grace_ms="${2:-20000}" current_rate="${3:-0}" baseline_rate="${4:-$current_rate}"
+
+    case "$idle_elapsed_ms" in ''|*[!0-9]*) idle_elapsed_ms=0 ;; esac
+    case "$grace_ms" in ''|*[!0-9]*) grace_ms=20000 ;; esac
+    case "$current_rate" in ''|*[!0-9]*) current_rate=0 ;; esac
+    case "$baseline_rate" in ''|*[!0-9]*) baseline_rate="$current_rate" ;; esac
+    [ "$grace_ms" -gt 0 ] 2>/dev/null || grace_ms=20000
+
+    if [ "$idle_elapsed_ms" -lt "$grace_ms" ]; then
+        MW_RT_IDLE_HOLD=1
+        MW_RT_IDLE_REMAINING_MS=$((grace_ms - idle_elapsed_ms))
+        MW_RT_IDLE_TARGET="$current_rate"
+    else
+        MW_RT_IDLE_HOLD=0
+        MW_RT_IDLE_REMAINING_MS=0
+        MW_RT_IDLE_TARGET="$baseline_rate"
+    fi
+}
+
+mw_realtime_adaptive_decrease_ready() {
+    local now="$1" backlog_free_since="$2" last_drop="$3" last_increase="$4"
+    local lower_since="$5" last_decrease="$6" backlog_free_ms="${7:-5000}"
+    local drop_free_ms="${8:-10000}" rearm_ms="${9:-10000}"
+    local confirm_ms="${10:-5000}" interval_ms="${11:-5000}"
+
+    MW_RT_DECREASE_READY=0
+    case "$now:$backlog_free_since:$last_drop:$last_increase:$lower_since:$last_decrease" in
+        *[!0-9:]*) return 0 ;;
+    esac
+    [ "$backlog_free_since" -gt 0 ] || return 0
+    [ "$last_drop" -gt 0 ] || return 0
+    [ "$lower_since" -gt 0 ] || return 0
+    [ $((now - backlog_free_since)) -ge "$backlog_free_ms" ] || return 0
+    [ $((now - last_drop)) -ge "$drop_free_ms" ] || return 0
+    [ $((now - last_increase)) -ge "$rearm_ms" ] || return 0
+    [ $((now - lower_since)) -ge "$confirm_ms" ] || return 0
+    [ $((now - last_decrease)) -ge "$interval_ms" ] || return 0
+    MW_RT_DECREASE_READY=1
+}
+
 mw_realtime_adaptive_range() {
-    local line_rate="$1" start_rate="${2:-1000}" cap
+    local line_rate="$1" start_rate="${2:-1000}" custom_start_rate="${3:-1000}" cap
 
     case "$line_rate" in ''|*[!0-9]*) line_rate=1 ;; esac
     [ "$line_rate" -gt 0 ] 2>/dev/null || line_rate=1
-    case "$start_rate" in 1000|1500) ;; *) start_rate=1000 ;; esac
+    case "$start_rate" in
+        1000|1500) ;;
+        custom)
+            case "$custom_start_rate" in
+                ''|*[!0-9]*) custom_start_rate=1000 ;;
+            esac
+            if [ "$custom_start_rate" -lt 300 ] 2>/dev/null || [ "$custom_start_rate" -gt 2000 ] 2>/dev/null; then
+                custom_start_rate=1000
+            fi
+            start_rate="$custom_start_rate"
+            ;;
+        *) start_rate=1000 ;;
+    esac
     cap=$((line_rate * 25 / 100))
     [ "$cap" -lt 1 ] && cap=1
 
@@ -77,7 +210,7 @@ mw_realtime_adaptive_range() {
     MW_RT_START="$start_rate"
     [ "$MW_RT_START" -gt "$cap" ] && MW_RT_START="$cap"
     [ "$MW_RT_START" -lt "$MW_RT_FLOOR" ] && MW_RT_START="$MW_RT_FLOOR"
-    MW_RT_CEILING=1800
+    MW_RT_CEILING=2000
     [ "$MW_RT_CEILING" -gt "$cap" ] && MW_RT_CEILING="$cap"
     [ "$MW_RT_CEILING" -lt "$MW_RT_START" ] && MW_RT_CEILING="$MW_RT_START"
 }

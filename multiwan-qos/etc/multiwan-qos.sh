@@ -14,7 +14,7 @@ IFS="$DEFAULT_IFS"
 : "${VERSION}" "${global_enabled:=}" "${nongameqdisc:=}" "${nongameqdiscoptions:=}" "${OVERHEAD:=}"
 : "${gameqdisc:=pfifo}" "${gameqdisc_child:=red}" "${nongameqdisc:=fq_codel}" "${ACK_FILTER_EGRESS:=auto}"
 : "${freshness_mode:=auto}" "${freshness_target_ms:=18}"
-: "${realtime_rate_mode:=default}" "${realtime_first_scheduling:=0}" "${adaptive_start_rate:=1000}" "${adaptive_demand_reserve:=300}"
+: "${realtime_rate_mode:=default}" "${realtime_first_scheduling:=0}" "${adaptive_start_rate:=1000}" "${adaptive_custom_start_rate:=1000}" "${adaptive_demand_reserve:=300}"
 : "${MAXDEL:=24}" "${PFIFOMIN:=5}" "${PACKETSIZE:=450}"
 : "${DOWNLOAD_IFB_STAB:=0}"
 : "${DISABLE_QOS_OFFLOADS:=1}"
@@ -2562,7 +2562,7 @@ select_realtime_rate() {
     MW_SELECTED_REALTIME_RATE="$auto_rate"
 
     if [ "$realtime_rate_mode" = adaptive ]; then
-        mw_realtime_adaptive_range "$line_rate" "$adaptive_start_rate"
+        mw_realtime_adaptive_range "$line_rate" "$adaptive_start_rate" "$adaptive_custom_start_rate"
         MW_SELECTED_REALTIME_RATE="$MW_RT_START"
         return 0
     fi
@@ -3111,9 +3111,9 @@ setup_interface() {
     if [ "$realtime_rate_mode" = adaptive ]; then
         local adaptive_up_floor adaptive_up_start adaptive_up_ceiling
         local adaptive_down_floor adaptive_down_start adaptive_down_ceiling
-        mw_realtime_adaptive_range "$upload" "$adaptive_start_rate"
+        mw_realtime_adaptive_range "$upload" "$adaptive_start_rate" "$adaptive_custom_start_rate"
         adaptive_up_floor="$MW_RT_FLOOR"; adaptive_up_start="$MW_RT_START"; adaptive_up_ceiling="$MW_RT_CEILING"
-        mw_realtime_adaptive_range "$download" "$adaptive_start_rate"
+        mw_realtime_adaptive_range "$download" "$adaptive_start_rate" "$adaptive_custom_start_rate"
         adaptive_down_floor="$MW_RT_FLOOR"; adaptive_down_start="$MW_RT_START"; adaptive_down_ceiling="$MW_RT_CEILING"
         print_msg "  Adaptive upload rate: floor=${adaptive_up_floor}k start=${adaptive_up_start}k current=${game_up}k ceiling=${adaptive_up_ceiling}k"
         print_msg "  Adaptive download rate: floor=${adaptive_down_floor}k start=${adaptive_down_start}k current=${game_down}k ceiling=${adaptive_down_ceiling}k"
@@ -3250,17 +3250,29 @@ esac
 
 case "$adaptive_start_rate" in
     1000|1500) ;;
-    *) error_out "Unsupported adaptive_start_rate '$adaptive_start_rate'. Expected 1000 or 1500."; exit 1 ;;
+    custom)
+        case "$adaptive_custom_start_rate" in
+            ''|*[!0-9]*)
+                error_out "Invalid adaptive_custom_start_rate '$adaptive_custom_start_rate'. Expected 300-2000 kbit/s."
+                exit 1
+                ;;
+        esac
+        if [ "$adaptive_custom_start_rate" -lt 300 ] || [ "$adaptive_custom_start_rate" -gt 2000 ]; then
+            error_out "Invalid adaptive_custom_start_rate '$adaptive_custom_start_rate'. Expected 300-2000 kbit/s."
+            exit 1
+        fi
+        ;;
+    *) error_out "Unsupported adaptive_start_rate '$adaptive_start_rate'. Expected 1000, 1500, or custom."; exit 1 ;;
 esac
 
 case "$adaptive_demand_reserve" in
     ''|*[!0-9]*)
-        error_out "Invalid adaptive_demand_reserve '$adaptive_demand_reserve'. Expected 0-1800 kbit/s."
+        error_out "Invalid adaptive_demand_reserve '$adaptive_demand_reserve'. Expected 0-2000 kbit/s."
         exit 1
         ;;
 esac
-if [ "$adaptive_demand_reserve" -gt 1800 ]; then
-    error_out "Invalid adaptive_demand_reserve '$adaptive_demand_reserve'. Expected 0-1800 kbit/s."
+if [ "$adaptive_demand_reserve" -gt 2000 ]; then
+    error_out "Invalid adaptive_demand_reserve '$adaptive_demand_reserve'. Expected 0-2000 kbit/s."
     exit 1
 fi
 

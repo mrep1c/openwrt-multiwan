@@ -190,25 +190,34 @@ return view.extend({
         o.readonly = (realtimeRateMode === 'adaptive');
 
         o = s.option(form.ListValue, 'realtime_rate_mode', _('Realtime Rate Mode'),
-            _('Default uses a fixed 1500 kbit/s reserve capped at 25% of the link. Manual uses the overrides below. Adaptive idles and starts new realtime sessions at the selected Adaptive Start / Idle Rate. While realtime packets are present, measured demand may adjust the HFSC rate from 300 to 1800 kbit/s, capped at 25% of the link. The first one-second sample without realtime traffic returns the rate to the selected baseline; the 20-second session grace tracks continuity only and cannot lower the rate. Increases use the highest one-second demand sample from the last 3 seconds plus the configured Adaptive Demand Reserve. Decreases use 30-second smoothed demand and 5-second burst memory, require clean drop and backlog history, and move in 50 kbit/s steps no faster than every 10 seconds. BFIFO and PFIFO use a fixed queue profile calculated at 1000 kbit/s; Adaptive changes only the HFSC class and never resizes the selected game qdisc.'));
+            _('Default uses a fixed 1500 kbit/s reserve capped at 25% of the link. Manual uses the overrides below. Adaptive starts and idles at the selected baseline, then adjusts the HFSC rate from 300 to 2000 kbit/s while remaining capped at 25% of the link. Demand combines served traffic with queue growth and a 200 ms backlog-drain allowance, then adds the configured Adaptive Demand Reserve exactly once. Increases use the highest one-second estimate from the last 3 seconds. Decreases use 30-second smoothed demand and 5-second burst memory, require 10 seconds without drops and 5 seconds without backlog, and move in 50 kbit/s steps no faster than every 5 seconds. The last safe rate is held through the 20-second session grace before returning to the selected baseline. BFIFO and PFIFO use a fixed queue profile calculated at 1000 kbit/s; Adaptive changes only the HFSC class and never resizes the selected game qdisc.'));
         o.value('default', _('Default'));
         o.value('manual', _('Manual'));
         o.value('adaptive', _('Adaptive'));
         o.default = 'default';
 
         o = s.option(form.ListValue, 'adaptive_start_rate', _('Adaptive Start / Idle Rate'),
-            _('Select the HFSC realtime baseline used when Adaptive starts and whenever realtime traffic becomes idle. The selected rate is capped at 25% of each link. It changes only the Adaptive HFSC rate and does not resize the fixed 1000 kbit/s BFIFO/PFIFO queue profile.'));
+            _('Select the HFSC realtime baseline used when Adaptive starts and after the 20-second idle grace expires. Choose Custom to enter any baseline from 300 to 2000 kbit/s. The selected rate is capped at 25% of each link. It changes only the Adaptive HFSC rate and does not resize the fixed 1000 kbit/s BFIFO/PFIFO queue profile.'));
         o.value('1000', _('1000 kbit/s'));
         o.value('1500', _('1500 kbit/s'));
+        o.value('custom', _('Custom'));
         o.default = '1000';
         o.rmempty = false;
         o.depends('realtime_rate_mode', 'adaptive');
 
+        o = s.option(form.Value, 'adaptive_custom_start_rate', _('Custom Adaptive Start / Idle Rate (kbit/s)'),
+            _('Manual Adaptive start and idle baseline used when Custom is selected above. Valid range: 300 to 2000 kbit/s. The 25% link cap still applies.'));
+        o.default = '1000';
+        o.placeholder = '1000';
+        o.datatype = 'range(300, 2000)';
+        o.rmempty = false;
+        o.depends({ realtime_rate_mode: 'adaptive', adaptive_start_rate: 'custom' });
+
         o = s.option(form.Value, 'adaptive_demand_reserve', _('Adaptive Demand Reserve (kbit/s)'),
-            _('Fixed safety margin added to measured realtime demand when Adaptive calculates increases and decreases. It applies to both the 1000 and 1500 start/idle baselines. Higher values react with more spare capacity; lower values reserve less bandwidth. The final rate remains limited by the 1800 kbit/s Adaptive ceiling and the 25% link cap.'));
+            _('Fixed safety margin added exactly once to estimated realtime demand when Adaptive calculates increases and decreases. It applies to the 1000, 1500, and Custom start/idle baselines. Higher values keep more spare capacity; lower values reserve less bandwidth. The final rate remains limited by the 2000 kbit/s Adaptive ceiling and the 25% link cap.'));
         o.default = '300';
         o.placeholder = '300';
-        o.datatype = 'range(0, 1800)';
+        o.datatype = 'range(0, 2000)';
         o.rmempty = false;
         o.depends('realtime_rate_mode', 'adaptive');
 
