@@ -2105,7 +2105,7 @@ start_service_impl() {
         return 1
     }
 
-    enable || {
+    enabled || /etc/init.d/multiwan-qos enable || {
         error_out "Failed to enable MultiWAN QoS init service; rolling back qdisc/nft state."
         rollback_failed_start
         return 1

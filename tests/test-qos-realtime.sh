@@ -12,6 +12,17 @@ fail() {
 
 . "$REPO_ROOT/multiwan-qos/lib/multiwan-qos/realtime.sh"
 
+upload_mss_block="$(sed -n '/if \[ "$upload" -lt 3000 \]/,/if \[ "$download" -lt 3000 \]/p' \
+    "$REPO_ROOT/multiwan-qos/etc/multiwan-qos.sh")"
+download_mss_block="$(sed -n '/if \[ "$download" -lt 3000 \]/,/NFT_TCPMSS_RULES=/p' \
+    "$REPO_ROOT/multiwan-qos/etc/multiwan-qos.sh")"
+printf '%s\n' "$upload_mss_block" |
+    grep -Fq 'meta iifname \"$device\" tcp flags syn tcp option maxseg size set $safe_mss counter' ||
+    fail "low-rate upload MSS clamp does not inspect WAN ingress SYN-ACK packets"
+printf '%s\n' "$download_mss_block" |
+    grep -Fq 'meta oifname \"$device\" tcp flags syn tcp option maxseg size set $safe_mss counter' ||
+    fail "low-rate download MSS clamp does not inspect WAN egress SYN packets"
+
 grep -Fq "option adaptive_start_rate '1000'" \
     "$REPO_ROOT/multiwan-qos/etc/config/multiwan-qos" ||
     fail "default config does not preserve the 1000 Adaptive baseline"

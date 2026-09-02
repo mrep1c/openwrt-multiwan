@@ -2974,13 +2974,15 @@ setup_interface() {
         local safe_mss="$MSS"
         [ "$safe_mss" -gt 1500 ] 2>/dev/null && safe_mss=1500
         [ "$safe_mss" -lt 536 ] 2>/dev/null && safe_mss=536
-        mss_rules="${mss_rules}meta oifname \"$device\" tcp flags syn tcp option maxseg size set $safe_mss counter; "
+        # The peer's SYN-ACK advertises the MSS used by this host for upload.
+        mss_rules="${mss_rules}meta iifname \"$device\" tcp flags syn tcp option maxseg size set $safe_mss counter; "
     fi
     if [ "$download" -lt 3000 ] && [ "$download" -gt 0 ]; then
          local safe_mss="$MSS"
          [ "$safe_mss" -gt 1500 ] 2>/dev/null && safe_mss=1500
          [ "$safe_mss" -lt 536 ] 2>/dev/null && safe_mss=536
-         mss_rules="${mss_rules}meta iifname \"$device\" tcp flags syn tcp option maxseg size set $safe_mss counter; "
+         # This host's SYN advertises the MSS used by the peer for download.
+         mss_rules="${mss_rules}meta oifname \"$device\" tcp flags syn tcp option maxseg size set $safe_mss counter; "
     fi
     NFT_TCPMSS_RULES="$NFT_TCPMSS_RULES $mss_rules"
 

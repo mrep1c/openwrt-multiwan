@@ -17,6 +17,10 @@ action=none
 set -- none
 . "$REPO_ROOT/multiwan-qos/etc/init.d/multiwan-qos"
 
+grep -Fq 'enabled || /etc/init.d/multiwan-qos enable || {' \
+    "$REPO_ROOT/multiwan-qos/etc/init.d/multiwan-qos" ||
+    fail "startup does not preserve an already-enabled init service"
+
 MULTIWAN_QOS_START_RESULT=23
 start_result=0
 service_started || start_result=$?
