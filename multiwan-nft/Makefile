@@ -30,9 +30,9 @@ define Package/multiwan-nft
      +conntrack
    TITLE:=MultiWAN NFT multi-WAN manager
    MAINTAINER:=Florian Eckert <fe@dev.tdt.de>
-   PROVIDES:=mwan3
-   CONFLICTS:=mwan3
-   REPLACES:=mwan3
+   PKG_PROVIDES:=mwan3
+   PKG_CONFLICTS:=mwan3
+   PKG_REPLACES:=mwan3
 endef
 
 define Package/multiwan-nft/description
