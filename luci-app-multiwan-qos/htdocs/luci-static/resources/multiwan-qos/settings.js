@@ -399,6 +399,14 @@ return view.extend({
         o.datatype = 'uinteger';
         o.placeholder = _('Auto (5% of upload)');
 
+        o = s_interfaces.option(form.Value, 'game_up', _('Game Upload Rate (kbps)'), _('Optional per-interface realtime upload rate override in kbps. Only used when Realtime Rate Mode is set to Manual in the HFSC tab. Leave empty to use global HFSC setting or auto-calculation.'));
+        o.datatype = 'uinteger';
+        o.placeholder = 'Auto';
+
+        o = s_interfaces.option(form.Value, 'game_down', _('Game Download Rate (kbps)'), _('Optional per-interface realtime download rate override in kbps. Only used when Realtime Rate Mode is set to Manual in the HFSC tab. Leave empty to use global HFSC setting or auto-calculation.'));
+        o.datatype = 'uinteger';
+        o.placeholder = 'Auto';
+
         return m.render();
     }
 });

@@ -9,6 +9,8 @@
 #	option upload '45000'
 #	option qdisc 'cake'
 #	option preset 'ethernet'
+#	# option game_up '2000'
+#	# option game_down '5000'
 
 config global 'global'
 	option enabled '0'

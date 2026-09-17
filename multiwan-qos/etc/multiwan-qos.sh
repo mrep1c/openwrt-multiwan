@@ -1592,7 +1592,10 @@ $AGENT_REAPPLY
         ip daddr 224.0.0.0/4 return
         ip6 daddr ff00::/8 return
 
-        # For INGRESS (WANâ†’LAN): skip ct mark save and return early
+        # For INGRESS (WAN->LAN): skip ct mark save and return early
+        # Note: IFB ingress shaping occurs before Netfilter forward; return packets rely
+        # on 'action ctinfo' restoration from egress conntrack marks, while Netfilter ingress
+        # rules undergo CS0 delivery washing.
         # Ingress DSCP is washed, so we don't want to overwrite the correct egress-saved value
         # Also allows multiwan_nft_forward at priority 1 to run
         $(if [ "$WASHDSCPDOWNDELIVERY" -eq 1 ] 2>/dev/null; then
@@ -2743,6 +2746,7 @@ NFT_DOWNPRIO_RULES=""
 # Parses all custom rules and explicitly attaches them iteratively as native tc flower logic to bypass the IFB redirect firewall bug loop.
 apply_tc_custom_ingress_rules() {
     local lan_dev="$1" qdisc="${2:-hfsc}" tc_parent="1:"
+    [ "$qdisc" = "cake" ] && return 0
     realtime_first_is_effective "$qdisc" && tc_parent="2:"
     
     process_tc_ingress_rule() {
@@ -2767,7 +2771,12 @@ apply_tc_custom_ingress_rules() {
         [ -n "$class_id" ] || return 0
 
         [ -z "$src_port_raw" ] && [ -z "$dest_port_raw" ] && [ -z "$src_ip_raw" ] && [ -z "$dest_ip_raw" ] && return 0
-        case "$src_port_raw$dest_port_raw$src_ip_raw$dest_ip_raw" in *'!='*) return 0 ;; esac
+        case "$src_port_raw$dest_port_raw$src_ip_raw$dest_ip_raw" in
+            *'!='*)
+                debug_log "Skipping IFB flower fallback for '$rule_label': negated match (!=) is not supported by tc flower."
+                return 0
+                ;;
+        esac
 
         local tc_l4proto=""
         [ "$proto" = "udp" ] && tc_l4proto="ip_proto udp"
@@ -3098,28 +3107,35 @@ setup_interface() {
 
     # Validate every rate-dependent value before replacing ingress or root
     # qdiscs. Invalid Manual values must leave a working topology untouched.
-    local game_up game_down
-    local game_up_override game_down_override
-    config_get game_up_override hfsc GAMEUP
-    config_get game_down_override hfsc GAMEDOWN
+    local game_up=0 game_down=0
+    case "$qdisc" in
+        hfsc|hybrid)
+            local game_up_override game_down_override
+            config_get game_up_override "$config" game_up ""
+            [ -n "$game_up_override" ] || config_get game_up_override hfsc GAMEUP
 
-    select_realtime_rate "$upload" "$game_up_override" upload ||
-        qdisc_setup_failed "Invalid realtime upload rate for $device."
-    game_up="$MW_SELECTED_REALTIME_RATE"
-    select_realtime_rate "$download" "$game_down_override" download ||
-        qdisc_setup_failed "Invalid realtime download rate for $device."
-    game_down="$MW_SELECTED_REALTIME_RATE"
+            config_get game_down_override "$config" game_down ""
+            [ -n "$game_down_override" ] || config_get game_down_override hfsc GAMEDOWN
 
-    if [ "$realtime_rate_mode" = adaptive ]; then
-        local adaptive_up_floor adaptive_up_start adaptive_up_ceiling
-        local adaptive_down_floor adaptive_down_start adaptive_down_ceiling
-        mw_realtime_adaptive_range "$upload" "$adaptive_start_rate" "$adaptive_custom_start_rate"
-        adaptive_up_floor="$MW_RT_FLOOR"; adaptive_up_start="$MW_RT_START"; adaptive_up_ceiling="$MW_RT_CEILING"
-        mw_realtime_adaptive_range "$download" "$adaptive_start_rate" "$adaptive_custom_start_rate"
-        adaptive_down_floor="$MW_RT_FLOOR"; adaptive_down_start="$MW_RT_START"; adaptive_down_ceiling="$MW_RT_CEILING"
-        print_msg "  Adaptive upload rate: floor=${adaptive_up_floor}k start=${adaptive_up_start}k current=${game_up}k ceiling=${adaptive_up_ceiling}k"
-        print_msg "  Adaptive download rate: floor=${adaptive_down_floor}k start=${adaptive_down_start}k current=${game_down}k ceiling=${adaptive_down_ceiling}k"
-    fi
+            select_realtime_rate "$upload" "$game_up_override" upload ||
+                qdisc_setup_failed "Invalid realtime upload rate for $device."
+            game_up="$MW_SELECTED_REALTIME_RATE"
+            select_realtime_rate "$download" "$game_down_override" download ||
+                qdisc_setup_failed "Invalid realtime download rate for $device."
+            game_down="$MW_SELECTED_REALTIME_RATE"
+
+            if [ "$realtime_rate_mode" = adaptive ]; then
+                local adaptive_up_floor adaptive_up_start adaptive_up_ceiling
+                local adaptive_down_floor adaptive_down_start adaptive_down_ceiling
+                mw_realtime_adaptive_range "$upload" "$adaptive_start_rate" "$adaptive_custom_start_rate"
+                adaptive_up_floor="$MW_RT_FLOOR"; adaptive_up_start="$MW_RT_START"; adaptive_up_ceiling="$MW_RT_CEILING"
+                mw_realtime_adaptive_range "$download" "$adaptive_start_rate" "$adaptive_custom_start_rate"
+                adaptive_down_floor="$MW_RT_FLOOR"; adaptive_down_start="$MW_RT_START"; adaptive_down_ceiling="$MW_RT_CEILING"
+                print_msg "  Adaptive upload rate: floor=${adaptive_up_floor}k start=${adaptive_up_start}k current=${game_up}k ceiling=${adaptive_up_ceiling}k"
+                print_msg "  Adaptive download rate: floor=${adaptive_down_floor}k start=${adaptive_down_start}k current=${game_down}k ceiling=${adaptive_down_ceiling}k"
+            fi
+            ;;
+    esac
 
     # Setup IFB with matching MTU and optional multi-queue for CAKE
     local lan_dev="ifb-$device"

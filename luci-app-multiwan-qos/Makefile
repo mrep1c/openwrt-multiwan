@@ -2,8 +2,8 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-multiwan-qos
 PKG_VERSION:=1.0.54
-PKG_RELEASE:=1
-PKG_PO_VERSION:=1.0.54-r1
+PKG_RELEASE:=2
+PKG_PO_VERSION:=1.0.54-r2
 
 PKG_MAINTAINER:=Markus Hütter <mh@hudra.net>
 PKG_LICENSE:=GPL-3.0-or-later
