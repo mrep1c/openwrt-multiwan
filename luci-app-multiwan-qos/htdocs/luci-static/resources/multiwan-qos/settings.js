@@ -399,13 +399,30 @@ return view.extend({
         o.datatype = 'uinteger';
         o.placeholder = _('Auto (5% of upload)');
 
+        function validateGameRate(section_id, value) {
+            var qdisc = this.section.formvalue(section_id, 'qdisc');
+            if (value == null || value === '' ||
+                uci.get('multiwan-qos', 'hfsc', 'realtime_rate_mode') !== 'manual' ||
+                this.section.formvalue(section_id, 'enabled') === '0' ||
+                (qdisc !== 'hfsc' && qdisc !== 'hybrid'))
+                return true;
+
+            var direction = this.option === 'game_up' ? 'upload' : 'download';
+            // Match setup_interface's bounds and use the current, unsaved input.
+            var rate = Math.max(1000, Math.min(2500000, Number(this.section.formvalue(section_id, direction))));
+            return (/^\d+$/.test(value) && Number(value) > 0 && Number(value) < rate) ||
+                _('Reserve must be a positive integer below the interface rate (%s kbit/s), or empty.').format(rate);
+        }
+
         o = s_interfaces.option(form.Value, 'game_up', _('Game Upload Rate (kbps)'), _('Optional per-interface realtime upload rate override in kbps. Only used when Realtime Rate Mode is set to Manual in the HFSC tab. Leave empty to use global HFSC setting or auto-calculation.'));
         o.datatype = 'uinteger';
         o.placeholder = 'Auto';
+        o.validate = validateGameRate;
 
         o = s_interfaces.option(form.Value, 'game_down', _('Game Download Rate (kbps)'), _('Optional per-interface realtime download rate override in kbps. Only used when Realtime Rate Mode is set to Manual in the HFSC tab. Leave empty to use global HFSC setting or auto-calculation.'));
         o.datatype = 'uinteger';
         o.placeholder = 'Auto';
+        o.validate = validateGameRate;
 
         return m.render();
     }

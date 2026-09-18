@@ -155,11 +155,9 @@ return view.extend({
     render: function (data) {
         var view = this;
         var connections = [];
-        var max_connections = 0;
 
         if (data[0] && data[0].connections) {
             connections = Object.values(data[0].connections);
-            max_connections = data[0].max_connections || 0;
         }
 
         // Get current UCI value for dropdown
@@ -187,7 +185,7 @@ return view.extend({
                 applyConnectionLimit(newLimit);
             }
         }, [
-            E('option', { 'value': '0' }, _('Unlimited')),
+            E('option', { 'value': '0' }, _('Automatic (load-based limit)')),
             E('option', { 'value': '10' }, _('10')),
             E('option', { 'value': '50' }, _('50')),
             E('option', { 'value': '100' }, _('100')),
@@ -217,7 +215,7 @@ return view.extend({
                             newMaxConnections = newData[0].max_connections || 0;
                         }
                         view.updateTable(newConnections);
-                        view.updateLimitWarning(newMaxConnections, newConnections.length);
+                        view.updateLimitWarning(newData[0] || {});
 
                         // Update dropdown to reflect current value
                         limitSelect.value = newMaxConnections.toString();
@@ -236,9 +234,13 @@ return view.extend({
             'style': 'background-color: #fff3cd; color: #856404; padding: 10px; margin: 10px 0; border-radius: 5px; display: none;'
         });
 
-        view.updateLimitWarning = function (maxConnections, currentCount) {
-            if (maxConnections > 0) {
-                limitWarning.innerHTML = '⚠️ ' + _('Limited to %d connections. Some connections may not be shown.').format(maxConnections);
+        view.updateLimitWarning = function (status) {
+            var limit = status.effective_max_connections || status.max_connections || 0;
+            if (status.truncated) {
+                limitWarning.textContent = _('Showing a sample of %d connections. Other connections, including larger flows, may be omitted.').format(limit);
+                limitWarning.style.display = 'block';
+            } else if (status.max_connections > 0) {
+                limitWarning.textContent = _('Limited to %d connections. Some connections may not be shown.').format(limit);
                 limitWarning.style.display = 'block';
             } else {
                 limitWarning.style.display = 'none';
@@ -454,7 +456,7 @@ return view.extend({
         };
 
         view.updateTable(connections);
-        view.updateLimitWarning(max_connections, connections.length);
+        view.updateLimitWarning(data[0] || {});
         this.updateSortIndicators();
 
         // Trigger the adaptive polling:
@@ -684,10 +686,8 @@ function adaptivePoll(view) {
 
         if (result && result.connections) {
             var connections = Object.values(result.connections);
-            var max_connections = result.max_connections || 0;
-
             view.updateTable(connections);
-            view.updateLimitWarning(max_connections, connections.length);
+            view.updateLimitWarning(result);
         } else {
             console.warn('Invalid data received:', result);
             // Show error message to user

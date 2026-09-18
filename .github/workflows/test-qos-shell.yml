@@ -1,18 +1,20 @@
-name: Test QoS shell compatibility
+name: Test QoS compatibility
 
 on:
   pull_request:
     paths:
       - "multiwan-qos/**"
+      - "luci-app-multiwan-qos/**"
       - "scripts/install-qos.sh"
-      - "tests/test-qos-*.sh"
+      - "tests/test-qos-*"
       - ".github/workflows/test-qos-shell.yml"
   push:
     branches: [main]
     paths:
       - "multiwan-qos/**"
+      - "luci-app-multiwan-qos/**"
       - "scripts/install-qos.sh"
-      - "tests/test-qos-*.sh"
+      - "tests/test-qos-*"
       - ".github/workflows/test-qos-shell.yml"
   workflow_dispatch:
 
@@ -25,10 +27,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install shell runtimes
+      - name: Install test runtimes
         run: |
           sudo apt-get update
-          sudo apt-get install -y busybox-static dash
+          sudo apt-get install -y busybox-static dash nodejs
 
       - name: Check installed script syntax
         run: |
@@ -55,6 +57,7 @@ jobs:
           busybox ash tests/test-qos-realtime.sh
           busybox ash tests/test-qos-runtime-state.sh
           busybox ash tests/test-qos-lifecycle.sh
+          busybox ash tests/test-qos-fixes.sh
 
       - name: Run QoS regression tests with dash
         run: |
@@ -62,3 +65,7 @@ jobs:
           dash tests/test-qos-realtime.sh
           dash tests/test-qos-runtime-state.sh
           dash tests/test-qos-lifecycle.sh
+          dash tests/test-qos-fixes.sh
+
+      - name: Run QoS UI regression tests
+        run: node tests/test-qos-ui.js

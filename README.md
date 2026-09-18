@@ -173,6 +173,12 @@ MultiWAN QoS:
 /etc/init.d/multiwan-qos health_check
 ```
 
+Download shaping happens on the WAN IFB before forwarded packets reach nftables.
+For a private LAN device or a rule with negated ports, use a matching upload rule
+so conntrack can carry its DSCP classification into reply traffic. A download-only
+nftables rule cannot change that packet's earlier IFB classification. The tc flower
+fallback skips private LAN addresses and negated matches; CAKE uses DSCP instead.
+
 Windows agent:
 
 1. Install `multiwan-qos` and `luci-app-multiwan-qos`.
