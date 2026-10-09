@@ -152,6 +152,39 @@ return view.extend({
         ]);
     },
 
+    createAdaptiveTable: function(states, nowMs) {
+        var rows = states.map(function(record) {
+            var fields = Object.create(null);
+            String(record).split(/\s+/).forEach(function(token) {
+                var separator = token.indexOf('=');
+                if (separator > 0) fields[token.slice(0, separator)] = token.slice(separator + 1);
+            });
+            var rate = function(value) {
+                return /^\d+$/.test(value || '') ? value + ' kbit/s' : _('Unknown');
+            };
+            var age = _('Unknown');
+            if (/^\d+$/.test(fields.stats_last_ok_ms || '') && Number(fields.stats_last_ok_ms) > 0 &&
+                Number(nowMs) >= Number(fields.stats_last_ok_ms)) {
+                age = ((Number(nowMs) - Number(fields.stats_last_ok_ms)) / 1000).toFixed(1) + ' s';
+            } else if (nowMs === undefined && /^\d+$/.test(fields.stats_age_ms || '')) {
+                age = (Number(fields.stats_age_ms) / 1000).toFixed(1) + ' s';
+            }
+            var ceiling = fields.saturation === 'pressure' ? _('At ceiling; pressure continues') :
+                fields.saturation === 'reached' ? _('At ceiling') :
+                fields.saturation === 'below' ? _('Below ceiling') : _('Unknown');
+            var queue = /^\d+$/.test(fields.backlog_bytes || '') ? formatSize(Number(fields.backlog_bytes)) : '-';
+            if (/^\d+$/.test(fields.freshness_target_ms || '')) queue += ' / ' + fields.freshness_target_ms + ' ms';
+            return [fields.device || '-', fields.direction === 'wan' ? _('Upload') : fields.direction === 'lan' ? _('Download') : '-',
+                rate(fields.applied_rate || fields.scheduler_rate), rate(fields.requested_rate), rate(fields.recommended_rate),
+                queue, (fields.drop_delta || '0') + ' / ' + (fields.congestion_drop_delta || '0'),
+                E('span', { 'title': _('Age when this statistics snapshot was collected') }, age),
+                ceiling, (fields.state || '-') + ' / ' + (fields.last_change_reason || '-')];
+        });
+        return this.createStatsTable(_('Adaptive Realtime'),
+            [_('Device'), _('Direction'), _('Applied'), _('Requested'), _('Demand target'), _('Backlog / target'),
+                _('Drops / rate signal'), _('Sample age'), _('Ceiling'), _('Decision / last applied update')], rows);
+    },
+
     // Create a simple chart using DOM elements
     createChart: function(id, title, data, labels, colors) {
         var container = E('div', { 'class': 'chart-container', 'style': 'height: 250px; margin-bottom: 10px;' });
@@ -1229,13 +1262,9 @@ return view.extend({
                     row.appendChild(E('span', {}, qosStats.gameqdisc || '-'));
                     infoContainer.appendChild(row);
                 }
-                (qosStats.adaptive_realtime_state || []).forEach(function(state) {
-                    var row = E('div', { 'style': 'margin-right: 1.5em; margin-bottom: 0.3em;' });
-                    row.appendChild(E('span', { 'style': 'font-weight: bold;' }, _('Adaptive State:')));
-                    row.appendChild(document.createTextNode(' '));
-                    row.appendChild(E('span', {}, state));
-                    infoContainer.appendChild(row);
-                });
+                if ((qosStats.adaptive_realtime_state || []).length) {
+                    infoContainer.appendChild(view.createAdaptiveTable(qosStats.adaptive_realtime_state, qosStats.adaptive_now_ms));
+                }
                 (qosStats.adaptive_realtime_errors || []).forEach(function(error) {
                     var row = E('div', { 'style': 'margin-right: 1.5em; margin-bottom: 0.3em; color: var(--error-color, #b42318);' });
                     row.appendChild(E('span', { 'style': 'font-weight: bold;' }, _('Adaptive Error:')));

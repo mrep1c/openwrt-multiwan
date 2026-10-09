@@ -153,6 +153,21 @@ tc_stats='class hfsc 1:11 parent 1:1 rt m1 10000Kbit d 25.0ms m2 1000Kbit
 mw_realtime_parse_tc_class_stats "$tc_stats" || fail "valid tc class statistics were rejected"
 [ "$MW_RT_STATS_BYTES:$MW_RT_STATS_DROPS:$MW_RT_STATS_BACKLOG_BYTES:$MW_RT_STATS_BACKLOG_PACKETS" = 123456:4:1500:3 ] ||
     fail "tc class statistics were parsed incorrectly"
+for scaled_backlog in 2Kb 2Mb 2Gb; do
+    case "$scaled_backlog" in
+        2Kb) expected_bytes=2048 ;;
+        2Mb) expected_bytes=2097152 ;;
+        2Gb) expected_bytes=2147483648 ;;
+    esac
+    mw_realtime_parse_tc_class_stats "$(printf '%s\n' "$tc_stats" | sed "s/1500b/$scaled_backlog/")" ||
+        fail "valid scaled backlog $scaled_backlog was rejected"
+    [ "$MW_RT_STATS_BACKLOG_BYTES" -eq "$expected_bytes" ] || fail "scaled backlog $scaled_backlog was parsed incorrectly"
+done
+for invalid_backlog in badKb -1b 2xb 2K 2.5Kb; do
+    if mw_realtime_parse_tc_class_stats "$(printf '%s\n' "$tc_stats" | sed "s/1500b/$invalid_backlog/")"; then
+        fail "invalid backlog $invalid_backlog was accepted"
+    fi
+done
 if mw_realtime_parse_tc_class_stats 'Sent invalid statistics'; then
     fail "malformed tc class statistics were accepted"
 fi

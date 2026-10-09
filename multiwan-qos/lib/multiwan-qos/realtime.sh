@@ -52,6 +52,73 @@ mw_realtime_resolve_packet_size() {
     MW_RT_RESOLVED_PACKET_SIZE="$packet_size"
 }
 
+mw_realtime_adaptive_freshness_enabled() {
+    [ "$1:$2" = 1:1 ] || return 1
+    case "$3" in bfifo|pfifo) return 0 ;; *) return 1 ;; esac
+}
+
+# Experimental backlog/drop heuristic; these counters do not measure packet sojourn time.
+mw_realtime_adaptive_freshness_step() {
+    local saved="$1" now="$2" rate="$3" backlog="$4" drops="$5" active="$6" session="$7" next_rate="$8"
+    local target last_change window_start last_sample sample_rate samples minimum maximum drop_samples estimate
+    case "$saved" in ''|*[!0-9\ ]*) saved='' ;; esac
+    set -- $saved
+    [ "$#" -eq 9 ] || set -- 20 0 0 0 0 0 0 0 0
+    target="$1"; last_change="$2"; window_start="$3"; last_sample="$4"; sample_rate="$5"
+    samples="$6"; minimum="$7"; maximum="$8"; drop_samples="$9"
+    if [ "$target" -lt 12 ] || [ "$target" -gt 24 ]; then
+        target=20; window_start=0; sample_rate=0; samples=0; minimum=0; maximum=0; drop_samples=0
+    fi
+    [ "$last_change" -le "$now" ] || last_change=0
+    estimate=$(((backlog * 8 + rate - 1) / rate))
+    MW_RT_FRESHNESS_REQUESTED_MS="$target"
+    MW_RT_FRESHNESS_PREVIOUS_CHANGE="$last_change"
+    MW_RT_FRESHNESS_REASON=observing
+    MW_RT_FRESHNESS_BACKLOG_MS="$estimate"
+    if [ "$active" -eq 0 ]; then
+        window_start=0; samples=0; minimum=0; maximum=0; drop_samples=0
+        MW_RT_FRESHNESS_REASON=idle-hold
+        if [ "$session" -eq 0 ]; then
+            MW_RT_FRESHNESS_REQUESTED_MS=20
+            MW_RT_FRESHNESS_REASON=idle-baseline
+        fi
+    elif [ "$next_rate" -ne "$rate" ] || [ "$sample_rate" -ne "$rate" ]; then
+        window_start="$now"; samples=0; minimum=0; maximum=0; drop_samples=0
+        MW_RT_FRESHNESS_REASON=rate-settling
+    elif [ "$last_sample" -ge "$now" ] || [ $((now - last_sample)) -gt 2500 ] ||
+        [ "$window_start" -gt "$now" ] || [ "$samples" -gt 30 ] || [ "$drop_samples" -gt "$samples" ] || [ "$minimum" -gt "$maximum" ]; then
+        window_start="$now"; samples=0; minimum=0; maximum=0; drop_samples=0
+        MW_RT_FRESHNESS_REASON=sample-gap
+    else
+        [ "$window_start" -gt 0 ] || window_start="$now"
+        if [ "$samples" -eq 0 ]; then minimum="$estimate"; maximum="$estimate"; fi
+        [ "$estimate" -ge "$minimum" ] || minimum="$estimate"
+        [ "$estimate" -le "$maximum" ] || maximum="$estimate"
+        samples=$((samples + 1))
+        [ "$drops" -eq 0 ] || drop_samples=$((drop_samples + 1))
+        if [ $((now - window_start)) -ge 10000 ] && [ "$samples" -ge 10 ]; then
+            if [ $((now - last_change)) -lt 20000 ]; then
+                MW_RT_FRESHNESS_REASON=cooldown
+            elif [ $((minimum * 2)) -ge "$target" ]; then
+                MW_RT_FRESHNESS_REQUESTED_MS=$((target - 1))
+                MW_RT_FRESHNESS_REASON=sampled-backlog
+            elif [ "$drop_samples" -ge 3 ] && [ $((maximum * 2)) -lt "$target" ]; then
+                MW_RT_FRESHNESS_REQUESTED_MS=$((target + 1))
+                MW_RT_FRESHNESS_REASON=burst-loss
+            elif [ "$drop_samples" -eq 0 ] && [ "$maximum" -eq 0 ] && [ "$target" -gt 20 ]; then
+                MW_RT_FRESHNESS_REQUESTED_MS=$((target - 1))
+                MW_RT_FRESHNESS_REASON=balanced-recovery
+            fi
+            [ "$MW_RT_FRESHNESS_REQUESTED_MS" -ge 12 ] || MW_RT_FRESHNESS_REQUESTED_MS=12
+            [ "$MW_RT_FRESHNESS_REQUESTED_MS" -le 24 ] || MW_RT_FRESHNESS_REQUESTED_MS=24
+            window_start="$now"; samples=0; minimum=0; maximum=0; drop_samples=0
+        fi
+    fi
+    [ "$MW_RT_FRESHNESS_REQUESTED_MS" -eq "$target" ] || last_change="$now"
+    MW_RT_FRESHNESS_CHANGE_MS="$last_change"
+    MW_RT_FRESHNESS_HISTORY="$window_start $now $rate $samples $minimum $maximum $drop_samples"
+}
+
 mw_realtime_auto_rate() {
     local line_rate="$1" cap
 
@@ -64,7 +131,7 @@ mw_realtime_auto_rate() {
 }
 
 mw_realtime_parse_tc_class_stats() {
-    local output="$1" line tail bytes="" drops="" backlog_bytes="" backlog_packets=""
+    local output="$1" line tail scale bytes="" drops="" backlog_bytes="" backlog_packets=""
 
     while IFS= read -r line; do
         set -- $line
@@ -78,7 +145,16 @@ mw_realtime_parse_tc_class_stats() {
                 ;;
             backlog)
                 [ "$#" -ge 3 ] || continue
-                backlog_bytes="${2%b}"
+                scale=1
+                case "$2" in
+                    *Kb) backlog_bytes="${2%Kb}"; scale=1024 ;;
+                    *Mb) backlog_bytes="${2%Mb}"; scale=1048576 ;;
+                    *Gb) backlog_bytes="${2%Gb}"; scale=1073741824 ;;
+                    *b) backlog_bytes="${2%b}" ;;
+                    *) return 1 ;;
+                esac
+                case "$backlog_bytes" in ''|*[!0-9]*) return 1 ;; esac
+                backlog_bytes=$((backlog_bytes * scale))
                 backlog_packets="${3%p}"
                 ;;
         esac
@@ -266,6 +342,20 @@ mw_realtime_queue_budget() {
     MW_RT_RED_BURST=$(((MW_RT_RED_MIN + MW_RT_RED_MIN + MW_RT_RED_MAX) / (3 * packet_size)))
     [ "$MW_RT_RED_BURST" -lt 2 ] && MW_RT_RED_BURST=2
     MW_RT_PACKET_SIZE="$packet_size"
+}
+
+# NETEM changes must resend delay and loss; a limit-only change clears them.
+mw_realtime_netem_args() {
+    local limit="$1" delay="$2" jitter="$3" distribution="$4" loss="$5"
+    case "$delay" in ''|*[!0-9]*) delay=0 ;; esac
+    case "$jitter" in ''|*[!0-9]*) jitter=0 ;; esac
+    MW_RT_NETEM_ARGS="limit $limit"
+    [ "$jitter" -eq 0 ] || [ "$delay" -ne 0 ] || delay=1
+    if [ "$delay" -ne 0 ]; then
+        MW_RT_NETEM_ARGS="$MW_RT_NETEM_ARGS delay ${delay}ms"
+        [ "$jitter" -eq 0 ] || MW_RT_NETEM_ARGS="$MW_RT_NETEM_ARGS ${jitter}ms distribution $distribution"
+    fi
+    [ -z "$loss" ] || [ "$loss" = none ] || MW_RT_NETEM_ARGS="$MW_RT_NETEM_ARGS loss $loss"
 }
 
 mw_realtime_curve() {

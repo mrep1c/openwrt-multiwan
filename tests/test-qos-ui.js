@@ -11,7 +11,10 @@ const fields = { enabled: '1', qdisc: 'hfsc', upload: '10000', download: '20000'
 let rateMode = 'manual';
 const section = {
     option(type, name) {
-        const option = { option: name, section: this, value() {} };
+        const option = {
+            option: name, section: this, value() {}, dependencies: [],
+            depends(key, value) { this.dependencies.push(typeof key === 'string' ? { [key]: value } : { ...key }); }
+        };
         options[name] = option;
         return option;
     },
@@ -84,4 +87,51 @@ assert.match(context.limitWarning.textContent, /500 connections/);
 context.view.updateLimitWarning({});
 assert.equal(context.limitWarning.style.display, 'none');
 
-console.log('QoS UI regression tests passed.');
+// Use the actual adaptive table builder with the existing table renderer stubbed.
+context.E = (tag, attributes, children) => ({ tag, attributes, children });
+const statistics = vm.runInContext('(function () {\n' + fs.readFileSync(path.join(uiDir, 'statistics.js'), 'utf8') + '\n})()', context);
+statistics.createStatsTable = (title, headers, rows) => ({ title, headers, rows });
+const adaptive = statistics.createAdaptiveTable([
+    'device=wan0 direction=wan applied_rate=1000 requested_rate=1150 recommended_rate=1200 backlog_bytes=2048 freshness_target_ms=20 drop_delta=2 congestion_drop_delta=1 stats_last_ok_ms=1000 saturation=pressure state=degraded last_change_reason=demand-increase',
+    'device=ifb-wan0 direction=lan scheduler_rate=1500 stats_last_ok_ms=0'
+], 6500);
+assert.equal(adaptive.rows.length, 2);
+assert.equal(adaptive.rows[0][2], '1000 kbit/s');
+assert.equal(adaptive.rows[0][3], '1150 kbit/s');
+assert.equal(adaptive.rows[0][5], '2 KiB / 20 ms');
+assert.equal(adaptive.rows[0][6], '2 / 1');
+assert.equal(adaptive.rows[0][7].children, '5.5 s');
+assert.equal(adaptive.rows[0][8], 'At ceiling; pressure continues');
+assert.equal(adaptive.rows[1][1], 'Download');
+assert.equal(adaptive.rows[1][2], '1500 kbit/s');
+assert.equal(adaptive.rows[1][3], 'Unknown');
+assert.equal(adaptive.rows[1][7].children, 'Unknown');
+assert.equal(adaptive.rows[1][8], 'Unknown');
+assert.equal(statistics.createAdaptiveTable(['device=wan0 direction=wan stats_last_ok_ms=7000 stats_age_ms=0'], 6500).rows[0][7].children, 'Unknown');
+assert.equal(statistics.createAdaptiveTable(['device=wan0 direction=wan stats_last_ok_ms=1000'], 0).rows[0][7].children, 'Unknown');
+
+// Render the actual HFSC view to check that both experimental features stay opt-in.
+context.uci.load = async () => {};
+context.uci.sections = (config, type, callback) => callback({ enabled: '1', qdisc: 'hfsc' });
+context.uci.get = (config, section, option) => option === 'gameqdisc' ? 'bfifo' : option === 'realtime_rate_mode' ? 'adaptive' : undefined;
+const hfsc = vm.runInContext('(function () {\n' + fs.readFileSync(path.join(uiDir, 'hfsc.js'), 'utf8') + '\n})()', context);
+hfsc.render().then(() => {
+    for (const option of ['adaptive_queue_budget', 'adaptive_freshness']) {
+        assert.equal(options[option].default, '0', `${option} is enabled by default`);
+        assert.equal(options[option].rmempty, false, `${option} does not persist its off value`);
+    }
+    const visible = values => options.adaptive_freshness.dependencies.some(dependency =>
+        Object.entries(dependency).every(([key, value]) => values[key] === value));
+    for (const gameqdisc of ['bfifo', 'pfifo'])
+        assert.equal(visible({ realtime_rate_mode: 'adaptive', adaptive_queue_budget: '1', gameqdisc }), true);
+    for (const gameqdisc of ['netem', 'qfq', 'red', 'fq_codel', 'drr'])
+        assert.equal(visible({ realtime_rate_mode: 'adaptive', adaptive_queue_budget: '1', gameqdisc }), false);
+    assert.equal(visible({ realtime_rate_mode: 'adaptive', adaptive_queue_budget: '0', gameqdisc: 'bfifo' }), false);
+    assert.equal(visible({ realtime_rate_mode: 'manual', adaptive_queue_budget: '1', gameqdisc: 'bfifo' }), false);
+    const config = fs.readFileSync(path.join(__dirname, '../multiwan-qos/etc/config/multiwan-qos'), 'utf8');
+    assert.match(config, /option adaptive_freshness '0'/);
+    console.log('QoS UI regression tests passed.');
+}).catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+});

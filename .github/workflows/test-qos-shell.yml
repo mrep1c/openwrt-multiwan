@@ -43,6 +43,7 @@ jobs:
             multiwan-qos/etc/multiwan-qos.sh
             multiwan-qos/usr/sbin/multiwan-qos-adaptive
             multiwan-qos/usr/sbin/multiwan-qos-agent-watchdog
+            luci-app-multiwan-qos/root/usr/libexec/rpcd/luci.multiwan_qos_stats
             multiwan-qos/etc/hotplug.d/iface/13-multiwan-qos-hotplug
             scripts/install-qos.sh
           "
@@ -55,6 +56,7 @@ jobs:
         run: |
           busybox ash tests/test-qos-process-lock.sh
           busybox ash tests/test-qos-realtime.sh
+          busybox ash tests/test-qos-adaptive-freshness.sh
           busybox ash tests/test-qos-runtime-state.sh
           busybox ash tests/test-qos-lifecycle.sh
           busybox ash tests/test-qos-fixes.sh
@@ -63,6 +65,7 @@ jobs:
         run: |
           dash tests/test-qos-process-lock.sh
           dash tests/test-qos-realtime.sh
+          dash tests/test-qos-adaptive-freshness.sh
           dash tests/test-qos-runtime-state.sh
           dash tests/test-qos-lifecycle.sh
           dash tests/test-qos-fixes.sh

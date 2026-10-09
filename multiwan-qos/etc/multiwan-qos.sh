@@ -15,6 +15,7 @@ IFS="$DEFAULT_IFS"
 : "${gameqdisc:=pfifo}" "${gameqdisc_child:=red}" "${nongameqdisc:=fq_codel}" "${ACK_FILTER_EGRESS:=auto}"
 : "${freshness_mode:=auto}" "${freshness_target_ms:=18}"
 : "${realtime_rate_mode:=default}" "${realtime_first_scheduling:=0}" "${adaptive_start_rate:=1000}" "${adaptive_custom_start_rate:=1000}" "${adaptive_demand_reserve:=300}"
+: "${adaptive_queue_budget:=0}" "${adaptive_freshness:=0}"
 : "${MAXDEL:=24}" "${PFIFOMIN:=5}" "${PACKETSIZE:=450}"
 : "${DOWNLOAD_IFB_STAB:=0}"
 : "${DISABLE_QOS_OFFLOADS:=1}"
@@ -1815,11 +1816,14 @@ setup_game_qdisc() {
     local realtime_target_ms
     mw_realtime_resolve_freshness "$FRESHNESS_MODE" "$FRESHNESS_TARGET_MS" "$MAXDEL"
     realtime_target_ms="$MW_RT_FRESHNESS_MS"
+    if [ "$realtime_rate_mode" = adaptive ] &&
+        mw_realtime_adaptive_freshness_enabled "$adaptive_freshness" "$adaptive_queue_budget" "$QDISC_TYPE"; then
+        realtime_target_ms=20
+    fi
     mw_realtime_resolve_packet_size "$PACKETSIZE" "$MTU"
     PACKETSIZE="$MW_RT_RESOLVED_PACKET_SIZE"
 
-    # Adaptive FIFO leaves use a fixed 1000 kbit profile. The monitor adjusts
-    # only the HFSC class, so the selected leaf and its queue stay intact.
+    # The caller selects the fixed profile or the opt-in rate-following budget.
     local budget_rate="$GAMERATE"
     case "$QDISC_TYPE" in
         bfifo|pfifo) budget_rate="$queue_budget_rate" ;;
@@ -1887,32 +1891,9 @@ setup_game_qdisc() {
                { [ "$NETEM_DIRECTION" = "egress" ] && [ "$DIR" = "wan" ]; } || \
                { [ "$NETEM_DIRECTION" = "ingress" ] && [ "$DIR" = "lan" ]; }; then
                 
-                # Build netem arguments as positional params instead of eval (#9)
-                local netem_args="limit $netem_limit"
-                
-                # If jitter is set but delay is 0, force minimum delay of 1ms
-                if [ "$netemjitterms" -ne 0 ] && [ "$netemdelayms" -eq 0 ]; then
-                    netemdelayms=1
-                fi
-
-                # Add delay parameter if set (either original or forced minimum)
-                if [ "$netemdelayms" -ne 0 ]; then
-                    netem_args="$netem_args delay ${netemdelayms}ms"
-                    
-                    # Add jitter if set
-                    if [ "$netemjitterms" -ne 0 ]; then
-                        netem_args="$netem_args ${netemjitterms}ms"
-                        netem_args="$netem_args distribution $netemdist"
-                    fi
-                fi
-                
-                # Add packet loss if set
-                if [ "$pktlossp" != "none" ] && [ -n "$pktlossp" ]; then
-                    netem_args="$netem_args loss $pktlossp"
-                fi
-                
+                mw_realtime_netem_args "$netem_limit" "$netemdelayms" "$netemjitterms" "$netemdist" "$pktlossp"
                 # shellcheck disable=SC2086
-                tc qdisc add dev "$DEV" parent "$game_parent" handle 10: netem $netem_args
+                tc qdisc add dev "$DEV" parent "$game_parent" handle 10: netem $MW_RT_NETEM_ARGS
             else
                 # NETEM is intentionally direction-scoped; keep the game class attached in the other direction.
                 tc qdisc add dev "$DEV" parent "$game_parent" handle 10: pfifo limit "$pfifo_limit"
@@ -2022,7 +2003,7 @@ setup_hfsc() {
     local MPU="$9"
     local queue_budget_rate="$GAMERATE"
 
-    if [ "$realtime_rate_mode" = adaptive ]; then
+    if [ "$realtime_rate_mode" = adaptive ] && [ "$adaptive_queue_budget" != 1 ]; then
         mw_realtime_adaptive_profile_range "$RATE"
         queue_budget_rate="$MW_RT_PROFILE_START"
     fi
@@ -2376,7 +2357,7 @@ setup_hybrid() {
     local SHAPER_RATE=$((RATE * 98 / 100)); [ "$SHAPER_RATE" -le 0 ] && SHAPER_RATE=1
     local queue_budget_rate="$GAMERATE"
 
-    if [ "$realtime_rate_mode" = adaptive ]; then
+    if [ "$realtime_rate_mode" = adaptive ] && [ "$adaptive_queue_budget" != 1 ]; then
         mw_realtime_adaptive_profile_range "$RATE"
         queue_budget_rate="$MW_RT_PROFILE_START"
     fi

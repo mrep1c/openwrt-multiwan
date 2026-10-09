@@ -32,10 +32,97 @@ and takes precedence over this option. Its HFSC start/idle baseline can use the
 adds its configurable demand reserve (300 kbit/s by default) exactly once to
 served traffic plus queue-growth and 200 ms backlog-drain estimates, holds the
 last safe rate through the 20-second session grace, and remains capped at both
-2000 kbit/s and 25% of each link. Adaptive does not resize the fixed 1000 kbit/s
-finite-queue profile. OpenWrt 23.05
+2000 kbit/s and 25% of each link. By default, Adaptive retains the fixed
+1000 kbit/s finite-queue profile. OpenWrt 23.05
 remains supported for the normal QoS modes but does not ship the required
 `sch_ets` module.
+
+Adaptive keeps one-second active sampling and five-second idle sampling.
+Agent notifications wake idle checks but preserve demand and burst history
+on active directions. History resets when traffic resumes after the full
+20-second idle interval, or when startup/counter resynchronization requires it.
+
+BFIFO/PFIFO overflow retains its immediate rate response, including QFQ FIFO
+children and NETEM's direction-specific PFIFO fallback. NETEM with configured
+loss does not use drop counts alone to raise the rate. For NETEM backlog,
+the controller subtracts a byte allowance for the current rate times
+configured delay plus jitter before estimating growth and drain pressure.
+This allowance is approximate, especially for delay distributions and bursts.
+Managed queues such as RED and FQ-CoDel require served utilization of at least
+80% of the current rate or two successive samples of backlog before drops
+trigger an increase. Demand and sustained excess backlog can still increase
+the rate. These are sampled heuristics that require router validation.
+
+Rate-change timers advance only after a successful change. Reaching the
+ceiling with continuing confirmed drops or sustained backlog reports
+`ceiling-pressure`, without recording a fictitious increase. Status records
+are published atomically and distinguish the last applied rate from the
+requested rate, including failed updates and line-cap repair. LuCI displays
+a per-device/direction table with rates, backlog, drops and the drop signal,
+ceiling state, measurement age, and the decision/last applied update reason.
+Measurement age is calculated at collection of the statistics snapshot;
+the existing RPC cache can retain that snapshot for up to five seconds.
+
+For HFSC or Hybrid in Adaptive mode, **Adapt Queue Capacity to Rate**
+(`hfsc.adaptive_queue_budget=1`) makes BFIFO/PFIFO and NETEM capacity follow the
+realtime rate while keeping the configured freshness target fixed. Legacy QFQ
+also supports all three BFIFO/PFIFO children. At 18 ms, BFIFO uses
+2250 bytes at 1000 kbit/s and 4500 bytes at 2000 kbit/s. The existing leaf is
+changed in place and verified before the class update, under the refresh lock.
+If an update fails, the controller retains the previous class rate, attempts
+to restore every changed leaf limit, and uses its existing bounded retry backoff.
+Status exposes the last verified `profile_limit`, `profile_requested_limit`,
+`freshness_target_ms`, and `profile_state`. For QFQ, `profile_limit` is the
+common child limit; zero means that readback failed or children differ.
+
+This option is disabled by default. RED is excluded: changing its limit creates
+a new internal FIFO and purges queued packets, so frequent updates would add
+loss. QFQ with RED/FQ-CoDel children is also excluded. FQ-CoDel retains its
+independent 5 ms target; DRR has no explicit freshness budget attached.
+NETEM changes resend the configured delay, jitter, distribution, and loss.
+The direction excluded from NETEM uses the existing PFIFO fallback, which also
+adapts. NETEM keeps its minimum of 12 packets; at 18 ms and 1000-2000 kbit/s
+with 450-byte packets, that floor keeps its limit unchanged. Its intentional
+loss still contributes to the existing demand controller's drop signal.
+The MTU floor and PFIFO minimum still apply; packet capacity also depends on
+packet sizes. The configured target is a queue budget, not a packet-age limit.
+Installing or enabling the option requires service setup once; subsequent
+rate and queue updates do not restart QoS.
+
+**Adapt Freshness Target (Experimental)** (`hfsc.adaptive_freshness=1`) is a
+separate toggle, disabled by default. It requires Adaptive mode, capacity
+adaptation, and a direct BFIFO/PFIFO leaf. It starts at 20 ms and overrides
+the saved freshness preset while enabled. The controller reuses existing
+statistics; it adds no packet probes, faster polling, or per-packet userspace
+processing. A compact state file is kept separately for each direction.
+
+After the service rate settles, a window of at least 10 seconds and 10 valid
+samples can propose a 1 ms step. Steps stay within 12-24 ms and are separated
+by at least 20 seconds during traffic. If every sampled backlog drain estimate
+is at least half the current target, the target tightens. At least three drop
+samples with every backlog estimate below half the target relax it instead.
+The estimate is `ceil(backlog_bytes * 8 / rate_kbit)`, not measured packet
+waiting time. A quiet, empty window brings targets above 20 ms back toward
+20 ms. The existing idle grace holds the target; full idle and counter resets
+restore 20 ms. Rate changes, missing samples, and polling gaps discard the
+observation window. Failed updates keep the last successful target and use
+the existing queue restoration and retry handling.
+
+Target-only updates do not rewrite the HFSC class. When minimum limits or
+packet rounding leave capacity unchanged, target changes make no additional
+kernel reads or writes. Status adds `freshness_control`,
+`freshness_requested_ms`, `freshness_reason`, and
+`freshness_backlog_estimate_ms`. NETEM, QFQ, RED, FQ-CoDel, and DRR do not run
+this millisecond controller. NETEM and QFQ retain their existing capacity
+adaptation with a fixed target.
+
+This is an experimental buffer-budget heuristic. One-second samples cannot
+observe individual 12-24 ms packet delays or reliably separate every burst
+from congestion. Actual delay also depends on packet sizes, queue minimums,
+and HFSC service. Router measurements of latency, loss, CPU usage, and
+stability are required before recommending this toggle for regular use.
+Packet sojourn measurements remain the stronger signal for controlling
+queue delay ([RFC 8289](https://www.rfc-editor.org/rfc/rfc8289.html#section-3.1)).
 
 The two services are designed to coexist. MultiWAN QoS uses the lower byte of
 conntrack marks for DSCP state, while MultiWAN NFT uses separate upper routing

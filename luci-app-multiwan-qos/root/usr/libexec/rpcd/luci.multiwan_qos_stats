@@ -208,7 +208,7 @@ get_stats() {
         # Get game qdisc type (used by both HFSC and hybrid)
         local gameqdisc realtime_rate_mode realtime_first_requested realtime_first_effective
         local realtime_first_reason realtime_first_topology realtime_first_classid
-        local adaptive_state adaptive_errors adaptive_file adaptive_line
+        local adaptive_state adaptive_errors adaptive_file adaptive_line adaptive_now_ms
         gameqdisc=$(uci -q get multiwan-qos.hfsc.gameqdisc || echo "pfifo")
         realtime_rate_mode=$(uci -q get multiwan-qos.hfsc.realtime_rate_mode || echo "default")
         realtime_first_requested=$(uci -q get multiwan-qos.hfsc.realtime_first_scheduling || echo "0")
@@ -219,7 +219,10 @@ get_stats() {
         realtime_first_classid=1:11
         adaptive_state='[]'
         adaptive_errors='[]'
+        adaptive_now_ms=0
         if [ "$realtime_rate_mode" = "adaptive" ]; then
+            adaptive_now_ms="$(diag_monotonic_ms)"
+            case "$adaptive_now_ms" in ''|*[!0-9]*) adaptive_now_ms=0 ;; esac
             for adaptive_file in /var/run/multiwan-qos/adaptive/*/status; do
                 [ -f "$adaptive_file" ] || continue
                 adaptive_line=$(cat "$adaptive_file" 2>/dev/null)
@@ -290,6 +293,7 @@ EOF
             --arg rfclass "$realtime_first_classid" \
             --argjson ars "$adaptive_state" \
             --argjson are "$adaptive_errors" \
+            --argjson anow "$adaptive_now_ms" \
             --argjson fs "$filtered_stats" \
             --argjson he "$hfsc_egress" \
             --argjson hi "$hfsc_ingress" \
@@ -314,6 +318,7 @@ EOF
                 realtime_first_classid: $rfclass,
                 adaptive_realtime_state: $ars,
                 adaptive_realtime_errors: $are,
+                adaptive_now_ms: $anow,
                 qdisc_stats: $fs,
                 hfsc_egress: $he,
                 hfsc_ingress: $hi,
