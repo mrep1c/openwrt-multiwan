@@ -1813,7 +1813,7 @@ setup_game_qdisc() {
     [ "$MAXDEL" -le 0 ] && MAXDEL=24
     [ "$PFIFOMIN" -lt 0 ] && PFIFOMIN=5
 
-    local realtime_target_ms
+    local realtime_target_ms burst_rate=0 burst_leaf="$QDISC_TYPE"
     mw_realtime_resolve_freshness "$FRESHNESS_MODE" "$FRESHNESS_TARGET_MS" "$MAXDEL"
     realtime_target_ms="$MW_RT_FRESHNESS_MS"
     if [ "$realtime_rate_mode" = adaptive ] &&
@@ -1828,7 +1828,16 @@ setup_game_qdisc() {
     case "$QDISC_TYPE" in
         bfifo|pfifo) budget_rate="$queue_budget_rate" ;;
     esac
-    mw_realtime_queue_budget "$budget_rate" "$realtime_target_ms" "$MTU" "$PACKETSIZE" "$PFIFOMIN"
+    if [ "$realtime_rate_mode" = adaptive ] && [ "$adaptive_queue_budget" = 1 ]; then
+        [ "$QDISC_TYPE" != qfq ] || burst_leaf="${gameqdisc_child:-bfifo}"
+        case "$burst_leaf" in
+            bfifo|pfifo|netem)
+                mw_realtime_adaptive_profile_range "$RATE"
+                burst_rate="$MW_RT_PROFILE_START"
+                ;;
+        esac
+    fi
+    mw_realtime_queue_budget "$budget_rate" "$realtime_target_ms" "$MTU" "$PACKETSIZE" "$PFIFOMIN" "$burst_rate"
     local target_bytes="$MW_RT_DELAY_BYTES" burst_floor_bytes="$MW_RT_BURST_FLOOR"
     local bfifo_limit="$MW_RT_QUEUE_BYTES" pfifo_limit="$MW_RT_PFIFO_LIMIT"
     local netem_limit="$MW_RT_NETEM_LIMIT"

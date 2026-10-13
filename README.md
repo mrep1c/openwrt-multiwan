@@ -65,7 +65,8 @@ the existing RPC cache can retain that snapshot for up to five seconds.
 
 For HFSC or Hybrid in Adaptive mode, **Adapt Queue Capacity to Rate**
 (`hfsc.adaptive_queue_budget=1`) makes BFIFO/PFIFO and NETEM capacity follow the
-realtime rate while keeping the configured freshness target fixed. Legacy QFQ
+realtime rate while keeping the configured freshness target fixed unless
+adaptive freshness is also enabled. Legacy QFQ
 also supports all three BFIFO/PFIFO children. At 18 ms, BFIFO uses
 2250 bytes at 1000 kbit/s and 4500 bytes at 2000 kbit/s. The existing leaf is
 changed in place and verified before the class update, under the refresh lock.
@@ -75,6 +76,18 @@ Status exposes the last verified `profile_limit`, `profile_requested_limit`,
 `freshness_target_ms`, and `profile_state`. For QFQ, `profile_limit` is the
 common child limit; zero means that readback failed or children differ.
 
+Capacity adaptation keeps a minimum burst reserve based on the fixed
+1000 kbit/s queue profile, capped at 25% of each link. With a fixed freshness
+target, the reserve uses that target; with experimental freshness, it uses the
+20 ms baseline regardless of the saved preset. The reserve applies at setup
+and during live updates, including NETEM's PFIFO fallback and QFQ FIFO children.
+For example, BFIFO at 300 kbit/s with a 20 ms adaptive target keeps 2500 bytes
+on an uncapped link rather than shrinking to one MTU. Capacity can grow above
+the reserve and shrink back to it. Existing rate-decrease gates retain recent
+burst history. This is bounded space for an unexpected burst, not a prediction
+of game round boundaries or a guarantee that every burst fits. The reserve can
+make actual waiting time exceed the selected target at low service rates.
+
 This option is disabled by default. RED is excluded: changing its limit creates
 a new internal FIFO and purges queued packets, so frequent updates would add
 loss. QFQ with RED/FQ-CoDel children is also excluded. FQ-CoDel retains its
@@ -82,8 +95,8 @@ independent 5 ms target; DRR has no explicit freshness budget attached.
 NETEM changes resend the configured delay, jitter, distribution, and loss.
 The direction excluded from NETEM uses the existing PFIFO fallback, which also
 adapts. NETEM keeps its minimum of 12 packets; at 18 ms and 1000-2000 kbit/s
-with 450-byte packets, that floor keeps its limit unchanged. Its intentional
-loss still contributes to the existing demand controller's drop signal.
+with 450-byte packets, that floor keeps its limit unchanged. Configured NETEM
+loss does not by itself trigger rate increases.
 The MTU floor and PFIFO minimum still apply; packet capacity also depends on
 packet sizes. The configured target is a queue budget, not a packet-age limit.
 Installing or enabling the option requires service setup once; subsequent
@@ -99,7 +112,12 @@ processing. A compact state file is kept separately for each direction.
 After the service rate settles, a window of at least 10 seconds and 10 valid
 samples can propose a 1 ms step. Steps stay within 12-24 ms and are separated
 by at least 20 seconds during traffic. If every sampled backlog drain estimate
-is at least half the current target, the target tightens. At least three drop
+is at least half the current target, the target can tighten. Reductions also
+require the existing Adaptive timers to show ten seconds since the last FIFO
+drop and ten seconds since the last rate increase. A blocked reduction reports
+`freshness_reason=burst-hold`. This guard also applies to recovery toward 20 ms;
+full idle still restores the baseline. It reuses existing samples and timestamps
+and adds no faster polling. At least three drop
 samples with every backlog estimate below half the target relax it instead.
 The estimate is `ceil(backlog_bytes * 8 / rate_kbit)`, not measured packet
 waiting time. A quiet, empty window brings targets above 20 ms back toward

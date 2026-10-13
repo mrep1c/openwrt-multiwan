@@ -347,14 +347,20 @@ printf 'PASS: PFIFO tracks rate and resynchronizes after counter reset.\n'
 fixture floor bfifo 1
 ADAPTIVE_START_RATE=custom; ADAPTIVE_CUSTOM_START_RATE=300
 sample 300000 0 0
-expect 300 1500
+expect 300 2250
+sample 301000 12500 1
+expect 450 2250
+fixture floor-disabled bfifo 0
+ADAPTIVE_START_RATE=custom; ADAPTIVE_CUSTOM_START_RATE=300
+sample 300000 0 0
+expect 300 2250
 fixture plateau pfifo 1
 ADAPTIVE_START_RATE=custom; ADAPTIVE_CUSTOM_START_RATE=300
 sample 300000 0 0
 sample 301000 12500 1
 expect 450 5
 ! grep -q '^qdisc change' "$TEST_ROOT/updates" || fail 'unchanged PFIFO limit was rewritten'
-printf 'PASS: MTU and PFIFO floors are preserved; identical limits skip queue writes.\n'
+printf 'PASS: low-rate capacity retains the fixed-profile burst reserve before and after overflow; identical limits skip queue writes.\n'
 
 fixture decrease bfifo 1
 sample 300000 0 0
@@ -611,6 +617,8 @@ sample 1000000 0 0
 sample 1001000 250000 0
 expect 2000 5000
 # Seed one completed observation window to isolate the kernel application path.
+printf '982000\n' >"$STATE_ROOT/$DEVICE-wan/last_increase"
+printf '982000\n' >"$STATE_ROOT/$DEVICE-wan/last_drop"
 printf '20 982000 992000 1001000 2000 9 12 12 0\n' >"$STATE_ROOT/$DEVICE-wan/freshness_state"
 : >"$TEST_ROOT/updates"
 sample 1002000 250000 0 3000b 7
@@ -637,6 +645,8 @@ fixture target-failure bfifo 1
 ADAPTIVE_FRESHNESS=1
 sample 1000000 0 0
 sample 1001000 250000 0
+printf '982000\n' >"$STATE_ROOT/$DEVICE-wan/last_increase"
+printf '982000\n' >"$STATE_ROOT/$DEVICE-wan/last_drop"
 printf '20 982000 992000 1001000 2000 9 12 12 0\n' >"$STATE_ROOT/$DEVICE-wan/freshness_state"
 FAIL_QUEUE=1
 sample 1002000 250000 0 3000b 7
@@ -654,6 +664,7 @@ fixture target-floor pfifo 1
 ADAPTIVE_FRESHNESS=1
 LINE_RATE=1200; SHAPER_RATE=1200
 sample 1000000 0 0
+printf '981000\n' >"$STATE_ROOT/$DEVICE-wan/last_drop"
 printf '20 981000 991000 1000000 300 9 24 24 0\n' >"$STATE_ROOT/$DEVICE-wan/freshness_state"
 : >"$TEST_ROOT/updates"; : >"$TEST_ROOT/reads"
 sample 1001000 37500 0 900b 2
@@ -665,6 +676,59 @@ sample 1022000 0 0
 expect 300 5
 status_has 'freshness_target_ms=20'
 printf 'PASS: target-only changes, independent directions, failed-update handling, counter resets, and minimum floors are verified.\n'
+
+fixture burst-floor bfifo 1
+ADAPTIVE_FRESHNESS=1
+ADAPTIVE_START_RATE=custom; ADAPTIVE_CUSTOM_START_RATE=300
+FRESHNESS_MODE=custom; FRESHNESS_TARGET_MS=50
+sample 1100000 0 0
+expect 300 2500
+printf '12 1080000 0 1100000 300 0 0 0 0\n' >"$STATE_ROOT/$DEVICE-wan/freshness_state"
+sample 1101000 1250 0
+expect 300 2500
+status_has 'freshness_target_ms=12'
+fixture burst-floor-capped bfifo 1
+ADAPTIVE_FRESHNESS=1; LINE_RATE=1200; SHAPER_RATE=1200
+sample 1100000 0 0
+expect 300 1500
+for burst_kind in bfifo pfifo; do
+    fixture "burst-qfq-$burst_kind" qfq 1 "$burst_kind"
+    ADAPTIVE_START_RATE=custom; ADAPTIVE_CUSTOM_START_RATE=300
+    sample 1100000 0 0
+    case "$burst_kind" in bfifo) burst_limit=2250 ;; pfifo) burst_limit=5 ;; esac
+    expect_children 300 "$burst_limit"
+done
+printf 'PASS: experimental targets retain the 20 ms reserve; link caps and QFQ child reserves are preserved.\n'
+
+for burst_signal in overflow rate-increase; do
+    fixture "freshness-burst-$burst_signal" bfifo 1
+    ADAPTIVE_FRESHNESS=1
+    sample 1200000 0 0
+    sample 1201000 250000 0
+    printf '20 1180000 1192000 1201000 2000 9 12 12 0\n' >"$STATE_ROOT/$DEVICE-wan/freshness_state"
+    case "$burst_signal" in
+        overflow) printf '1180000\n' >"$STATE_ROOT/$DEVICE-wan/last_increase"; burst_drops=1 ;;
+        rate-increase) printf '1180000\n' >"$STATE_ROOT/$DEVICE-wan/last_drop"; burst_drops=0 ;;
+    esac
+    : >"$TEST_ROOT/updates"
+    sample 1202000 250000 "$burst_drops" 3000b 7
+    expect 2000 5000
+    status_has 'freshness_reason=burst-hold'
+    [ ! -s "$TEST_ROOT/updates" ] || fail 'burst hold changed the kernel queue or class'
+    printf '20 1180000 1202000 1211000 2000 9 12 12 0\n' >"$STATE_ROOT/$DEVICE-wan/freshness_state"
+    sample 1212000 2500000 0 3000b 7
+    expect 2000 4750
+    status_has 'freshness_reason=sampled-backlog'
+done
+fixture burst-relax bfifo 1
+ADAPTIVE_FRESHNESS=1
+sample 1300000 0 0
+sample 1301000 250000 0
+printf '20 1280000 1292000 1301000 2000 9 0 0 2\n' >"$STATE_ROOT/$DEVICE-wan/freshness_state"
+sample 1302000 250000 1
+expect 2000 5250
+status_has 'freshness_reason=burst-loss'
+printf 'PASS: recent overflow and rate increases block tightening for ten seconds; relaxation remains available.\n'
 
 for boundary_target in 12 13 23 24; do
     fixture "target-boundary-$boundary_target" bfifo 1
@@ -718,5 +782,17 @@ setup_game_qdisc test-setup 100000 1000 bfifo wan 1500 24 5 450 custom 50 0 0 no
 realtime_rate_mode=adaptive
 setup_game_qdisc test-setup 100000 1000 netem wan 1500 24 5 450 custom 50 0 0 normal both none 1000
 [ "$setup_kind:$setup_limit" = netem:14 ] || fail 'adaptive freshness changed NETEM setup'
+adaptive_freshness=1
+setup_game_qdisc test-setup 100000 300 bfifo wan 1500 24 5 450 custom 50 0 0 normal both none 300
+[ "$setup_kind:$setup_limit" = bfifo:2500 ] || fail 'startup omitted the experimental burst reserve'
+adaptive_freshness=0
+setup_game_qdisc test-setup 100000 300 bfifo wan 1500 24 5 450 balanced 18 0 0 normal both none 300
+[ "$setup_kind:$setup_limit" = bfifo:2250 ] || fail 'startup omitted the fixed-target burst reserve'
+adaptive_queue_budget=0
+setup_game_qdisc test-setup 100000 300 bfifo wan 1500 24 5 450 balanced 18 0 0 normal both none 300
+[ "$setup_kind:$setup_limit" = bfifo:1500 ] || fail 'disabled adaptation changed the startup queue'
+adaptive_queue_budget=1; realtime_rate_mode=manual
+setup_game_qdisc test-setup 100000 300 bfifo wan 1500 24 5 450 balanced 18 0 0 normal both none 300
+[ "$setup_kind:$setup_limit" = bfifo:1500 ] || fail 'manual mode gained an adaptive reserve'
 printf 'PASS: setup starts supported opt-in FIFOs at 20 ms and preserves manual, disabled, and NETEM targets.\n'
 printf 'Adaptive queue freshness regression tests passed. No real networking commands ran.\n'

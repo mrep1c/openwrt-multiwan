@@ -241,7 +241,7 @@ change_queue_limit() {
 }
 
 profile_params() {
-    local rate="$1" mtu="$2" packet_size realtime_target_ms
+    local rate="$1" mtu="$2" packet_size realtime_target_ms burst_rate=0 burst_target_ms
 
     mw_realtime_resolve_freshness "$FRESHNESS_MODE" "$FRESHNESS_TARGET_MS" "$MAXDEL"
     realtime_target_ms="$MW_RT_FRESHNESS_MS"
@@ -253,7 +253,12 @@ profile_params() {
     fi
     mw_realtime_resolve_packet_size "$PACKETSIZE" "$mtu"
     packet_size="$MW_RT_RESOLVED_PACKET_SIZE"
-    mw_realtime_queue_budget "$rate" "$realtime_target_ms" "$mtu" "$packet_size" "$PFIFOMIN"
+    burst_target_ms="$realtime_target_ms"
+    if queue_budget_enabled; then
+        burst_rate="$MW_RT_PROFILE_START"
+        if freshness_enabled; then burst_target_ms=20; fi
+    fi
+    mw_realtime_queue_budget "$rate" "$realtime_target_ms" "$mtu" "$packet_size" "$PFIFOMIN" "$burst_rate" "$burst_target_ms"
     case "${ADAPTIVE_LEAF_MODE:-$GAME_QDISC}" in
         bfifo) ADAPTIVE_PROFILE_REQUESTED_LIMIT="$MW_RT_QUEUE_BYTES" ;;
         pfifo) ADAPTIVE_PROFILE_REQUESTED_LIMIT="$MW_RT_PFIFO_LIMIT" ;;
@@ -342,7 +347,7 @@ process_direction() {
     local monitor_pid force_start
     local delta_bytes delta_drops instant_demand backlog_drain window_ms peak peak_1 peak_2 peak_3 peak_4 current_peak rolling_peak recent_peak desired down_target window_complete
     local backlog_samples backlog_step backlog_free_since lower_since last_decrease last_increase idle_since idle_elapsed new_session slow_rate slow_weight last_drop rollback_rate rollback_until drop_step new state rv
-    local mtu profile_rate freshness_saved freshness_change
+    local mtu profile_rate freshness_saved freshness_change freshness_hold
     local stats_last_ok stats_failures stats_retry_after tc_failures tc_retry_after tc_backoff startup_state
     local agent_session_id saved_agent_session_id next_sample_ms
     local last_activity_ms traffic_active session_active activity_source session_state
@@ -988,7 +993,12 @@ process_direction() {
     fi
 
     if freshness_enabled; then
-        mw_realtime_adaptive_freshness_step "$freshness_saved" "$now" "$current" "$backlog_bytes" "$delta_drops" "$traffic_active" "$session_active" "$new"
+        freshness_hold=0
+        if [ $((now - last_drop)) -lt "$DECREASE_DROP_FREE_MS" ] ||
+            [ $((now - last_increase)) -lt "$DECREASE_REARM_MS" ]; then
+            freshness_hold=1
+        fi
+        mw_realtime_adaptive_freshness_step "$freshness_saved" "$now" "$current" "$backlog_bytes" "$delta_drops" "$traffic_active" "$session_active" "$new" "$freshness_hold"
         ADAPTIVE_FRESHNESS_REQUESTED_MS="$MW_RT_FRESHNESS_REQUESTED_MS"
         ADAPTIVE_FRESHNESS_REASON="$MW_RT_FRESHNESS_REASON"
         ADAPTIVE_FRESHNESS_BACKLOG_MS="$MW_RT_FRESHNESS_BACKLOG_MS"

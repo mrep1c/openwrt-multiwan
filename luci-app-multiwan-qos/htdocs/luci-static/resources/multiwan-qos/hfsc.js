@@ -190,14 +190,14 @@ return view.extend({
         o.readonly = (realtimeRateMode === 'adaptive');
 
         o = s.option(form.ListValue, 'realtime_rate_mode', _('Realtime Rate Mode'),
-            _('Default uses a fixed 1500 kbit/s reserve capped at 25% of the link. Manual uses the overrides below. Adaptive starts and idles at the selected baseline, then adjusts the HFSC rate from 300 to 2000 kbit/s while remaining capped at 25% of the link. Demand combines served traffic with queue growth and a 200 ms backlog-drain allowance, then adds the configured Adaptive Demand Reserve exactly once. Increases use the highest one-second estimate from the last 3 seconds. Decreases use 30-second smoothed demand and 5-second burst memory, require 10 seconds without drops and 5 seconds without backlog, and move in 50 kbit/s steps no faster than every 5 seconds. The last safe rate is held through the 20-second session grace before returning to the selected baseline. BFIFO and PFIFO keep the fixed 1000 kbit/s queue profile unless Adapt FIFO Capacity to Rate is enabled.'));
+            _('Default uses a fixed 1500 kbit/s reserve capped at 25% of the link. Manual uses the overrides below. Adaptive starts and idles at the selected baseline, then adjusts the HFSC rate from 300 to 2000 kbit/s while remaining capped at 25% of the link. Demand combines served traffic with queue growth and a 200 ms backlog-drain allowance, then adds the configured Adaptive Demand Reserve exactly once. Increases use the highest one-second estimate from the last 3 seconds. Decreases use 30-second smoothed demand and 5-second burst memory, require 10 seconds without drops and 5 seconds without backlog, and move in 50 kbit/s steps no faster than every 5 seconds. The last safe rate is held through the 20-second session grace before returning to the selected baseline. BFIFO and PFIFO keep the fixed 1000 kbit/s queue profile unless Adapt Queue Capacity to Rate is enabled below Realtime Freshness.'));
         o.value('default', _('Default'));
         o.value('manual', _('Manual'));
         o.value('adaptive', _('Adaptive'));
         o.default = 'default';
 
         o = s.option(form.ListValue, 'adaptive_start_rate', _('Adaptive Start / Idle Rate'),
-            _('Select the HFSC realtime baseline used when Adaptive starts and after the 20-second idle grace expires. Choose Custom to enter any baseline from 300 to 2000 kbit/s. The selected rate is capped at 25% of each link. With Adapt FIFO Capacity to Rate enabled, the FIFO queue budget also follows this rate.'));
+            _('Select the HFSC realtime baseline used when Adaptive starts and after the 20-second idle grace expires. Choose Custom to enter any baseline from 300 to 2000 kbit/s. The selected rate is capped at 25% of each link. With Adapt Queue Capacity to Rate enabled, the FIFO queue budget also follows this rate.'));
         o.value('1000', _('1000 kbit/s'));
         o.value('1500', _('1500 kbit/s'));
         o.value('custom', _('Custom'));
@@ -221,23 +221,6 @@ return view.extend({
         o.rmempty = false;
         o.depends('realtime_rate_mode', 'adaptive');
 
-        o = s.option(form.Flag, 'adaptive_queue_budget', _('Adapt Queue Capacity to Rate'),
-            _('Keep the selected freshness target while resizing BFIFO, PFIFO, or NETEM capacity as the realtime rate changes. Legacy QFQ supports BFIFO/PFIFO children. NETEM retains its configured delay, jitter, loss, and direction. The MTU floor, PFIFO minimum, and NETEM minimum of 12 packets still apply. RED is excluded because changing its limit purges queued packets. Disabled by default.'));
-        o.default = '0';
-        o.rmempty = false;
-        o.depends({ realtime_rate_mode: 'adaptive', gameqdisc: 'bfifo' });
-        o.depends({ realtime_rate_mode: 'adaptive', gameqdisc: 'pfifo' });
-        o.depends({ realtime_rate_mode: 'adaptive', gameqdisc: 'netem' });
-        o.depends({ realtime_rate_mode: 'adaptive', gameqdisc: 'qfq', gameqdisc_child: 'bfifo' });
-        o.depends({ realtime_rate_mode: 'adaptive', gameqdisc: 'qfq', gameqdisc_child: 'pfifo' });
-
-        o = s.option(form.Flag, 'adaptive_freshness', _('Adapt Freshness Target (Experimental)'),
-            _('For BFIFO/PFIFO, start at 20 ms and adjust within 12-24 ms using existing backlog and drop samples. Rate adaptation acts first. Target changes use 1 ms steps, at most once per 20 seconds during traffic; idle returns to 20 ms. This is an experimental queue budget heuristic, not a measurement or guarantee of packet latency. Requires Adapt Queue Capacity to Rate. Disabled by default.'));
-        o.default = '0';
-        o.rmempty = false;
-        o.depends({ realtime_rate_mode: 'adaptive', adaptive_queue_budget: '1', gameqdisc: 'bfifo' });
-        o.depends({ realtime_rate_mode: 'adaptive', adaptive_queue_budget: '1', gameqdisc: 'pfifo' });
-
         o = createOption('GAMEUP', _('Realtime Upload Reserve Override (kbit/s)'), _('Manual upload reserve. A blank value keeps the default reserve for this direction.'), _('Default: fixed 1500 kbit/s'), 'uinteger');
         o.depends('realtime_rate_mode', 'manual');
         o = createOption('GAMEDOWN', _('Realtime Download Reserve Override (kbit/s)'), _('Manual download reserve. A blank value keeps the default reserve for this direction.'), _('Default: fixed 1500 kbit/s'), 'uinteger');
@@ -252,7 +235,7 @@ return view.extend({
         createOption('nongameqdiscoptions', _('Non-Game QDisc Options'), _('Cake options for non-realtime queueing discipline'), _('Default: besteffort ack-filter'));
 
         o = s.option(form.ListValue, 'freshness_mode', _('Realtime Freshness'),
-            addRelevanceInfo(_('Finite realtime queue budget. Auto/Balanced: 18 ms, Tight: 14 ms, Relaxed: 22 ms, Custom: use the custom target below. For BFIFO/PFIFO, enabled Adapt Freshness Target overrides these presets. Queue capacity uses the detected MTU as its minimum; the HFSC burst segment remains fixed at 25 ms and game FQ_CODEL keeps its independent 5 ms target.'), 'freshness_mode', rootQdisc, gameqdisc));
+            addRelevanceInfo(_('Finite realtime queue budget. Auto/Balanced: 18 ms, Tight: 14 ms, Relaxed: 22 ms, Custom: use the custom target below. For BFIFO/PFIFO in Adaptive mode, enabling both adaptation toggles below overrides these presets; disabling Adapt Freshness Target uses the saved preset again. Queue capacity uses the detected MTU as its minimum; the HFSC burst segment remains fixed at 25 ms and game FQ_CODEL keeps its independent 5 ms target.'), 'freshness_mode', rootQdisc, gameqdisc));
         o.value('auto', _('Auto (Balanced)'));
         o.value('tight', _('Tight'));
         o.value('balanced', _('Balanced'));
@@ -262,6 +245,23 @@ return view.extend({
 
         o = createOption('freshness_target_ms', _('Custom Freshness Target (ms)'), _('Manual finite realtime queue target. The HFSC burst remains 25 ms and game FQ_CODEL keeps its independent 5 ms target.'), _('Default: 18'), 'uinteger');
         o.depends('freshness_mode', 'custom');
+
+        o = s.option(form.Flag, 'adaptive_queue_budget', _('Adapt Queue Capacity to Rate'),
+            _('Resize BFIFO, PFIFO, or NETEM capacity as the realtime rate changes. The freshness target stays fixed unless Adapt Freshness Target is also enabled. With both enabled, capacity follows the current rate and adaptive target. A minimum burst reserve uses the fixed 1000 kbit/s profile, capped at 25% of each link; its target is the selected fixed target or 20 ms when adaptive freshness is enabled. The reserve is present before a burst and can make waiting time exceed the target at low rates. Legacy QFQ supports BFIFO/PFIFO children. NETEM retains its configured delay, jitter, loss, and direction. The MTU floor, PFIFO minimum, and NETEM minimum of 12 packets still apply. RED is excluded because changing its limit purges queued packets. Disabled by default.'));
+        o.default = '0';
+        o.rmempty = false;
+        o.depends({ realtime_rate_mode: 'adaptive', gameqdisc: 'bfifo' });
+        o.depends({ realtime_rate_mode: 'adaptive', gameqdisc: 'pfifo' });
+        o.depends({ realtime_rate_mode: 'adaptive', gameqdisc: 'netem' });
+        o.depends({ realtime_rate_mode: 'adaptive', gameqdisc: 'qfq', gameqdisc_child: 'bfifo' });
+        o.depends({ realtime_rate_mode: 'adaptive', gameqdisc: 'qfq', gameqdisc_child: 'pfifo' });
+
+        o = s.option(form.Flag, 'adaptive_freshness', _('Adapt Freshness Target (Experimental)'),
+            _('For BFIFO/PFIFO, replace the selected freshness preset with a target that starts at 20 ms and adjusts within 12-24 ms using existing backlog and drop samples. Requires Adapt Queue Capacity to Rate. Both options work together: capacity uses the current rate and this target, subject to the burst reserve. Rate adaptation acts first. Target reductions wait at least 10 seconds after FIFO drops or a rate increase. Target changes use 1 ms steps, at most once per 20 seconds during traffic; idle returns to 20 ms. This is an experimental queue budget heuristic, not a measurement or guarantee of packet latency. Disabled by default.'));
+        o.default = '0';
+        o.rmempty = false;
+        o.depends({ realtime_rate_mode: 'adaptive', adaptive_queue_budget: '1', gameqdisc: 'bfifo' });
+        o.depends({ realtime_rate_mode: 'adaptive', adaptive_queue_budget: '1', gameqdisc: 'pfifo' });
 
         o = createOption('PFIFOMIN', _('PFIFO Min'), _('Minimum packet count for PFIFO queue'), _('Default: 5'), 'uinteger');
         o.depends('gameqdisc', 'pfifo');

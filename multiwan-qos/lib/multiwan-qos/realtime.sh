@@ -60,6 +60,7 @@ mw_realtime_adaptive_freshness_enabled() {
 # Experimental backlog/drop heuristic; these counters do not measure packet sojourn time.
 mw_realtime_adaptive_freshness_step() {
     local saved="$1" now="$2" rate="$3" backlog="$4" drops="$5" active="$6" session="$7" next_rate="$8"
+    local tightening_hold="${9:-0}"
     local target last_change window_start last_sample sample_rate samples minimum maximum drop_samples estimate
     case "$saved" in ''|*[!0-9\ ]*) saved='' ;; esac
     set -- $saved
@@ -108,6 +109,10 @@ mw_realtime_adaptive_freshness_step() {
             elif [ "$drop_samples" -eq 0 ] && [ "$maximum" -eq 0 ] && [ "$target" -gt 20 ]; then
                 MW_RT_FRESHNESS_REQUESTED_MS=$((target - 1))
                 MW_RT_FRESHNESS_REASON=balanced-recovery
+            fi
+            if [ "$tightening_hold" -eq 1 ] && [ "$MW_RT_FRESHNESS_REQUESTED_MS" -lt "$target" ]; then
+                MW_RT_FRESHNESS_REQUESTED_MS="$target"
+                MW_RT_FRESHNESS_REASON=burst-hold
             fi
             [ "$MW_RT_FRESHNESS_REQUESTED_MS" -ge 12 ] || MW_RT_FRESHNESS_REQUESTED_MS=12
             [ "$MW_RT_FRESHNESS_REQUESTED_MS" -le 24 ] || MW_RT_FRESHNESS_REQUESTED_MS=24
@@ -309,13 +314,17 @@ mw_realtime_adaptive_profile_range() {
 
 mw_realtime_queue_budget() {
     local rate="$1" freshness="$2" mtu="$3" packet_size="$4" pfifo_min="$5"
+    local burst_rate="${6:-0}" burst_freshness="${7:-$2}"
     case "$rate" in ''|*[!0-9]*) rate=1 ;; esac
     case "$freshness" in ''|*[!0-9]*) freshness=18 ;; esac
     case "$mtu" in ''|*[!0-9]*) mtu=1500 ;; esac
     case "$packet_size" in ''|*[!0-9]*) packet_size=450 ;; esac
     case "$pfifo_min" in ''|*[!0-9]*) pfifo_min=5 ;; esac
+    case "$burst_rate" in ''|*[!0-9]*) burst_rate=0 ;; esac
+    case "$burst_freshness" in ''|*[!0-9]*) burst_freshness="$freshness" ;; esac
     [ "$rate" -gt 0 ] 2>/dev/null || rate=1
     [ "$freshness" -gt 0 ] 2>/dev/null || freshness=18
+    [ "$burst_freshness" -gt 0 ] 2>/dev/null || burst_freshness="$freshness"
     [ "$mtu" -gt 0 ] 2>/dev/null || mtu=1500
     [ "$packet_size" -lt 64 ] 2>/dev/null && packet_size=64
     [ "$packet_size" -gt "$mtu" ] 2>/dev/null && packet_size="$mtu"
@@ -324,7 +333,9 @@ mw_realtime_queue_budget() {
     MW_RT_DELAY_BYTES=$(((freshness * rate + 7) / 8))
     [ "$MW_RT_DELAY_BYTES" -lt 1 ] && MW_RT_DELAY_BYTES=1
 
-    MW_RT_BURST_FLOOR="$mtu"
+    # Keep a bounded reserve available before a burst reaches the next userspace sample.
+    MW_RT_BURST_FLOOR=$(((burst_rate * burst_freshness + 7) / 8))
+    [ "$MW_RT_BURST_FLOOR" -lt "$mtu" ] && MW_RT_BURST_FLOOR="$mtu"
 
     MW_RT_QUEUE_BYTES="$MW_RT_DELAY_BYTES"
     [ "$MW_RT_QUEUE_BYTES" -lt "$MW_RT_BURST_FLOOR" ] && MW_RT_QUEUE_BYTES="$MW_RT_BURST_FLOOR"
