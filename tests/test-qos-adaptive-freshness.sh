@@ -164,12 +164,13 @@ printf '1800\n' >"$STATE_ROOT/$DEVICE-wan/slow_rate"
 printf '1600\n' >"$STATE_ROOT/$DEVICE-wan/peak_1"
 MW_ADAPTIVE_AGENT_SESSION_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 sample 92000 12500 0
-[ "$(cat "$STATE_ROOT/$DEVICE-wan/slow_rate")" -gt 1700 ] || fail 'agent event erased active demand history'
-[ "$(cat "$STATE_ROOT/$DEVICE-wan/peak_2")" -eq 1600 ] || fail 'agent event erased burst history'
+[ "$(cat "$STATE_ROOT/$DEVICE-wan/slow_rate")" -eq 100 ] || fail 'new agent session did not reset demand as in 6d80876'
+[ "$(cat "$STATE_ROOT/$DEVICE-wan/peak_2")" -eq 0 ] || fail 'new agent session retained an earlier burst'
 MW_ADAPTIVE_AGENT_SESSION_ID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 sample 93000 0 0
 sample 94000 12500 0
-[ "$(cat "$STATE_ROOT/$DEVICE-wan/slow_rate")" -gt 1600 ] || fail 'agent event erased history during idle grace'
+[ "$(cat "$STATE_ROOT/$DEVICE-wan/slow_rate")" -eq 100 ] || fail 'pending session did not reset on returning traffic'
+[ "$(cat "$STATE_ROOT/$DEVICE-wan/last_increase")" -eq 94000 ] || fail 'new session did not rearm decreases above baseline'
 sample 114000 0 0
 status_has 'poll_state=idle'
 MW_ADAPTIVE_AGENT_SESSION_ID=cccccccccccccccccccccccccccccccc
@@ -178,7 +179,7 @@ sample 115000 12500 0
 grep -q '^stats' "$TEST_ROOT/reads" || fail 'agent event no longer wakes idle polling'
 [ "$(cat "$STATE_ROOT/$DEVICE-wan/slow_rate")" -eq 100 ] || fail 'traffic after full idle retained stale history'
 status_has 'idle_poll_interval=5s'
-printf 'PASS: agent events preserve active/grace history and still wake five-second idle polling.\n'
+printf 'PASS: agent sessions restore 6d80876 history reset, decrease rearm, and idle wakeup.\n'
 
 for agent_direction in wan lan; do
     fixture "agent-$agent_direction" bfifo 0
@@ -190,9 +191,35 @@ done
 MW_ADAPTIVE_AGENT_SESSION_ID=dddddddddddddddddddddddddddddddd
 for agent_direction in wan lan; do
     DEVICE="agent-$agent_direction"; DIRECTION="$agent_direction"
+    SENT_BYTES=250000
     sample 92000 12500 0
-    [ "$(cat "$STATE_ROOT/$DEVICE-$DIRECTION/slow_rate")" -gt 1700 ] || fail 'global agent event erased another direction history'
+    [ "$(cat "$STATE_ROOT/$DEVICE-$DIRECTION/slow_rate")" -eq 100 ] || fail 'agent session did not reset an active direction'
 done
+
+for queue_option in 0 1; do
+    fixture "agent-baseline-$queue_option" pfifo "$queue_option"
+    sample 90000 0 0
+    printf '500\n' >"$STATE_ROOT/$DEVICE-wan/rate"
+    printf '500\n' >"$TEST_ROOT/kernel/$DEVICE.rate"
+    MW_ADAPTIVE_AGENT_SESSION_ID=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+    sample 91000 12500 0
+    expect 1000 5
+    status_has 'session_source=agent-flow'
+done
+printf 'PASS: agent flow sessions restore the baseline with capacity adaptation on or off.\n'
+
+fixture agent-baseline-retry pfifo 1
+sample 90000 0 0
+printf '500\n' >"$STATE_ROOT/$DEVICE-wan/rate"
+printf '500\n' >"$TEST_ROOT/kernel/$DEVICE.rate"
+MW_ADAPTIVE_AGENT_SESSION_ID=ffffffffffffffffffffffffffffffff
+FAIL_CLASS=1
+sample 91000 12500 0
+expect 500 5
+sample 92000 12500 0
+sample 93000 12500 0
+expect 1000 5
+printf 'PASS: a failed agent-session baseline update retries after tc backoff.\n'
 
 fixture saturated bfifo 0
 sample 90000 0 0
@@ -272,16 +299,16 @@ fixture netem-loss netem 1
 NETEM_LOSS=1%
 sample 90000 0 0
 sample 91000 12500 10
-expect 1000 12
-status_has 'drop_signal=netem-configured-loss'
-status_has 'congestion_drop_delta=0'
+expect 1200 12
+status_has 'drop_signal=raw-drops'
+status_has 'congestion_drop_delta=10'
 fixture netem-pressure netem 1
 NETEM_DELAY_MS=050; NETEM_JITTER_MS=0005; NETEM_LOSS=1%
 sample 90000 0 0
 sample 91000 12500 10 6000b 14
-expect 1000 12
-status_has 'pressure_backlog_bytes=0'
-status_has 'netem_delay_allowance_bytes=6875'
+expect 1200 12
+status_has 'pressure_backlog_bytes=6000'
+status_has 'netem_delay_allowance_bytes=0'
 sample 92000 12500 10 9000b 20
 sample 93000 12500 10 9500b 21
 [ "$(cat "$TEST_ROOT/kernel/$DEVICE.rate")" -gt 1000 ] || fail 'NETEM excess backlog could not increase the rate'
@@ -300,18 +327,18 @@ for managed_queue in red fq_codel; do
     fixture "managed-$managed_queue" "$managed_queue" 0
     sample 90000 0 0
     sample 91000 12500 1
-    expect 1000 2250
-    status_has 'drop_signal=managed-unconfirmed'
+    expect 1150 2250
+    status_has 'drop_signal=raw-drops'
     sample 92000 125000 1
     [ "$(cat "$TEST_ROOT/kernel/$DEVICE.rate")" -gt 1000 ] || fail 'managed queue ignored drops under high utilization'
     fixture "managed-backlog-$managed_queue" "$managed_queue" 0
     sample 90000 0 0
     sample 91000 12500 1 2Kb 4
-    expect 1000 2250
+    expect 1150 2250
     sample 92000 12500 1 2Kb 4
     [ "$(cat "$TEST_ROOT/kernel/$DEVICE.rate")" -gt 1000 ] || fail 'managed queue ignored sustained backlog with drops'
 done
-printf 'PASS: FIFO overflow stays fast; NETEM emulation and low-demand managed-queue drops do not drive rate increases.\n'
+printf 'PASS: all leaf drop/backlog signals retain the 6d80876 rate response.\n'
 
 fixture fixed bfifo 0
 sample 100000 0 0
@@ -442,7 +469,7 @@ sample 600000 0 0
 fixture other fq_codel 1
 sample 700000 0 0
 sample 701000 12500 1
-expect 1000 2250
+expect 1150 2250
 ! grep -q '^qdisc change' "$TEST_ROOT/updates" || fail 'non-FIFO queue was modified'
 printf 'PASS: lock contention, queue ownership, and FQ-CoDel behavior are preserved.\n'
 

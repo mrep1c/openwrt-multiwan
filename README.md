@@ -37,24 +37,24 @@ last safe rate through the 20-second session grace, and remains capped at both
 remains supported for the normal QoS modes but does not ship the required
 `sch_ets` module.
 
-Adaptive keeps one-second active sampling and five-second idle sampling.
-Agent notifications wake idle checks but preserve demand and burst history
-on active directions. History resets when traffic resumes after the full
-20-second idle interval, or when startup/counter resynchronization requires it.
+Adaptive restores the rate and session behavior from commit `6d80876`, with
+one-second active sampling and five-second idle sampling. A new agent flow
+notification remains pending until traffic appears on a direction. It then
+resets demand and burst history, restores at least the configured start baseline,
+and rearms the decrease hold. Traffic resuming after the full 20-second idle
+interval also starts a new session. Failed baseline writes retain the pending
+notification for retry. Startup and counter resynchronization reset history.
 
-BFIFO/PFIFO overflow retains its immediate rate response, including QFQ FIFO
-children and NETEM's direction-specific PFIFO fallback. NETEM with configured
-loss does not use drop counts alone to raise the rate. For NETEM backlog,
-the controller subtracts a byte allowance for the current rate times
-configured delay plus jitter before estimating growth and drain pressure.
-This allowance is approximate, especially for delay distributions and bursts.
-Managed queues such as RED and FQ-CoDel require served utilization of at least
-80% of the current rate or two successive samples of backlog before drops
-trigger an increase. Demand and sustained excess backlog can still increase
-the rate. These are sampled heuristics that require router validation.
+Drop counters can immediately raise the rate for all leaf modes, including
+managed queues and NETEM with configured loss. Backlog estimates use the full
+reported backlog, including NETEM delay. This deliberately restores `6d80876`;
+the later managed-drop confirmation and NETEM allowance heuristics are removed.
+The demand reserve is added once, without the older 75% utilization multiplier.
+Adaptive's HFSC realtime class remains RT-only: its service curve can pace a
+backlogged game queue even when other link capacity is available.
 
 Rate-change timers advance only after a successful change. Reaching the
-ceiling with continuing confirmed drops or sustained backlog reports
+ceiling with continuing drops or sustained backlog reports
 `ceiling-pressure`, without recording a fictitious increase. Status records
 are published atomically and distinguish the last applied rate from the
 requested rate, including failed updates and line-cap repair. LuCI displays
@@ -62,6 +62,15 @@ a per-device/direction table with rates, backlog, drops and the drop signal,
 ceiling state, measurement age, and the decision/last applied update reason.
 Measurement age is calculated at collection of the statistics snapshot;
 the existing RPC cache can retain that snapshot for up to five seconds.
+
+Router agent updates tolerate a transient conntrack miss for a still-reported
+exact flow. Both existing nft chains must first verify against the cached PC IP,
+DSCP and complete endpoint tuples. The first miss starts a nonrenewing 10-second
+grace, evaluated on each update; unmatched replies keep the PC agent's fast retry
+active. A fresh lookup clears that flow's miss time. Partial misses retain only
+eligible flows. Removed or changed endpoints and DSCP changes do not reuse the
+cache. Explicit clear/disconnect and overall agent expiry still remove rules.
+Status reports `conntrack_retained` separately from fresh conntrack resolutions.
 
 For HFSC or Hybrid in Adaptive mode, **Adapt Queue Capacity to Rate**
 (`hfsc.adaptive_queue_budget=1`) makes BFIFO/PFIFO and NETEM capacity follow the
@@ -96,7 +105,7 @@ NETEM changes resend the configured delay, jitter, distribution, and loss.
 The direction excluded from NETEM uses the existing PFIFO fallback, which also
 adapts. NETEM keeps its minimum of 12 packets; at 18 ms and 1000-2000 kbit/s
 with 450-byte packets, that floor keeps its limit unchanged. Configured NETEM
-loss does not by itself trigger rate increases.
+loss contributes to drop-driven rate increases under the restored controller.
 The MTU floor and PFIFO minimum still apply; packet capacity also depends on
 packet sizes. The configured target is a queue budget, not a packet-age limit.
 Installing or enabling the option requires service setup once; subsequent

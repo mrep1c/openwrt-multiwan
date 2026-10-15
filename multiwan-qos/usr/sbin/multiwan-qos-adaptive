@@ -349,9 +349,9 @@ process_direction() {
     local backlog_samples backlog_step backlog_free_since lower_since last_decrease last_increase idle_since idle_elapsed new_session slow_rate slow_weight last_drop rollback_rate rollback_until drop_step new state rv
     local mtu profile_rate freshness_saved freshness_change freshness_hold
     local stats_last_ok stats_failures stats_retry_after tc_failures tc_retry_after tc_backoff startup_state
-    local agent_session_id saved_agent_session_id next_sample_ms
+    local agent_session_id saved_agent_session_id agent_session_changed agent_session_pending next_sample_ms
     local last_activity_ms traffic_active session_active activity_source session_state
-    local pressure_backlog_bytes pressure_backlog previous_pressure_backlog congestion_drops netem_delay netem_jitter
+    local pressure_backlog_bytes pressure_backlog previous_pressure_backlog congestion_drops
 
     [ -d "/sys/class/net/$dev" ] || return 0
     [ ! -e "$STATE_ROOT/.detached-$dev" ] || return 0
@@ -618,22 +618,6 @@ process_direction() {
     pressure_backlog_bytes="$backlog_bytes"
     pressure_backlog="$backlog"
     previous_pressure_backlog="$previous_backlog_bytes"
-    if [ "$ADAPTIVE_LEAF_MODE" = netem ]; then
-        netem_delay="$NETEM_DELAY_MS"; netem_jitter="$NETEM_JITTER_MS"
-        case "$netem_delay" in ''|*[!0-9]*) netem_delay=0 ;; esac
-        case "$netem_jitter" in ''|*[!0-9]*) netem_jitter=0 ;; esac
-        while [ "${netem_delay#0}" != "$netem_delay" ]; do netem_delay="${netem_delay#0}"; done
-        while [ "${netem_jitter#0}" != "$netem_jitter" ]; do netem_jitter="${netem_jitter#0}"; done
-        : "${netem_delay:=0}" "${netem_jitter:=0}"
-        [ "$netem_jitter" -eq 0 ] || [ "$netem_delay" -gt 0 ] || netem_delay=1
-        # shortcut: delay plus jitter is an allowance, not exact NETEM residence time; upgrade with leaf timing evidence.
-        ADAPTIVE_NETEM_ALLOWANCE_BYTES=$(((current * (netem_delay + netem_jitter) + 7) / 8))
-        pressure_backlog_bytes=$((backlog_bytes - ADAPTIVE_NETEM_ALLOWANCE_BYTES))
-        previous_pressure_backlog=$((previous_backlog_bytes - ADAPTIVE_NETEM_ALLOWANCE_BYTES))
-        [ "$pressure_backlog_bytes" -ge 0 ] || pressure_backlog_bytes=0
-        [ "$previous_pressure_backlog" -ge 0 ] || previous_pressure_backlog=0
-        [ "$pressure_backlog_bytes" -gt 0 ] || pressure_backlog=0
-    fi
     mw_realtime_adaptive_demand "$delta_bytes" "$elapsed" "$pressure_backlog_bytes" "$previous_pressure_backlog" "$BACKLOG_DRAIN_MS"
     instant_demand="$MW_RT_INSTANT_DEMAND"
     backlog_drain="$MW_RT_BACKLOG_DRAIN_RATE"
@@ -648,22 +632,9 @@ process_direction() {
     fi
     printf '%s\n' "$backlog_samples" > "$state_dir/backlog_samples"
     congestion_drops="$delta_drops"
-    ADAPTIVE_DROP_SIGNAL=fifo
-    case "$ADAPTIVE_LEAF_MODE" in
-        bfifo|pfifo) ;;
-        netem)
-            # shortcut: mixed NETEM drops cannot identify overflow; revisit when kernel counters distinguish the causes.
-            case "$NETEM_LOSS" in *[1-9]*) congestion_drops=0; ADAPTIVE_DROP_SIGNAL=netem-configured-loss ;; esac
-            ;;
-        *)
-            # shortcut: managed drops need corroboration; refine after leaf-counter measurements on the router.
-            ADAPTIVE_DROP_SIGNAL=managed-confirmed
-            if [ "$MW_RT_SERVED_RATE" -lt $(((current * 80 + 99) / 100)) ] && [ "$backlog_samples" -lt 2 ]; then
-                congestion_drops=0
-                ADAPTIVE_DROP_SIGNAL=managed-unconfirmed
-            fi
-            ;;
-    esac
+    # Keep the 6d80876 rate controller independent of optional queue adaptation.
+    ADAPTIVE_DROP_SIGNAL=raw-drops
+    case "$ADAPTIVE_LEAF_MODE" in bfifo|pfifo) ADAPTIVE_DROP_SIGNAL=fifo ;; esac
     ADAPTIVE_CONGESTION_DROPS="$congestion_drops"
     ADAPTIVE_PRESSURE_BACKLOG_BYTES="$pressure_backlog_bytes"
     ADAPTIVE_BACKLOG_SAMPLES="$backlog_samples"
@@ -712,15 +683,34 @@ process_direction() {
     if [ -r "$state_dir/agent_session_id" ]; then
         IFS= read -r saved_agent_session_id < "$state_dir/agent_session_id"
     fi
-    if [ -n "$agent_session_id" ] && [ "$agent_session_id" != "$saved_agent_session_id" ]; then
+    read_number "$state_dir/agent_session_pending" 0
+    agent_session_pending="$MW_ADAPTIVE_NUMBER"
+    ADAPTIVE_SESSION_PENDING="$agent_session_pending"
+    agent_session_changed=0
+    if [ -z "$agent_session_id" ]; then
+        agent_session_pending=0
+        ADAPTIVE_SESSION_PENDING=0
+        rm -f "$state_dir/agent_session_pending"
+    elif [ "$agent_session_id" != "$saved_agent_session_id" ]; then
         printf '%s\n' "$agent_session_id" > "$state_dir/agent_session_id"
+        printf '1\n' > "$state_dir/agent_session_pending"
+        agent_session_pending=1
+        ADAPTIVE_SESSION_PENDING=1
     fi
-    # A global agent event wakes polling but cannot identify this direction's traffic.
-    [ ! -e "$state_dir/agent_session_pending" ] || rm -f "$state_dir/agent_session_pending"
+    if [ "$traffic_active" -eq 1 ] && [ "$agent_session_pending" -eq 1 ]; then
+        agent_session_changed=1
+        agent_session_pending=0
+        ADAPTIVE_SESSION_PENDING=0
+        rm -f "$state_dir/agent_session_pending"
+    fi
 
     read_number "$state_dir/idle_since" 0
     idle_since="$MW_ADAPTIVE_NUMBER"
     new_session=0
+    if [ "$agent_session_changed" -eq 1 ]; then
+        new_session=1
+        ADAPTIVE_SESSION_SOURCE=agent-flow
+    fi
     if [ "$traffic_active" -eq 1 ]; then
         if [ "$new_session" -eq 0 ] && [ "$idle_since" -gt 0 ] &&
             [ $((now - idle_since)) -ge "$SESSION_IDLE_MS" ]; then
@@ -785,7 +775,7 @@ process_direction() {
     fi
     ADAPTIVE_SESSION_STATE="$session_state"
     if [ -n "$agent_session_id" ]; then
-        ADAPTIVE_SESSION_SOURCE=agent-wakeup
+        ADAPTIVE_SESSION_SOURCE=agent-flow
     elif [ "$session_active" -eq 1 ]; then
         ADAPTIVE_SESSION_SOURCE="$session_state"
     fi
@@ -1040,6 +1030,12 @@ process_direction() {
         printf '%s\n' "$now" > "$state_dir/last_change_ms"
         printf '%s\n' "$state" > "$state_dir/last_change_reason"
     fi
+    if [ "$rv" -ne 0 ] && [ "$agent_session_changed" -eq 1 ]; then
+        printf '1\n' > "$state_dir/agent_session_pending"
+        ADAPTIVE_SESSION_PENDING=1
+    fi
+    # A confirmed new flow rearms decreases even when already above its baseline.
+    if [ "$rv" -eq 0 ] && [ "$new_session" -eq 1 ]; then last_increase="$now"; fi
     printf '%s\n' "$last_decrease" > "$state_dir/last_decrease"
     printf '%s\n' "$last_increase" > "$state_dir/last_increase"
 

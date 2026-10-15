@@ -30,7 +30,7 @@ jobs:
       - name: Install test runtimes
         run: |
           sudo apt-get update
-          sudo apt-get install -y busybox-static dash nodejs
+          sudo apt-get install -y busybox-static dash nodejs lua5.1
 
       - name: Check installed script syntax
         run: |
@@ -72,3 +72,8 @@ jobs:
 
       - name: Run QoS UI regression tests
         run: node tests/test-qos-ui.js
+
+      - name: Run router agent endpoint regression tests
+        run: |
+          luac5.1 -p multiwan-qos/www/cgi-bin/multiwan-qos-agent
+          lua5.1 tests/test-qos-agent.lua

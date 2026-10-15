@@ -24,6 +24,7 @@ local NFT_REAPPLY_CHAIN = "multiwan_qos_agent_reapply"
 local LOCK_DIR = "/tmp/multiwan_qos_agent.lock"
 local LOCK_HELPER = "/lib/multiwan-qos/process-lock.sh"
 local MIN_REQUEST_INTERVAL_SEC = 1  -- minimum seconds between requests
+local CONNTRACK_RETRY_GRACE_SEC = 10
 local DEFAULT_DSCP = 46
 local AGENT_ENDPOINT_VERSION = 5
 local lock_token = nil
@@ -418,7 +419,9 @@ local function conntrack_candidate_score(candidate, reported_remote_port, report
 end
 
 local function consider_conntrack_candidate(candidate, reported_remote_port, reported_local_port, best, best_score)
-    if candidate then
+    if candidate and
+        (not validate_port(reported_remote_port) or candidate.remote_port == reported_remote_port) and
+        (not validate_port(reported_local_port) or candidate.local_port == reported_local_port) then
         local candidate_score = conntrack_candidate_score(candidate, reported_remote_port, reported_local_port)
         if candidate_score > best_score then
             return candidate, candidate_score
@@ -782,7 +785,36 @@ local function verify_reapply_rules(expected_count, dscp_class, dscp_value)
     }
 end
 
-local function verify_agent_chains(expected_count, dscp_class, dscp_value)
+local function rule_tuples_match(output, rules, pc_ip)
+    local expected, actual = {}, {}
+    local function key(src, dst, proto, sport, dport)
+        return table.concat({ src, dst, proto, tostring(tonumber(sport)), tostring(tonumber(dport)) }, "|")
+    end
+    for _, rule in ipairs(rules) do
+        if not validate_ip(rule.remote_ip) or not validate_port(tonumber(rule.remote_port)) or
+            not validate_port(tonumber(rule.local_port)) or
+            (rule.proto ~= "udp" and rule.proto ~= "tcp") then return false end
+        local src, dst, sport, dport = pc_ip, rule.remote_ip, rule.local_port, rule.remote_port
+        if rule.direction == "DN" then
+            src, dst, sport, dport = dst, src, dport, sport
+        elseif rule.direction ~= "UP" then return false end
+        local tuple = key(src, dst, rule.proto, sport, dport)
+        expected[tuple] = (expected[tuple] or 0) + 1
+    end
+    for line in (output or ""):gmatch("[^\r\n]+") do
+        local src, dst, proto, sport, port_proto, dport = trim(line):match(
+            "^ip%s+saddr%s+(%S+)%s+ip%s+daddr%s+(%S+)%s+(%w+)%s+sport%s+(%d+)%s+(%w+)%s+dport%s+(%d+)%s")
+        if src and proto == port_proto then
+            local tuple = key(src, dst, proto, sport, dport)
+            actual[tuple] = (actual[tuple] or 0) + 1
+        end
+    end
+    for tuple, count in pairs(expected) do if actual[tuple] ~= count then return false end end
+    for tuple, count in pairs(actual) do if expected[tuple] ~= count then return false end end
+    return true
+end
+
+local function verify_agent_chains(expected_count, dscp_class, dscp_value, rules, pc_ip)
     local primary = verify_agent_rules(expected_count, dscp_class, dscp_value)
     local reapply = verify_reapply_rules(expected_count, dscp_class, dscp_value)
     primary.reapply_rule_count = reapply.rule_count or 0
@@ -792,7 +824,31 @@ local function verify_agent_chains(expected_count, dscp_class, dscp_value)
         primary.status = reapply.status
         primary.message = "Agent DSCP reapply chain did not match the primary agent chain"
     end
+    if primary.ok and rules and (not rule_tuples_match(primary.nft_output, rules, pc_ip) or
+        not rule_tuples_match(reapply.nft_output, rules, pc_ip)) then
+        primary.ok = false
+        primary.status = "agent_tuple_mismatch"
+        primary.message = "Agent rule endpoints did not match the requested exact flows"
+        primary.verified_rule_count = 0
+    end
     return primary
+end
+
+local function retained_conntrack_flow(state, pc_ip, conn, dscp_value, now)
+    if type(state) ~= "table" or state.pc_ip ~= pc_ip or tonumber(state.dscp) ~= dscp_value or
+        type(state.rules) ~= "table" or not validate_port(tonumber(conn.local_port)) then return nil end
+    local up, down
+    for _, rule in ipairs(state.rules) do
+        if rule.game == conn.game and rule.proto == conn.proto and rule.remote_ip == conn.remote_ip and
+            tonumber(rule.remote_port) == tonumber(conn.remote_port) and
+            tonumber(rule.local_port) == tonumber(conn.local_port) and rule.dscp == DSCP_CLASS_BY_VALUE[dscp_value] then
+            if rule.direction == "UP" then up = rule elseif rule.direction == "DN" then down = rule end
+        end
+    end
+    if not up or not down or up.conntrack_missed_at ~= down.conntrack_missed_at then return nil end
+    local missed_at = tonumber(up.conntrack_missed_at or now)
+    if not missed_at or missed_at > now or now - missed_at >= CONNTRACK_RETRY_GRACE_SEC then return nil end
+    return { local_port = tonumber(up.local_port), remote_port = tonumber(up.remote_port), conntrack_missed_at = missed_at }
 end
 
 local function current_agent_status()
@@ -861,6 +917,8 @@ local function apply_connection_rules(pc_ip, connections, dscp_class, dscp_value
     local ignored_connections = 0
     local conntrack_resolved = 0
     local conntrack_unmatched = 0
+    local conntrack_retained = 0
+    local cached_verification
     local existing_state = read_agent_state()
 
     if not agent_chain_exists() then
@@ -882,10 +940,25 @@ local function apply_connection_rules(pc_ip, connections, dscp_class, dscp_value
             if validate_ip(conn.remote_ip) and validate_port(remote_port) then
                 local local_port = tonumber(conn.local_port)
                 local resolved = find_router_conntrack_flow(conntrack_lines, pc_ip, conn.remote_ip, remote_port, local_port)
+                if not resolved then
+                    conntrack_unmatched = conntrack_unmatched + 1
+                    local retained = retained_conntrack_flow(existing_state, pc_ip, conn, dscp_value, os.time())
+                    if retained then
+                        if not cached_verification then
+                            cached_verification = verify_agent_chains(existing_state.rule_count, dscp_class, dscp_value,
+                                existing_state.rules, pc_ip)
+                        end
+                        if cached_verification.ok then
+                            resolved = retained
+                            conntrack_retained = conntrack_retained + 1
+                        end
+                    end
+                else
+                    conntrack_resolved = conntrack_resolved + 1
+                end
                 if resolved then
                     remote_port = resolved.remote_port
                     local_port = resolved.local_port
-                    conntrack_resolved = conntrack_resolved + 1
 
                     buffer[#buffer + 1] = string.format(
                         'add rule %s %s ip saddr %s ip daddr %s %s sport %d %s dport %d %s',
@@ -897,9 +970,9 @@ local function apply_connection_rules(pc_ip, connections, dscp_class, dscp_value
                         NFT_TABLE, NFT_REAPPLY_CHAIN, pc_ip, conn.remote_ip, proto, local_port, proto, remote_port,
                         agent_reapply_actions(dscp_class)
                     )
-                    rules_meta[#rules_meta + 1] = mark_rule_meta_source(
-                        make_rule_meta(game, "UP", proto, conn.remote_ip, remote_port, local_port, dscp_class),
-                        "router_conntrack")
+                    local up_meta = make_rule_meta(game, "UP", proto, conn.remote_ip, remote_port, local_port, dscp_class)
+                    up_meta.conntrack_missed_at = resolved.conntrack_missed_at
+                    rules_meta[#rules_meta + 1] = mark_rule_meta_source(up_meta, "router_conntrack")
 
                     buffer[#buffer + 1] = string.format(
                         'add rule %s %s ip saddr %s ip daddr %s %s sport %d %s dport %d %s',
@@ -911,12 +984,11 @@ local function apply_connection_rules(pc_ip, connections, dscp_class, dscp_value
                         NFT_TABLE, NFT_REAPPLY_CHAIN, conn.remote_ip, pc_ip, proto, remote_port, proto, local_port,
                         agent_reapply_actions(dscp_class)
                     )
-                    rules_meta[#rules_meta + 1] = mark_rule_meta_source(
-                        make_rule_meta(game, "DN", proto, conn.remote_ip, remote_port, local_port, dscp_class),
-                        "router_conntrack")
+                    local down_meta = make_rule_meta(game, "DN", proto, conn.remote_ip, remote_port, local_port, dscp_class)
+                    down_meta.conntrack_missed_at = resolved.conntrack_missed_at
+                    rules_meta[#rules_meta + 1] = mark_rule_meta_source(down_meta, "router_conntrack")
                     rules_added = rules_added + 2
                 else
-                    conntrack_unmatched = conntrack_unmatched + 1
                     ignored_connections = ignored_connections + 1
                 end
             else
@@ -928,8 +1000,9 @@ local function apply_connection_rules(pc_ip, connections, dscp_class, dscp_value
     end
 
     if rules_added > 0 and state_matches_desired_rules(existing_state, rules_added, rules_meta, dscp_value) then
-        local verification = verify_agent_chains(rules_added, dscp_class, dscp_value)
+        local verification = verify_agent_chains(rules_added, dscp_class, dscp_value, rules_meta, pc_ip)
         if verification and verification.ok then
+            verification.conntrack_retained = conntrack_retained
             return rules_added, nil, verification, rules_meta, ignored_connections,
                 conntrack_resolved, conntrack_unmatched, true
         end
@@ -951,7 +1024,9 @@ local function apply_connection_rules(pc_ip, connections, dscp_class, dscp_value
         return nil, "Failed to apply nft agent rules", nil, rules_meta, ignored_connections, conntrack_resolved, conntrack_unmatched
     end
 
-    return rules_added, nil, verify_agent_chains(rules_added, dscp_class, dscp_value),
+    local verification = verify_agent_chains(rules_added, dscp_class, dscp_value, rules_meta, pc_ip)
+    verification.conntrack_retained = conntrack_retained
+    return rules_added, nil, verification,
         rules_meta, ignored_connections, conntrack_resolved, conntrack_unmatched, false
 end
 -- Main CGI handler
@@ -1106,6 +1181,7 @@ local function main()
                     dscp_rule_count = verification.dscp_rule_count,
                     conntrack_resolved = conntrack_resolved or 0,
                     conntrack_unmatched = conntrack_unmatched or 0,
+                    conntrack_retained = verification.conntrack_retained or 0,
                     rules_reused = rules_reused and true or false,
                     session_id = state_session_id,
                     rule_shape = "dscp_only"
@@ -1144,6 +1220,7 @@ local function main()
             dscp_rule_count = verification and verification.dscp_rule_count or 0,
             conntrack_resolved = conntrack_resolved or 0,
             conntrack_unmatched = conntrack_unmatched or 0,
+            conntrack_retained = verification and verification.conntrack_retained or 0,
             verification_ok = verification and verification.ok or false,
             verification_status = verification and verification.status or "not_run",
             ignored_connections = ignored_connections or 0,
