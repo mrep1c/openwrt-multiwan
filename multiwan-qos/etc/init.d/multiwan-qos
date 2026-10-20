@@ -399,10 +399,10 @@ log_msg() {
             '') printf '\n' ;; # print out empty lines
             *)
                 case "$err_l" in
-                    err|warn) msgs_dest="/dev/stderr" ;;
-                    *) msgs_dest="/dev/stdout"
+                    err|warn) msgs_dest=2 ;;
+                    *) msgs_dest=1
                 esac
-                printf '%s\n' "${msgs_prefix}${_arg}" > "$msgs_dest"
+                printf '%s\n' "${msgs_prefix}${_arg}" >&"$msgs_dest"
                 logger -t multiwan_qos -p user."$err_l" "${msgs_prefix}${_arg}"
                 msgs_prefix=''
         esac
@@ -1623,7 +1623,7 @@ validate_nft_file() {
 # Args: $1=file_path, $2=tmp_file
 validate_inline_rules() {
     local file_path="$1" tmp_file="$2"
-    local check_file="/tmp/multiwan_qos_inline_init_check.nft"
+    local check_file
     
     echo "  - Checking for forbidden keywords (table, chain, hook, priority)..." >> "$tmp_file"
     
@@ -1636,12 +1636,20 @@ validate_inline_rules() {
         "  - Checking NFT syntax (within context)..." >> "$tmp_file"
     
     # Create temporary file with context
-    {
+    check_file="$(mktemp /tmp/multiwan_qos_inline_init_check.XXXXXX)" || {
+        echo "  - Could not create temporary inline rules file." >> "$tmp_file"
+        return 1
+    }
+    if ! {
         printf '%s\n\t%s\n' "table inet __multiwan_qos_validation_ctx {" \
-            "chain __dscptag_init_ctx {"
-        cat "$file_path"
+            "chain __dscptag_init_ctx {" &&
+        cat "$file_path" &&
         printf '\n\t%s\n%s\n' "}" "}"
-    } > "$check_file"
+    } > "$check_file"; then
+        rm -f "$check_file"
+        echo "  - Could not write temporary inline rules file." >> "$tmp_file"
+        return 1
+    fi
     
     if nft --check --file "$check_file" 2>>"$tmp_file"; then
         echo "  - Syntax check PASSED." >> "$tmp_file"

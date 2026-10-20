@@ -47,15 +47,15 @@ type error_out >/dev/null 2>&1 || error_out() { log_msg -err "${@}"; }
 # Only define print_msg/log_msg if not already loaded from init script (#11)
 if ! type print_msg >/dev/null 2>&1; then
 print_msg() {
-    local _arg msgs_dest="/dev/stdout" msgs_prefix=''
+    local _arg msgs_dest=1 msgs_prefix=''
     for _arg in "$@"
     do
         case "${_arg}" in
-            -err) msgs_dest="/dev/stderr" msgs_prefix="Error: " ;;
-            -warn) msgs_dest="/dev/stderr" msgs_prefix="Warning: " ;;
+            -err) msgs_dest=2 msgs_prefix="Error: " ;;
+            -warn) msgs_dest=2 msgs_prefix="Warning: " ;;
             '') printf '\n' ;; # print out empty lines
             *)
-                printf '%s\n' "${msgs_prefix}${_arg}" > "$msgs_dest"
+                printf '%s\n' "${msgs_prefix}${_arg}" >&"$msgs_dest"
                 msgs_prefix=''
         esac
     done
@@ -76,10 +76,10 @@ log_msg() {
             '') printf '\n' ;; # print out empty lines
             *)
                 case "$err_l" in
-                    err|warn) msgs_dest="/dev/stderr" ;;
-                    *) msgs_dest="/dev/stdout"
+                    err|warn) msgs_dest=2 ;;
+                    *) msgs_dest=1
                 esac
-                printf '%s\n' "${msgs_prefix}${_arg}" > "$msgs_dest"
+                printf '%s\n' "${msgs_prefix}${_arg}" >&"$msgs_dest"
                 logger -t multiwan_qos -p user."$err_l" "${msgs_prefix}${_arg}"
                 msgs_prefix=''
         esac
@@ -204,14 +204,20 @@ cake_memory_limit() {
 }
 
 # Get CAKE parameters from common link settings
-# $1 = preset, $2 = overhead, $3 = mpu, $4 = "hybrid" (optional)
+# $1 = preset, $2 = overhead, $3 = mpu, $4 = "hybrid", $5 = direction (optional)
 get_cake_link_params() {
     local preset="$1"
     local oh="$2"
     local mpu="$3"
-    local mode="$4"
+    local mode="${4:-}"
     local base=""
     local vlan_keyword="${ETHER_VLAN_KEYWORD:+ $ETHER_VLAN_KEYWORD}"
+
+    # The parent STAB already adjusts packet lengths throughout the hierarchy.
+    if [ "$mode" = "hybrid" ] && should_apply_root_stab "${5:-wan}"; then
+        printf '%s' raw
+        return 0
+    fi
 
     # Determine base keyword and default overhead
     case "$preset" in
@@ -441,18 +447,18 @@ create_nft_sets() {
             if [ -n "$ip_list" ]; then
                 if [ "$family" = "ipv6" ]; then
                     debug_log "Creating static IPv6 set: $name"
-                    echo "set $name { type ipv6_addr; flags $set_flags; elements = { $(echo "$ip_list" | tr ' ' ',') }; }"
+                    echo "set $name { type ipv6_addr; flags $set_flags; auto-merge; elements = { $(echo "$ip_list" | tr ' ' ',') }; }"
                 else
                     debug_log "Creating static IPv4 set: $name"
-                    echo "set $name { type ipv4_addr; flags $set_flags; elements = { $(echo "$ip_list" | tr ' ' ',') }; }"
+                    echo "set $name { type ipv4_addr; flags $set_flags; auto-merge; elements = { $(echo "$ip_list" | tr ' ' ',') }; }"
                 fi
             else
                 if [ "$family" = "ipv6" ]; then
                     debug_log "Creating empty static IPv6 set: $name"
-                    echo "set $name { type ipv6_addr; flags $set_flags; }"
+                    echo "set $name { type ipv6_addr; flags $set_flags; auto-merge; }"
                 else
                     debug_log "Creating empty static IPv4 set: $name"
-                    echo "set $name { type ipv4_addr; flags $set_flags; }"
+                    echo "set $name { type ipv4_addr; flags $set_flags; auto-merge; }"
                 fi
             fi
         fi
@@ -1363,13 +1369,20 @@ INLINE_FILE="/etc/multiwan-qos.d/inline_dscptag.nft"
 INLINE_INCLUDE=""
 
 if [ -s "$INLINE_FILE" ]; then
-    TMP_CHECK_FILE="/tmp/multiwan_qos_inline_sh_check.nft"
+    TMP_CHECK_FILE="$(mktemp /tmp/multiwan_qos_inline_sh_check.XXXXXX)" || {
+        error_out "Failed to create temporary inline rules file."
+        exit 1
+    }
 
-    {
-        printf '%s\n\t%s\n' "table inet __multiwan_qos_sh_ctx {" "chain __dscptag_sh_ctx {"
-        cat "$INLINE_FILE"
+    if ! {
+        printf '%s\n\t%s\n' "table inet __multiwan_qos_sh_ctx {" "chain __dscptag_sh_ctx {" &&
+        cat "$INLINE_FILE" &&
         printf "\n\t%s\n%s\n" "}" "}"
-    } > "$TMP_CHECK_FILE"
+    } > "$TMP_CHECK_FILE"; then
+        rm -f "$TMP_CHECK_FILE"
+        error_out "Failed to write temporary inline rules file."
+        exit 1
+    fi
 
     if nft --check --file "$TMP_CHECK_FILE" 2>/dev/null; then
         INLINE_INCLUDE="include \"$INLINE_FILE\""
@@ -2326,7 +2339,7 @@ setup_hybrid_realtime_first() {
         "$GAMERATE" "2:1" ||
         qdisc_setup_failed "Failed to set up $gameqdisc game qdisc on $DEV."
 
-    cake_link_params="$(get_cake_link_params "$PRESET" "$OVERHEAD" "$MPU" "hybrid")"
+    cake_link_params="$(get_cake_link_params "$PRESET" "$OVERHEAD" "$MPU" "hybrid" "$DIR")"
     CAKE_OPTS=""
     if [ "$DIR" = "wan" ]; then
         CAKE_OPTS="besteffort"
@@ -2434,7 +2447,7 @@ setup_hybrid() {
 
     # Attach CAKE as a work-conserving leaf. HFSC owns shaping in Hybrid; a
     # shaped CAKE child can become non-work-conserving and build stale queues.
-    local cake_link_params="$(get_cake_link_params "$PRESET" "$OVERHEAD" "$MPU" "hybrid")"
+    local cake_link_params="$(get_cake_link_params "$PRESET" "$OVERHEAD" "$MPU" "hybrid" "$DIR")"
     local CAKE_OPTS=""
     tc qdisc del dev "$DEV" parent 1:13 handle 13: > /dev/null 2>&1
     

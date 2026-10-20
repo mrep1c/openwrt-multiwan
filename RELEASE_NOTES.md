@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixes NFT route copying for dead/linkdown flags, static QoS IP set overlaps, redirected QoS logging, and duplicate Hybrid CAKE overhead when parent STAB is active.
+- Uses unique inline-rule scratch files, adds NFT route and QoS regression checks to compatibility CI, and updates build SDKs to OpenWrt 25.12.6 and 24.10.8.
 - Adds an Adaptive start/idle-rate selector for the existing 1000 kbit/s baseline and a new 1500 kbit/s baseline, raises demand headroom from 200 to 300 kbit/s for both choices, and retains the 25% link cap and fixed finite-queue profile.
 
 ## v1.0.27

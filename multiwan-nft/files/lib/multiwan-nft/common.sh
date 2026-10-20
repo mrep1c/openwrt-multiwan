@@ -204,7 +204,7 @@ multiwan_nft_has_enabled_family()
 
 multiwan_nft_init()
 {
-	local bitcnt mmdefault source_routing mask_file mask_tmp cached_mask normalized_mask
+	local bitcnt mmdefault route_modifiers source_routing mask_file mask_tmp cached_mask normalized_mask
 
 	config_load 'multiwan-nft'
 
@@ -248,10 +248,13 @@ multiwan_nft_init()
 	[ "$MULTIWAN_NFT_INTERFACE_MAX" -lt 0 ] && MULTIWAN_NFT_INTERFACE_MAX=0
 	LOG debug "Max interface count is ${MULTIWAN_NFT_INTERFACE_MAX}"
 
-	# remove "linkdown", expiry and source based routing modifiers from route lines
+	# Remove unsupported flags, expiry and source based routing modifiers.
 	config_get_bool source_routing globals source_routing 0
 	[ "$source_routing" -eq 1 ] && unset source_routing
-	MULTIWAN_NFT_ROUTE_LINE_EXP="s/offload//; s/linkdown //; s/expires [0-9]\+sec//; s/error [0-9]\+//; ${source_routing:+s/default\(.*\) from [^ ]*/default\1/;} p"
+	route_modifiers="s/offload//; s/ dead / /; s/ dead$/ /;"
+	route_modifiers="$route_modifiers s/ linkdown / /; s/ linkdown$/ /;"
+	route_modifiers="$route_modifiers s/expires [0-9]\+sec//; s/error [0-9]\+//;"
+	MULTIWAN_NFT_ROUTE_LINE_EXP="$route_modifiers ${source_routing:+s/default\(.*\) from [^ ]*/default\1/;} p"
 
 	# mark mask constants
 	bitcnt=$(multiwan_nft_count_one_bits MMX_MASK)

@@ -1,20 +1,28 @@
-name: Test QoS compatibility
+name: Test QoS and NFT compatibility
 
 on:
   pull_request:
     paths:
       - "multiwan-qos/**"
       - "luci-app-multiwan-qos/**"
+      - "multiwan-nft/**"
+      - "luci-app-multiwan-nft/**"
       - "scripts/install-qos.sh"
+      - "scripts/install-nft.sh"
       - "tests/test-qos-*"
+      - "tests/test-nft-*"
       - ".github/workflows/test-qos-shell.yml"
   push:
     branches: [main]
     paths:
       - "multiwan-qos/**"
       - "luci-app-multiwan-qos/**"
+      - "multiwan-nft/**"
+      - "luci-app-multiwan-nft/**"
       - "scripts/install-qos.sh"
+      - "scripts/install-nft.sh"
       - "tests/test-qos-*"
+      - "tests/test-nft-*"
       - ".github/workflows/test-qos-shell.yml"
   workflow_dispatch:
 
@@ -46,6 +54,12 @@ jobs:
             luci-app-multiwan-qos/root/usr/libexec/rpcd/luci.multiwan_qos_stats
             multiwan-qos/etc/hotplug.d/iface/13-multiwan-qos-hotplug
             scripts/install-qos.sh
+            multiwan-nft/files/lib/multiwan-nft/*.sh
+            multiwan-nft/files/etc/init.d/multiwan-nft
+            multiwan-nft/files/etc/hotplug.d/iface/*
+            multiwan-nft/files/usr/sbin/*
+            multiwan-nft/files/usr/libexec/rpcd/*
+            scripts/install-nft.sh
           "
           for file in $files; do
             dash -n "$file"
@@ -60,6 +74,8 @@ jobs:
           busybox ash tests/test-qos-runtime-state.sh
           busybox ash tests/test-qos-lifecycle.sh
           busybox ash tests/test-qos-fixes.sh
+          busybox ash tests/test-qos-upstream-fixes.sh
+          busybox ash tests/test-nft-routes.sh
 
       - name: Run QoS regression tests with dash
         run: |
@@ -69,6 +85,8 @@ jobs:
           dash tests/test-qos-runtime-state.sh
           dash tests/test-qos-lifecycle.sh
           dash tests/test-qos-fixes.sh
+          dash tests/test-qos-upstream-fixes.sh
+          dash tests/test-nft-routes.sh
 
       - name: Run QoS UI regression tests
         run: node tests/test-qos-ui.js
