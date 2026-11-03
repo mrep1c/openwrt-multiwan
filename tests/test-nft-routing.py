@@ -443,6 +443,10 @@ def dynamic_routing():
     run(peer_command("world", "ip", "addr", "add", "203.0.113.10/32", "dev", "lo"))
     run(peer_command("world", "ip", "-6", "addr", "add", "2001:db8:ffff::10/128", "dev", "lo", "nodad"))
     run(peer_command("world", "ip", "-6", "route", "add", "2001:db8:10::/64", "via", "2001:db8:102::2"))
+    # Disable inherited per-device RPF so synthetic providers permit asymmetric paths.
+    for namespace in ("world", "wan1", "wan2"):
+        previous = run(peer_command(namespace, "sh", "-ec", 'for path in /proc/sys/net/ipv4/conf/*/rp_filter; do printf "%s=%s\\n" "$path" "$(cat "$path")"; printf 0 > "$path"; [ "$(cat "$path")" = 0 ]; done'))
+        print("DYNAMIC_RPF " + json.dumps({"namespace": namespace, "previous": previous, "applied": 0}), flush=True)
     server("world", "world4", "203.0.113.10", 45000)
     server("world", "world6", "2001:db8:ffff::10", 45000)
     rules = []
