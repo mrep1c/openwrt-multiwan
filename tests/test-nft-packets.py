@@ -19,7 +19,7 @@ def run(args, **kwargs):
 
 if "--isolated" not in sys.argv:
     raise SystemExit(subprocess.call([
-        "unshare", "-Urn", sys.executable, __file__, "--isolated", *sys.argv[1:]
+        "unshare", "-n" if os.geteuid() == 0 else "-Urn", sys.executable, __file__, "--isolated", *sys.argv[1:]
     ]))
 
 REPO = Path(sys.argv[-1]).resolve()

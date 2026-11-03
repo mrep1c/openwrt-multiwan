@@ -71,6 +71,7 @@ fi
 # The namespace child may not traverse the runner's private home directory.
 TEST_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="${TEST_DIR%/tests}"
+ulimit -S -n 2048
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/multiwan-nft-sockopt.XXXXXX")" || exit 1
 trap 'rm -rf "$TEST_ROOT"' EXIT HUP INT TERM
 "${CC:-cc}" -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC -shared \
@@ -394,4 +395,6 @@ int main(int argc, char **argv)
 }
 C
 "${CC:-cc}" -std=gnu11 -O2 -Wall -Wextra -Werror -pthread "$TEST_ROOT/probe.c" -o "$TEST_ROOT/probe"
-unshare -Urn /bin/sh "$0" --inside "$TEST_ROOT"
+namespace_flags=-Urn
+[ "$(id -u)" != 0 ] || namespace_flags=-n
+unshare "$namespace_flags" /bin/sh "$0" --inside "$TEST_ROOT"

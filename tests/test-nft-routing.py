@@ -95,7 +95,7 @@ if len(sys.argv) > 1 and sys.argv[1] == "--session":
     raise SystemExit
 if "--isolated" not in sys.argv:
     environment = {**os.environ, "NFT_ROUTING_PARENT_NETNS": os.readlink("/proc/self/ns/net")}
-    raise SystemExit(subprocess.call(["unshare", "-Urn", sys.executable, __file__, "--isolated", *sys.argv[1:]], env=environment))
+    raise SystemExit(subprocess.call(["unshare", "-n" if os.geteuid() == 0 else "-Urn", sys.executable, __file__, "--isolated", *sys.argv[1:]], env=environment))
 parent_namespace = os.environ.get("NFT_ROUTING_PARENT_NETNS")
 assert parent_namespace and parent_namespace != os.readlink("/proc/self/ns/net"), "Refusing network mutation without a fresh namespace"
 
