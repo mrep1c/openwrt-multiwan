@@ -1,9 +1,6 @@
 #!/bin/sh
 
 set -eu
-TEST_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-REPO_ROOT="${TEST_DIR%/tests}"
-
 if [ "${1:-}" = --inside ]; then
     TEST_ROOT="$2"
     ip link set lo up
@@ -71,6 +68,9 @@ NFT
     exit 0
 fi
 
+# The namespace child may not traverse the runner's private home directory.
+TEST_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REPO_ROOT="${TEST_DIR%/tests}"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/multiwan-nft-sockopt.XXXXXX")" || exit 1
 trap 'rm -rf "$TEST_ROOT"' EXIT HUP INT TERM
 "${CC:-cc}" -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC -shared \
