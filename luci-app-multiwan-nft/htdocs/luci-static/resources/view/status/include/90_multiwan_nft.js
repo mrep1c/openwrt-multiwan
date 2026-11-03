@@ -25,10 +25,16 @@ return baseclass.extend({
 	},
 
 	render: function (result) {
-		if (!result[0].interfaces)
-			return null;
-
 		var container = E('div', { 'id': 'multiwan_nft-service-status' });
+		if (result[0].reconfiguration_pending)
+			container.appendChild(E('div', { 'class': 'alert-message warning' }, [ _('Routing configuration is incomplete. Affected connections remain blocked. Check the system log if this persists.') ]));
+		if (result[0].running === false) {
+			container.appendChild(E('div', { 'class': 'alert-message warning' }, [ _('MultiWAN routing is stopped.') ]));
+			return container;
+		}
+		if (!result[0].interfaces)
+			return result[0].reconfiguration_pending ? container : null;
+
 		var iface;
 		for ( iface in result[0].interfaces) {
 			var state = '';
@@ -61,11 +67,25 @@ return baseclass.extend({
 						tname = '';
 					}
 					break;
-				default:
+				case 'waiting':
+					state = _('Waiting for interface');
+					css = 'alert-message warning';
+					break;
+				case 'connecting':
+					state = _('Connecting');
+					css = 'alert-message warning';
+					break;
+				case 'disconnecting':
+					state = _('Disconnecting');
+					css = 'alert-message warning';
+					break;
+				case 'disabled':
 					css = 'alert-message warning';
 					state = _('Disabled');
-					time = '';
-					tname = '';
+					break;
+				default:
+					css = 'alert-message warning';
+					state = _('Unknown');
 					break;
 			}
 

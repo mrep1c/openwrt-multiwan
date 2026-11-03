@@ -1,9 +1,10 @@
 #!/bin/sh
 
-. /lib/functions.sh
-. /usr/share/libubox/jshn.sh
-. /lib/functions/network.sh
-. /lib/multiwan-nft/multiwan_nft.sh
+MULTIWAN_NFT_LIB_ROOT="${MULTIWAN_NFT_LIB_ROOT:-/lib}"
+. "$MULTIWAN_NFT_LIB_ROOT/functions.sh"
+. "${IPKG_INSTROOT}/usr/share/libubox/jshn.sh"
+. "$MULTIWAN_NFT_LIB_ROOT/functions/network.sh"
+. "$MULTIWAN_NFT_LIB_ROOT/multiwan-nft/multiwan_nft.sh"
 
 command_help() {
 	local cmd="$1"
@@ -34,88 +35,88 @@ EOF
 }
 
 ifdown() {
-	if [ -z "$1" ]; then
-		echo "Error: Expecting interface. Usage: multiwan-nft ifdown <interface>"
-		exit 1
+	if [ -z "${1:-}" ]; then
+		echo "Error: Expecting interface. Usage: multiwan-nft ifdown <interface>" >&2
+		return 2
 	fi
 
-	if [ -n "$2" ]; then
-		echo "Error: Too many arguments. Usage: multiwan-nft ifdown <interface>"
-		exit 1
+	if [ "$#" -gt 1 ]; then
+		echo "Error: Too many arguments. Usage: multiwan-nft ifdown <interface>" >&2
+		return 2
 	fi
 
+	multiwan_nft_init || return
 	multiwan_nft_interface_hotplug_shutdown "$1" 1
 }
 
 ifup() {
-	. /etc/init.d/multiwan-nft
-
-	if [ -z "$1" ]; then
-		echo "Expecting interface. Usage: multiwan-nft ifup <interface>"
-		exit 1
+	if [ -z "${1:-}" ]; then
+		echo "Expecting interface. Usage: multiwan-nft ifup <interface>" >&2
+		return 2
 	fi
 
-	if [ -n "$2" ]; then
-		echo "Too many arguments. Usage: multiwan-nft ifup <interface>"
-		exit 1
+	if [ "$#" -gt 1 ]; then
+		echo "Too many arguments. Usage: multiwan-nft ifup <interface>" >&2
+		return 2
 	fi
 
+	multiwan_nft_init || return
 	multiwan_nft_ifup "$1" "cmd"
 }
 
 interfaces()
 {
-	config_load 'multiwan-nft'
+	config_load 'multiwan-nft' || return
 
 	echo "Interface status:"
-	config_foreach multiwan_nft_report_iface_status interface
+	config_foreach multiwan_nft_report_iface_status interface || return
 	echo
 }
 
 policies()
 {
 	echo "Current ipv4 policies:"
-	multiwan_nft_report_policies_v4
+	multiwan_nft_report_policies_v4 || return
 	echo
-	[ "$NO_IPV6" -ne 0 ] && return
+	[ "$NO_IPV6" -eq 0 ] || return 0
 	echo "Current ipv6 policies:"
-	multiwan_nft_report_policies_v6
+	multiwan_nft_report_policies_v6 || return
 	echo
 }
 
 connected()
 {
 	echo "Directly connected ipv4 networks:"
-	multiwan_nft_report_connected_v4
+	multiwan_nft_report_connected_v4 || return
 	echo
-	[ "$NO_IPV6" -ne 0 ] && return
+	[ "$NO_IPV6" -eq 0 ] || return 0
 	echo "Directly connected ipv6 networks:"
-	multiwan_nft_report_connected_v6
+	multiwan_nft_report_connected_v6 || return
 	echo
 }
 
 rules()
 {
 	echo "Active ipv4 user rules:"
-	multiwan_nft_report_rules_v4
+	multiwan_nft_report_rules_v4 || return
 	echo
-	[ "$NO_IPV6" -ne 0 ] && return
+	[ "$NO_IPV6" -eq 0 ] || return 0
 	echo "Active ipv6 user rules:"
-	multiwan_nft_report_rules_v6
+	multiwan_nft_report_rules_v6 || return
 	echo
 }
 
 status()
 {
-	interfaces
-	policies
-	connected
+	interfaces || return
+	policies || return
+	connected || return
 	rules
 }
 
 internal()
 {
-	local family="$1"
+	local family="${1:-ipv4}"
 	local dash="-------------------------------------------------"
 
 	if [ -f "/etc/openwrt_release" ]; then
@@ -133,7 +134,7 @@ internal()
 	echo "Software-Version"
 	echo "$dash"
 
-	if [ "$DISTRIB_RELEASE" != "" ]; then
+	if [ -n "${DISTRIB_RELEASE:-}" ]; then
 		echo "OpenWrt - $DISTRIB_RELEASE"
 	else
 		echo "OpenWrt - unknown"
@@ -197,62 +198,87 @@ internal()
 }
 
 start() {
-	/etc/init.d/multiwan-nft enable
+	/etc/init.d/multiwan-nft enable || return
 	/etc/init.d/multiwan-nft start
 }
 
 stop() {
-	/etc/init.d/multiwan-nft disable
+	/etc/init.d/multiwan-nft disable || return
 	/etc/init.d/multiwan-nft stop
 }
 
 restart() {
-	/etc/init.d/multiwan-nft enable
-	/etc/init.d/multiwan-nft stop
+	/etc/init.d/multiwan-nft enable || return
+	/etc/init.d/multiwan-nft stop || return
 	/etc/init.d/multiwan-nft start
 }
 
 use() {
-	# Run a command with the device, src_ip and fwmark set to avoid processing by multiwan_nft
-	# firewall rules
-
-	local interface device src_ip family
-	multiwan_nft_init
-
-	interface=$1 ; shift
-	[ -z "$*" ] && echo "no command specified for multiwan_nft use" && return
-	network_get_device device $interface
-	[ -z "$device" ] && echo "could not find device for $interface" && return
-
-	multiwan_nft_get_src_ip src_ip $interface
-	[ -z "$src_ip" ] && echo "could not find src_ip for $interface" && return
-
-	config_get family $interface family
-	[ -z "$family" ] && echo "could not find family for $interface. Using ipv4." && family='ipv4'
-
-	echo "Running '$*' with DEVICE=$device SRCIP=$src_ip FWMARK=$MMX_DEFAULT FAMILY=$family"
-	
-	# Check if libwrap library exists
-	if [ -f "/lib/multiwan-nft/libwrap_mwan3_sockopt.so.1.0" ]; then
-		# shellcheck disable=SC2048
-		FAMILY=$family DEVICE=$device SRCIP=$src_ip FWMARK=$MMX_DEFAULT LD_PRELOAD=/lib/multiwan-nft/libwrap_mwan3_sockopt.so.1.0 $*
-	else
-		# Fallback: run command with interface binding if it's a network command
-		echo "Note: libwrap library not found, using native interface binding"
-		# shellcheck disable=SC2048
-		$*
+	local interface device src_ip family true_iface library
+	if [ "$#" -lt 2 ] || [ -z "$1" ]; then
+		echo "Usage: multiwan-nft use <interface> <command> [arguments...]" >&2
+		return 2
 	fi
+	interface="$1"
+	shift
+	config_get family "$interface" family ipv4
+	case "$family" in ipv4|ipv6) ;; *) echo "Invalid address family for interface $interface" >&2; return 1 ;; esac
+	multiwan_nft_get_true_iface true_iface "$interface"
+	network_get_device device "$true_iface"
+	[ -n "$device" ] || { echo "Could not find device for $interface" >&2; return 1; }
+	multiwan_nft_get_src_ip src_ip "$interface"
+	case "$src_ip" in ''|0.0.0.0|::) echo "Could not find source address for $interface" >&2; return 1 ;; esac
+	library="$MULTIWAN_NFT_LIB_ROOT/multiwan-nft/libwrap_mwan3_sockopt.so.1.0"
+	[ -r "$library" ] || { echo "Interface binding library is missing: $library" >&2; return 1; }
+	printf 'Running command through %s (device %s, source %s, family %s)\n' "$interface" "$device" "$src_ip" "$family" >&2
+	FAMILY="$family" DEVICE="$device" SRCIP="$src_ip" FWMARK="$MMX_DEFAULT" \
+		LD_PRELOAD="$library${LD_PRELOAD:+:$LD_PRELOAD}" exec "$@"
 }
 
-case "$1" in
-	ifup|ifdown|interfaces|policies|connected|rules|status|start|stop|restart|use|internal)
-		multiwan_nft_init
-		# shellcheck disable=SC2048
-		$*
-	;;
-	*)
-		help
-	;;
-esac
+main() {
+	local command="${1:-}" chains running
+	case "$command" in
+		''|help|-h|--help) help; return 0 ;;
+		ifup|ifdown|use) ;;
+		internal)
+			if [ "$#" -gt 2 ] || { [ "$#" -eq 2 ] && [ "$2" != ipv4 ] && [ "$2" != ipv6 ]; }; then
+				echo "Usage: multiwan-nft internal [ipv4|ipv6]" >&2
+				return 2
+			fi
+			;;
+		interfaces|policies|connected|rules|status|start|stop|restart)
+			[ "$#" -eq 1 ] || { echo "Unexpected arguments for $command" >&2; return 2; }
+			;;
+		*) echo "Unknown command: $command" >&2; help >&2; return 2 ;;
+	esac
+	shift
+	case "$command" in
+		ifup|ifdown|start|stop|restart) ;;
+		*) multiwan_nft_init readonly || return ;;
+	esac
+	case "$command" in
+		interfaces|policies|connected|rules|status|internal)
+			if multiwan_nft_reconfiguration_pending; then
+				echo 'Warning: Routing configuration is incomplete. Affected connections remain blocked. Check the system log if this persists.'
+			fi
+			if [ "$command" != internal ]; then
+				# A checked inventory distinguishes an absent hook from a failed read.
+				chains="$($NFT list chains "$NFT_FAMILY")" || return
+				running="$(printf '%s\n' "$chains" | awk -v family="$NFT_FAMILY" -v table="$NFT_TABLE" '
+					$1 == "table" { owned = ($2 == family && $3 == table) }
+					owned && $1 == "chain" && $2 == "multiwan_nft_hook" { found = 1 }
+					END { print found + 0 }')" || return
+				if [ "$running" -eq 0 ]; then
+					echo 'MultiWAN NFT is stopped.'
+					case "$command" in
+						interfaces|status) config_foreach multiwan_nft_report_iface_status interface stopped || return ;;
+					esac
+					return 0
+				fi
+			fi
+			;;
+	esac
+	"$command" "$@"
+}
 
-exit 0
+[ "${MULTIWAN_NFT_CLI_LIBRARY_ONLY:-0}" = 1 ] || main "$@"

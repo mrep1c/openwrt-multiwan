@@ -45,40 +45,12 @@ stop_subprocs() {
 }
 
 WRAP() {
-	# If libwrap exists, use it for proper fwmark binding
-	if [ -f /lib/multiwan-nft/libwrap_mwan3_sockopt.so.1.0 ]; then
-		# shellcheck disable=SC2048
-		FAMILY=$FAMILY DEVICE=$DEVICE SRCIP=$SRC_IP FWMARK=$MMX_DEFAULT LD_PRELOAD=/lib/multiwan-nft/libwrap_mwan3_sockopt.so.1.0 $*
-	else
-		# Fallback: use native interface binding (#23: handle all track methods)
-		local cmd="$1"
-		shift
-		case "$cmd" in
-			*ping*)
-				# Bind tracking probes to the real device. Binding only to
-				# the source address can still let policy/default routing send
-				# the probe through another WAN, which makes a healthy backup
-				# interface look down when the preferred WAN is wedged.
-				"$cmd" -I "$DEVICE" "$@"
-				;;
-			arping)
-				# arping already uses -I, just run as-is
-				"$cmd" "$@"
-				;;
-			httping)
-				# httping supports -b for source address binding
-				"$cmd" -b "$SRC_IP" "$@"
-				;;
-			nping)
-				# nping supports -S for source IP and -e for device
-				"$cmd" -S "$SRC_IP" -e "$DEVICE" "$@"
-				;;
-			*)
-				# For other commands, just run without special binding
-				"$cmd" "$@"
-				;;
-		esac
-	fi
+	local LC_ALL=C library="$MULTIWAN_NFT_LIB_ROOT/multiwan-nft/libwrap_mwan3_sockopt.so.1.0"
+	export LC_ALL
+	[ -r "$library" ] || { LOG err "Interface binding library is missing: $library"; return 1; }
+	# Like mwan3, preload binding requires dynamically linked probe binaries.
+	FAMILY="$FAMILY" DEVICE="$DEVICE" SRCIP="$SRC_IP" FWMARK="$MMX_DEFAULT" \
+		LD_PRELOAD="$library${LD_PRELOAD:+:$LD_PRELOAD}" "$@"
 }
 
 clean_up() {
@@ -90,6 +62,7 @@ clean_up() {
 if_down() {
 	LOG info "Detect ifdown event on interface ${INTERFACE} (${DEVICE})"
 	IFDOWN_EVENT=1
+	IFUP_EVENT=0
 	stop_subprocs
 }
 
@@ -135,6 +108,10 @@ validate_track_method() {
 			fi
 			;;
 		arping)
+			[ "$FAMILY" = "ipv6" ] && {
+				LOG warn "arping does not support IPv6. Please use another track method."
+				return 1
+			}
 			command -v arping 1>/dev/null 2>&1 || {
 				LOG warn "Missing arping. Please install iputils-arping package."
 				return 1
@@ -147,8 +124,24 @@ validate_track_method() {
 			}
 			;;
 		nping-*)
+			if [ "$1" = "nping-arp" ] && [ "$FAMILY" = "ipv6" ]; then
+				LOG warn "nping ARP tracking does not support IPv6. Please use another track method."
+				return 1
+			fi
 			command -v nping 1>/dev/null 2>&1 || {
-				LOG warn "Missing nping. Please install nping package."
+				LOG warn "Missing nping. Please install multiwan-nft-nping."
+				return 1
+			}
+			if [ "$FAMILY" = ipv6 ] && ! nping --version 2>/dev/null | awk '
+				$1 == "Nping" && $2 == "version" && $3 ~ /^[0-9]+[.][0-9]+$/ { split($3, v, "."); supported = v[1]+0 > 7 || (v[1]+0 == 7 && v[2]+0 >= 992) }
+				END { exit !supported }'; then
+				LOG warn "IPv6 Nping requires version 7.992 or newer. Please install multiwan-nft-nping."
+				return 1
+			fi
+			;;
+		nslookup)
+			command -v nslookup 1>/dev/null 2>&1 || {
+				LOG warn "Missing nslookup. Please install busybox package."
 				return 1
 			}
 			;;
@@ -160,9 +153,9 @@ validate_track_method() {
 }
 
 validate_wrap() {
-	# libwrap is optional - we have a fallback using native interface binding
-	[ -f /lib/multiwan-nft/libwrap_mwan3_sockopt.so.1.0 ] && return
-	LOG notice "libwrap_mwan3_sockopt not found, using native interface binding"
+	[ -r "$MULTIWAN_NFT_LIB_ROOT/multiwan-nft/libwrap_mwan3_sockopt.so.1.0" ] && return 0
+	LOG err "Missing interface binding library. Please reinstall multiwan-nft-sockopt."
+	return 1
 }
 
 disconnected() {
@@ -233,7 +226,7 @@ waiting() {
 }
 
 firstconnect() {
-	local true_iface
+	local true_iface committed_state
 	network_flush_cache
 
 	multiwan_nft_get_true_iface true_iface $INTERFACE
@@ -245,7 +238,11 @@ firstconnect() {
 		return
 	fi
 
-	if [ "$STATUS" != "online" ]; then
+	if [ "${1:-}" = refresh ]; then
+		committed_state=$(cat "$MULTIWAN_NFT_STATUS_DIR/iface_state/$INTERFACE" 2>/dev/null)
+		case "$committed_state" in online|offline) STATUS="$committed_state" ;; esac
+	fi
+	if [ "$STATUS" != "online" ] && [ "$STATUS" != "offline" ]; then
 		config_get STATUS $INTERFACE initial_state "online"
 	fi
 
@@ -259,6 +256,17 @@ firstconnect() {
 	else
 		connected 1
 	fi
+}
+
+refresh_expired_source() {
+	local addresses current_src
+	[ "$FAMILY" = ipv6 ] || return 0
+	addresses=$($IP6 address ls to "$SRC_IP/128" scope global 2>/dev/null) || return 0
+	printf '%s\n' "$addresses" | grep -q 'inet6 ' && return 0
+	# A delegated address can expire without another WAN address event.
+	network_flush_cache
+	multiwan_nft_get_src_ip current_src "$INTERFACE" || return 0
+	[ "$current_src" = "$SRC_IP" ] || firstconnect refresh
 }
 
 update_status() {
@@ -292,7 +300,7 @@ main() {
 	local keep_failure_interval check_quality failure_latency
 	local recovery_latency failure_loss recovery_loss
 
-	local max_ttl httping_ssl track_ips do_log
+	local max_ttl httping_ssl track_ips do_log httping_url ipv6_opt nping_source_opt
 	local target_count host_down_count round_state max_failures
 
 	INTERFACE=$1
@@ -301,6 +309,7 @@ main() {
 	TRACK_OUTPUT=$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/TRACK_OUTPUT
 
 	multiwan_nft_init || return 1
+	validate_wrap || return 1
 
 	mkdir -p "$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE"
 
@@ -346,7 +355,7 @@ main() {
 	config_list_foreach "$1" track_ip multiwan_nft_list_track_ips
 
 	case "$reliability:$count:$timeout:$interval:$down:$up:$failure_interval:$recovery_interval:$failure_latency:$recovery_latency:$failure_loss:$recovery_loss" in
-		*[!0-9:]*|:*|*::*)
+		*[!0-9:]*|:*|*:|*::*)
 			LOG err "Invalid non-numeric tracking configuration for interface $INTERFACE"
 			exit 1
 			;;
@@ -378,17 +387,19 @@ main() {
 		if [ "${IFDOWN_EVENT}" -eq 1 ]; then
 			LOG debug "Register ifdown event on interface ${INTERFACE} (${DEVICE})"
 			disconnected 0 ifdown
-			waiting "$INTERFACE"
+			STATUS=disabled
+			echo disabled > "$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE/STATUS"
+			STARTED=0
 			IFDOWN_EVENT=0
 		fi
 		if [ "${IFUP_EVENT}" -eq 1 ]; then
 			LOG debug "Register ifup event on interface ${INTERFACE} (${DEVICE})"
-			firstconnect
+			firstconnect refresh
 			IFUP_EVENT=0
 		fi
 
 		if [ "$STARTED" -eq 0 ]; then
-			firstconnect
+			[ "$STATUS" = disabled ] || firstconnect
 			if [ "$STARTED" -eq 0 ]; then
 				sleep "$READY_RECHECK_INTERVAL" &
 				SLEEP_PID=$!
@@ -399,6 +410,8 @@ main() {
 			SLEEP_START=""
 			continue
 		fi
+		refresh_expired_source
+		[ "$STARTED" -eq 1 ] || continue
 		sleep_time=$interval
 		last_failed_target=
 		round_state=neutral
@@ -427,13 +440,7 @@ main() {
 							ping_status=$?
 							TRACK_PID=""
 							TRACK_START=""
-							loss="$(sed $TRACK_OUTPUT -ne 's/.*\([0-9]\+\)% packet loss.*/\1/p')"
-							if [ "$ping_status" -ne 0 ] || [ "$loss" -eq 100 ]; then
-								latency=999999
-								loss=100
-							else
-								latency="$(sed $TRACK_OUTPUT -ne 's%\(rtt\|round-trip\).* = [^/]*/\([0-9]\+\).*%\2%p')"
-							fi
+							loss="$(sed -ne 's/.* \([0-9]\+\)% packet loss.*/\1/p' "$TRACK_OUTPUT")"
 						fi
 					;;
 					arping)
@@ -446,28 +453,70 @@ main() {
 						TRACK_START=""
 					;;
 					httping)
-						if [ "$httping_ssl" -eq 1 ]; then
-							WRAP httping -c $count -t $timeout -q "https://$track_ip" &> /dev/null &
+						ipv6_opt=
+						# HTTPing 3.5 expects an unbracketed IPv6 literal in its URL.
+						httping_url="http://$track_ip"
+						[ "$httping_ssl" -eq 1 ] && httping_url="https://$track_ip"
+						[ "$FAMILY" != ipv6 ] || ipv6_opt=-6
+						if [ "$check_quality" -eq 0 ]; then
+							WRAP httping $ipv6_opt -c $count -t $timeout -q "$httping_url" &> /dev/null &
 						else
-							WRAP httping -c $count -t $timeout -q "http://$track_ip" &> /dev/null &
+							quality_sample=1
+							WRAP httping $ipv6_opt -c $count -t $timeout "$httping_url" 2>/dev/null > "$TRACK_OUTPUT" &
 						fi
+						TRACK_PID=$!
+						TRACK_START="$(mw_process_start_time "$TRACK_PID")"
+						wait "$TRACK_PID"
+						result=$?
+						ping_status=$result
+						TRACK_PID=""
+						TRACK_START=""
+						if [ "$quality_sample" -eq 1 ]; then
+							loss="$(sed -ne 's/.* \([0-9]\+\(\.[0-9]\+\)\?\)% failed.*/\1/p' "$TRACK_OUTPUT" | awk '{ n=$1+0; print int(n)+(n>int(n)) }')"
+						fi
+					;;
+					nping-*)
+						# IPv6 --source-ip requires Ethernet MAC options; let the bound socket supply it.
+						nping_source_opt=
+						[ "$FAMILY" != ipv4 ] || nping_source_opt="--source-ip=$SRC_IP"
+						[ "$track_method" != nping-arp ] || nping_source_opt="--arp-sender-ip=$SRC_IP"
+						WRAP nping -${FAMILY#ipv} -e "$DEVICE" $nping_source_opt \
+							-c "$count" "$track_ip" --${track_method#nping-} > "$TRACK_OUTPUT" &
+						TRACK_PID=$!
+						TRACK_START="$(mw_process_start_time "$TRACK_PID")"
+						wait "$TRACK_PID"
+						ping_status=$?
+						result=1
+						if [ "$ping_status" -eq 0 ]; then
+							result="$(sed -ne 's/.*Lost: \([0-9]\+\).*/\1/p' "$TRACK_OUTPUT")"
+							case "$result" in ''|*[!0-9]*) result=1 ;; esac
+						fi
+						TRACK_PID=""
+						TRACK_START=""
+					;;
+					nslookup)
+						WRAP nslookup "-retry=$count" "-t=$timeout" www.google.com "$track_ip" > "$TRACK_OUTPUT" 2>&1 &
 						TRACK_PID=$!
 						TRACK_START="$(mw_process_start_time "$TRACK_PID")"
 						wait "$TRACK_PID"
 						result=$?
 						TRACK_PID=""
 						TRACK_START=""
-					;;
-					nping-*)
-						WRAP nping -${FAMILY#ipv} -c $count $track_ip --${track_method#nping-} > $TRACK_OUTPUT &
-						TRACK_PID=$!
-						TRACK_START="$(mw_process_start_time "$TRACK_PID")"
-						wait "$TRACK_PID"
-						result=$(grep Lost $TRACK_OUTPUT | awk '{print $12}')
-						TRACK_PID=""
-						TRACK_START=""
-					;;
+						if [ "$result" -eq 0 ]; then
+							awk '/^Name:[[:space:]]/ { answer=1 }
+								answer && /^[[:space:]]*Address(es|[[:space:]]+[0-9]+)?:[[:space:]]+[^[:space:]]/ { found=1 }
+								END { exit !found }' "$TRACK_OUTPUT" || result=1
+						fi
+						;;
 				esac
+				if [ "$quality_sample" -eq 1 ]; then
+					if [ "$ping_status" -ne 0 ] || [ "$loss" = 100 ]; then
+						latency=999999
+						loss=100
+					else
+						latency="$(sed -ne 's%\(rtt\|round-trip\).* = [^/]*/\([0-9]\+\(\.[0-9]\+\)\?\).*%\2%p' "$TRACK_OUTPUT" | awk '{ n=$1+0; print int(n)+(n>int(n)) }')"
+					fi
+				fi
 				do_log=""
 				if [ "$check_quality" -eq 0 ] || [ "$quality_sample" -eq 0 ]; then
 					if [ "$result" -eq 0 ]; then
@@ -487,7 +536,7 @@ main() {
 
 				else
 					case "$loss:$latency" in
-						*[!0-9:]*|:*|*::*) loss=100; latency=999999 ;;
+						*[!0-9:]*|:*|*:|*::*) loss=100; latency=999999 ;;
 					esac
 					if [ "$loss" -ge "$failure_loss" ] || [ "$latency" -ge "$failure_latency" ]; then
 						let lost++

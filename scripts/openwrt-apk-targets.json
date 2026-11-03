@@ -1,0 +1,5 @@
+[
+  {"target":"rockchip","subtarget":"armv8","architecture":"aarch64_generic"},
+  {"target":"ipq40xx","subtarget":"generic","architecture":"arm_cortex-a7_neon-vfpv4"},
+  {"target":"ramips","subtarget":"mt7621","architecture":"mipsel_24kc"}
+]

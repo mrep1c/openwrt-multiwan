@@ -11,8 +11,6 @@
 . /usr/share/libubox/jshn.sh
 . /lib/multiwan-nft/common.sh
 
-multiwan_nft_init
-
 IIF=1000
 FWMARK=2000
 ID=0
@@ -45,19 +43,22 @@ usage() {
 
 diag_gateway() {
 	local iface="$1"
-	local gw device
+	local gw device family true_iface
 
-	network_get_gateway gw "${iface}"
-	[ -z "$gw" ] && network_get_gateway gw "${iface}_4"
+	config_get family "$iface" family ipv4
+	multiwan_nft_get_true_iface true_iface "$iface"
+	if [ "$family" = ipv6 ]; then
+		network_get_gateway6 gw "$true_iface"
+	else
+		network_get_gateway gw "$true_iface"
+	fi
 
 	[ -z "$gw" ] && {
 		echo "No gateway for interface ${iface} found."
 		exit 2
 	}
 
-	# Get the device for this interface
-	network_get_device device "${iface}"
-	[ -z "$device" ] && network_get_device device "${iface}_4"
+	network_get_device device "$true_iface"
 
 	[ -z "$device" ] && {
 		echo "No device for interface ${iface} found."
@@ -65,16 +66,30 @@ diag_gateway() {
 	}
 
 	echo "Pinging gateway $gw via device $device..."
-	ping -c 5 -W 1 -I "$device" "$gw"
+	diag_ping "$family" -c 5 -W 1 -I "$device" "$gw"
+}
+
+diag_ping() {
+	local family="$1"
+	shift
+	if [ "$family" = ipv6 ]; then
+		if command -v ping6 >/dev/null 2>&1; then
+			ping6 "$@"
+		else
+			ping -6 "$@"
+		fi
+	else
+		ping "$@"
+	fi
 }
 
 diag_tracking() {
 	local iface="$1"
-	local device
+	local device family true_iface
 
-	# Get the device for this interface
-	network_get_device device "${iface}"
-	[ -z "$device" ] && network_get_device device "${iface}_4"
+	config_get family "$iface" family ipv4
+	multiwan_nft_get_true_iface true_iface "$iface"
+	network_get_device device "$true_iface"
 
 	[ -z "$device" ] && {
 		echo "No device for interface ${iface} found."
@@ -84,20 +99,21 @@ diag_tracking() {
 	checkips() {
 		local ip="$1"
 		local device="$2"
+		local family="$3"
 
 		echo "Pinging tracking IP $ip via device $device..."
-		ping -c 5 -W 1 -I "$device" "$ip"
+		diag_ping "$family" -c 5 -W 1 -I "$device" "$ip"
 	}
 
 	config_load 'multiwan-nft'
-	config_list_foreach "$iface" "track_ip" checkips "$device"
+	config_list_foreach "$iface" "track_ip" checkips "$device" "$family"
 }
 
 iface_number() {
 	local cfg="$1"
 	local iface="$2"
 
-	let number++
+	number=$((number + 1))
 
 	[ "$cfg" = "$iface" ] && {
 		ID="$number"
@@ -106,15 +122,10 @@ iface_number() {
 
 diag_rules() {
 	local iface="$1"
-
-	local number=0
-	local iif=0
-	local fwmark=0
-
-	local iif_rule iif_result
-	local fwmark_rule fwmark_result
+	local number=0 family IP device true_iface state rules iif_rule oif_rule fwmark_rule guard_rule
 
 	config_load 'multiwan-nft'
+	ID=0
 	config_foreach iface_number 'interface' "$iface"
 
 	[ "$ID" = "0" ] && {
@@ -122,36 +133,37 @@ diag_rules() {
 		exit 2
 	}
 
-	let "iif=$IIF+$ID"
-	let "fwmark=$FWMARK+$ID"
+	config_get family "$iface" family ipv4
+	[ "$family" = ipv6 ] && IP="$IP6" || IP="$IP4"
+	multiwan_nft_get_true_iface true_iface "$iface"
+	network_get_device device "$true_iface"
+	rules="$($IP rule list)" || return 1
+	iif_rule="$(printf '%s\n' "$rules" | awk -v pref="$((IIF + ID)):" -v dev="$device" -v table="$ID" '$1 == pref && index($0, "iif " dev " ") && $NF == table')"
+	oif_rule="$(printf '%s\n' "$rules" | awk -v pref="$((IIF + ID)):" -v dev="$device" -v table="$ID" '$1 == pref && index($0, "oif " dev " ") && $NF == table')"
+	fwmark_rule="$(printf '%s\n' "$rules" | awk -v pref="$((FWMARK + ID)):" '$1 == pref')"
+	guard_rule="$(printf '%s\n' "$rules" | awk -v pref="$((3000 + ID)):" '$1 == pref && $NF == "unreachable"')"
+	state="$(cat "$MULTIWAN_NFT_STATUS_DIR/iface_state/$iface" 2>/dev/null)"
 
-	iif_rule="$(ip rule | grep ${iif})"
-	iif_result="$?"
-
-	fwmark_rule="$(ip rule | grep ${fwmark})"
-	fwmark_result="$?"
-
-	if [ "$fwmark_result" = 0 ] && [ "$iif_result" = 0 ]; then
+	if [ "$state" = offline ]; then
+		if [ -n "$iif_rule" ] && [ -z "$fwmark_rule" ] && [ -n "$guard_rule" ]; then
+			echo "All required IP rules for offline interface \"$iface\" found (isolated for recovery)"
+		else
+			echo "Incomplete offline isolation rules for interface \"$iface\""
+		fi
+	elif [ -n "$iif_rule" ] && [ -n "$oif_rule" ] && [ -n "$fwmark_rule" ] && [ -n "$guard_rule" ]; then
 		echo "All required IP rules for interface \"$iface\" found"
-		echo "$fwmark_rule"
-		echo "$iif_rule"
-	elif [ "$fwmark_result" = 1 ] && [ "$iif_result" = 0 ]; then
-		echo "Only iif IP rule for interface \"$iface\" found"
-		echo "$iif_rule"
-	elif [ "$fwmark_result" = 0 ] && [ "$iif_result" = 1 ]; then
-		echo "Only fwmark IP rule for interface \"$iface\" found"
-		echo "$fwmark_rule"
 	else
-		echo "Missing fwmark and iif IP rule for interface \"$iface\""
+		echo "Incomplete IP rules for interface \"$iface\""
 	fi
+	printf '%s\n' "$rules" | awk -v iif="$((IIF + ID)):" -v mark="$((FWMARK + ID)):" -v guard="$((3000 + ID)):" '$1 == iif || $1 == mark || $1 == guard'
 }
 
 diag_routes() {
 	local iface="$1"
-
-	local table table_result
+	local table table_result family IP number=0
 
 	config_load 'multiwan-nft'
+	ID=0
 	config_foreach iface_number 'interface' "$iface"
 
 	[ "$ID" = "0" ] && {
@@ -159,7 +171,9 @@ diag_routes() {
 		exit 2
 	}
 
-	table="$(ip route list table $ID)"
+	config_get family "$iface" family ipv4
+	[ "$family" = ipv6 ] && IP="$IP6" || IP="$IP4"
+	table="$($IP route list table "$ID")"
 	table_result="$?"
 
 	if [ "$table_result" = 0 ]; then
@@ -171,6 +185,7 @@ diag_routes() {
 }
 
 diag_cmd() {
+	config_load 'multiwan-nft' || return 1
 	case "$1" in
 		gateway)
 			diag_gateway "$2"
@@ -191,7 +206,7 @@ diag_cmd() {
 }
 
 ipset_dump() {
-	$NFT list sets $NFT_FAMILY $NFT_TABLE 2>/dev/null | grep 'set ' | awk '{print $2}' | grep -v 'multiwan_nft_' | sort -u
+	$NFT list table $NFT_FAMILY $NFT_TABLE 2>/dev/null | awk '$1 == "set" {print $2}' | grep -v '^multiwan_nft_' | sort -u
 }
 
 ipset_cmd() {

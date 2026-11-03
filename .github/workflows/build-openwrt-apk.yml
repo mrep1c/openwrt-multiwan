@@ -1,5 +1,5 @@
 name: Build OpenWrt APK feed
-run-name: OpenWrt apk-25.12-noarch
+run-name: OpenWrt 25.12 APK feeds (AArch64, ARMv7, MIPSel)
 
 on:
   workflow_run:
@@ -13,10 +13,6 @@ permissions:
 
 env:
   OPENWRT_RELEASE: "25.12.6"
-  TARGET: rockchip
-  SUBTARGET: armv8
-  SDK_URL: https://downloads.openwrt.org/releases/25.12.6/targets/rockchip/armv8/openwrt-sdk-25.12.6-rockchip-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst
-  RELEASE_TAG: apk-25.12-noarch
 
 jobs:
   preflight:
@@ -24,12 +20,18 @@ jobs:
     outputs:
       build: ${{ steps.decide.outputs.build }}
       reason: ${{ steps.decide.outputs.reason }}
+      targets: ${{ steps.targets.outputs.matrix }}
     steps:
       - name: Checkout package feed
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
+
+      - name: Load supported architectures
+        id: targets
+        run: |
+          echo "matrix=$(python3 -c 'import json; print(json.dumps({"include":json.load(open("scripts/openwrt-apk-targets.json"))},separators=(",",":")))')" >> "$GITHUB_OUTPUT"
 
       - name: Decide whether to build feed
         id: decide
@@ -61,7 +63,7 @@ jobs:
                 for path in $changed_files; do
                   [ -n "$path" ] || continue
                   case "$path" in
-                    multiwan-nft/*|luci-app-multiwan-nft/*|multiwan-qos/*|luci-app-multiwan-qos/*|install.sh|VERSION|keys/*)
+                    multiwan-nft/*|multiwan-nft-nping/*|luci-app-multiwan-nft/*|multiwan-qos/*|luci-app-multiwan-qos/*|install.sh|VERSION|keys/*|setup-feed.sh|scripts/download-openwrt-sdk.py|scripts/configure-openwrt-sdk.py|scripts/openwrt-apk-targets.json|.github/workflows/build-openwrt-apk.yml)
                       feed_input_changed=true
                       ;;
                   esac
@@ -114,6 +116,13 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.build == 'true'
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.targets) }}
+    env:
+      TARGET: ${{ matrix.target }}
+      SUBTARGET: ${{ matrix.subtarget }}
+      RELEASE_TAG: apk-25.12-${{ matrix.architecture }}
 
     steps:
       - name: Checkout package feed
@@ -144,9 +153,15 @@ jobs:
             zstd
 
       - name: Download OpenWrt SDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/openwrt-sdk.tar.zst
+          key: openwrt-sdk-${{ env.OPENWRT_RELEASE }}-${{ matrix.target }}-${{ matrix.subtarget }}
+
+      - name: Verify and extract OpenWrt SDK
         run: |
           mkdir -p "$RUNNER_TEMP/openwrt-sdk"
-          wget -O "$RUNNER_TEMP/openwrt-sdk.tar.zst" "$SDK_URL"
+          python3 scripts/download-openwrt-sdk.py "$OPENWRT_RELEASE" "$TARGET" "$SUBTARGET" "${{ matrix.architecture }}" "$RUNNER_TEMP/openwrt-sdk.tar.zst"
           tar -I zstd -xf "$RUNNER_TEMP/openwrt-sdk.tar.zst" \
             -C "$RUNNER_TEMP/openwrt-sdk" \
             --strip-components=1
@@ -179,15 +194,27 @@ jobs:
             sleep $((attempt * 30))
           done
           ./scripts/feeds install -p multiwan multiwan-nft
+          ./scripts/feeds install -p multiwan multiwan-nft-sockopt
+          ./scripts/feeds install -p multiwan multiwan-nft-nping
           ./scripts/feeds install -p multiwan luci-app-multiwan-nft
           ./scripts/feeds install -p multiwan multiwan-qos
           ./scripts/feeds install -p multiwan luci-app-multiwan-qos
+          python3 "$GITHUB_WORKSPACE/scripts/configure-openwrt-sdk.py" . \
+            multiwan-nft multiwan-nft-sockopt multiwan-nft-nping \
+            luci-app-multiwan-nft multiwan-qos luci-app-multiwan-qos
           make defconfig
+
+      - name: Cache probe source
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/openwrt-sources
+          key: openwrt-probe-source-${{ hashFiles('multiwan-nft-nping/Makefile') }}
 
       - name: Build packages
         run: |
           cd "$RUNNER_TEMP/openwrt-sdk"
           make -j"$(nproc)" package/feeds/multiwan/multiwan-nft/compile V=s
+          make -j"$(nproc)" package/feeds/multiwan/multiwan-nft-nping/compile V=s DL_DIR="$RUNNER_TEMP/openwrt-sources"
           make -j"$(nproc)" package/feeds/multiwan/luci-app-multiwan-nft/compile V=s
           make -j"$(nproc)" package/feeds/multiwan/multiwan-qos/compile V=s
           make -j"$(nproc)" package/feeds/multiwan/luci-app-multiwan-qos/compile V=s
@@ -225,12 +252,14 @@ jobs:
           cp "$key_file" "$GITHUB_WORKSPACE/dist/mrep1c-openwrt-multiwan-apk.pem"
 
           apk_count="$(find "$GITHUB_WORKSPACE/dist" -maxdepth 1 -type f -name "*.apk" | wc -l)"
-          test "$apk_count" -ge 4
+          test "$apk_count" -ge 6
+          test "$(find "$GITHUB_WORKSPACE/dist" -maxdepth 1 -type f -name 'multiwan-nft-sockopt-*.apk' | wc -l)" -eq 1
+          test "$(find "$GITHUB_WORKSPACE/dist" -maxdepth 1 -type f -name 'multiwan-nft-nping-*.apk' | wc -l)" -eq 1
           test -s "$GITHUB_WORKSPACE/dist/packages.adb"
           test -s "$GITHUB_WORKSPACE/dist/mrep1c-openwrt-multiwan-apk.pem"
 
           {
-            echo "OpenWrt $OPENWRT_RELEASE architecture-independent APK feed"
+            echo "OpenWrt $OPENWRT_RELEASE APK feed for ${{ matrix.architecture }}"
             echo
             echo "Install the feed public key first:"
             echo "uclient-fetch -O /etc/apk/keys/mrep1c-openwrt-multiwan-apk.pem https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/mrep1c-openwrt-multiwan-apk.pem"
@@ -262,7 +291,7 @@ jobs:
           else
             gh release create "$TAG" \
               --target "$GITHUB_SHA" \
-              --title "OpenWrt $OPENWRT_RELEASE architecture-independent APK feed" \
+              --title "OpenWrt $OPENWRT_RELEASE APK feed for ${{ matrix.architecture }}" \
               --notes-file dist/RELEASE_NOTES.txt
             gh release upload "$TAG" dist/*.apk dist/mrep1c-openwrt-multiwan-apk.pem --clobber
             gh release upload "$TAG" dist/packages.adb --clobber

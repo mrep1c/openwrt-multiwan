@@ -8,10 +8,10 @@ START=19
 USE_PROCD=1
 SCRIPTNAME="multiwan_nft-init"
 EXTRA_COMMANDS="check_deps install_deps"
-EXTRA_HELP="	check_deps	Check required runtime packages
+EXTRA_HELP="	check_deps	Check runtime commands, JSON support and socket helper
 	install_deps	Install missing runtime packages with apk/opkg"
 
-MULTIWAN_NFT_REQUIRED_PACKAGES="ip-full nftables jshn rpcd conntrack"
+MULTIWAN_NFT_REQUIRED_PACKAGES="ip-full nftables-json kmod-nft-fib jshn rpcd conntrack multiwan-nft-sockopt"
 MULTIWAN_NFT_PACKAGE_LOCK="/tmp/multiwan_nft-package-install.lock"
 MULTIWAN_NFT_PACKAGE_LOCK_HELD=0
 MULTIWAN_NFT_PACKAGE_LOCK_TOKEN=""
@@ -78,26 +78,24 @@ multiwan_nft_release_package_lock() {
 }
 
 multiwan_nft_check_required_packages() {
-	local manager missing_packages pkg
-
-	manager="$(multiwan_nft_detect_package_manager)"
-	case "$manager" in
-		apk|opkg) ;;
-		*)
-			LOG error "No supported package manager found; cannot verify multiwan_nft dependencies"
-			return 1
-			;;
-	esac
-
-	for pkg in $MULTIWAN_NFT_REQUIRED_PACKAGES; do
-		multiwan_nft_check_package "$manager" "$pkg" || missing_packages="$missing_packages $pkg"
+	local program missing=""
+	# APK post-install runs before its new package database is visible to readers.
+	for program in ip nft conntrack jshn rpcd flock; do
+		command -v "$program" >/dev/null 2>&1 || missing="$missing $program"
 	done
-
-	[ -z "$missing_packages" ] && return 0
-
-	LOG error "Missing required multiwan_nft packages:$missing_packages"
-	LOG error "Install multiwan_nft through the OpenWrt feed, or run '/etc/init.d/multiwan-nft install_deps' to attempt repair"
-	return 1
+	[ -r "${IPKG_INSTROOT}/lib/multiwan-nft/libwrap_mwan3_sockopt.so.1.0" ] || missing="$missing multiwan-nft-sockopt"
+	if [ -n "$missing" ]; then
+		LOG error "Missing MultiWAN runtime tools:$missing; reinstall the required packages"
+		return 1
+	fi
+	$IP4 -V >/dev/null 2>&1 || {
+		LOG error "MultiWAN requires iproute2; install ip-full instead of using BusyBox ip"
+		return 1
+	}
+	$NFT -j list tables >/dev/null 2>&1 || {
+		LOG error "nftables JSON/kernel support is unavailable; install nftables-json"
+		return 1
+	}
 }
 
 multiwan_nft_install_missing_packages() {
@@ -175,20 +173,6 @@ install_deps() {
 	multiwan_nft_install_missing_packages
 }
 
-multiwan_nft_is_package_script_context() {
-	local cmdline
-
-	[ -n "${APK_SCRIPT:-}" ] && return 0
-	[ -r "/proc/$PPID/cmdline" ] || return 1
-	cmdline="$(tr '\0' ' ' 2>/dev/null < "/proc/$PPID/cmdline")"
-	case "$cmdline" in
-		*/lib/apk/db/scripts/*|*/usr/lib/opkg/info/*|*post-install*|*post-upgrade*)
-			return 0
-			;;
-	esac
-	return 1
-}
-
 # Wait for basic network readiness (at least one interface + routes)
 # Does NOT wait for all interfaces - late PPPoE connections handled by hotplug
 # This allows multiwan_nft to start quickly and add interfaces as they come online
@@ -229,7 +213,8 @@ wait_for_network() {
 }
 
 service_running() {
-	[ -d "$MULTIWAN_NFT_STATUS_DIR" ]
+	[ -d "$MULTIWAN_NFT_STATUS_DIR" ] &&
+		$NFT list chain "$NFT_FAMILY" "$NFT_TABLE" multiwan_nft_hook >/dev/null 2>&1
 }
 
 multiwan_nft_helper_pids() {
@@ -243,27 +228,8 @@ multiwan_nft_helper_pids() {
 		[ -n "$start" ] || continue
 		cmdline="$(tr '\0' ' ' 2>/dev/null < "$pid_dir/cmdline")"
 		case "$cmdline" in
-			*"/usr/sbin/$helper "*|*"/usr/sbin/$helper")
-				printf '%s:%s\n' "$pid" "$start"
-				;;
-		esac
-	done
-}
-
-multiwan_nft_exact_cmdline_pids() {
-	local needle="$1" pid_dir pid ppid start cmdline
-
-	for pid_dir in /proc/[0-9]*; do
-		[ -r "$pid_dir/cmdline" ] || continue
-		pid="${pid_dir##*/}"
-		[ "$pid" = "$$" ] && continue
-		ppid="$(sed -n 's/^PPid:[[:space:]]*//p' "$pid_dir/status" 2>/dev/null)"
-		[ "$ppid" = "1" ] || continue
-		start="$(mw_process_start_time "$pid" 2>/dev/null)"
-		[ -n "$start" ] || continue
-		cmdline="$(tr '\0' ' ' 2>/dev/null < "$pid_dir/cmdline")"
-		case "$cmdline" in
-			"$needle"|"$needle ")
+			"/usr/sbin/$helper "*|"/bin/sh /usr/sbin/$helper "*|\
+			"sh /usr/sbin/$helper "*|"/bin/ash /usr/sbin/$helper "*)
 				printf '%s:%s\n' "$pid" "$start"
 				;;
 		esac
@@ -296,10 +262,10 @@ multiwan_nft_stop_helper_processes() {
 }
 
 multiwan_nft_stop_route_monitor_processes() {
-	local cmd entry pid start
+	local family entry pid start
 
-	for cmd in "ip -4 monitor route" "ip -6 monitor route"; do
-		for entry in $(multiwan_nft_exact_cmdline_pids "$cmd"); do
+	for family in ipv4 ipv6; do
+		for entry in $(mw_rtmon_orphan_pids "$family"); do
 			pid="${entry%%:*}"
 			start="${entry#*:}"
 			mw_process_identity_alive "$pid" "$start" && kill "$pid" 2>/dev/null
@@ -308,12 +274,12 @@ multiwan_nft_stop_route_monitor_processes() {
 
 	sleep 1
 
-	for cmd in "ip -4 monitor route" "ip -6 monitor route"; do
-		for entry in $(multiwan_nft_exact_cmdline_pids "$cmd"); do
+	for family in ipv4 ipv6; do
+		for entry in $(mw_rtmon_orphan_pids "$family"); do
 			pid="${entry%%:*}"
 			start="${entry#*:}"
 			if mw_process_identity_alive "$pid" "$start"; then
-				LOG warn "Force killing stale route monitor process $pid ($cmd)"
+				LOG warn "Force killing owned stale route monitor process $pid ($family)"
 				kill -KILL "$pid" 2>/dev/null
 			fi
 		done
@@ -329,6 +295,9 @@ start_tracker() {
 
 	procd_open_instance "track_${1}"
 	procd_set_param command /usr/sbin/multiwan-nft-track $interface
+	procd_set_param file /etc/config/multiwan-nft /usr/sbin/multiwan-nft-track \
+		/lib/multiwan-nft/common.sh /lib/multiwan-nft/process-lock.sh \
+		/lib/multiwan-nft/libwrap_mwan3_sockopt.so.1.0
 	procd_set_param respawn
 	procd_close_instance
 }
@@ -338,58 +307,82 @@ start_rtmon() {
 
 	procd_open_instance "rtmon_${family}"
 	procd_set_param command /usr/sbin/multiwan-nft-rtmon "$family"
+	procd_set_param file /etc/config/multiwan-nft /usr/sbin/multiwan-nft-rtmon \
+		/lib/multiwan-nft/common.sh /lib/multiwan-nft/multiwan_nft.sh \
+		/lib/multiwan-nft/process-lock.sh
 	procd_set_param respawn
 	procd_close_instance
 }
 
 start_service() {
+	local setup_failed=0 mask_file mask_backup=""
+	MULTIWAN_NFT_START_RESULT=1
+	# Package callbacks use the same instance definition to keep workers supervised.
 	enabled=""
 	hotplug_pids=""
 
-	if multiwan_nft_is_package_script_context; then
-		LOG notice "Skipping service start during package installation"
-		return 0
-	fi
-	
 	# Wait for network interfaces and routes to be available
 	wait_for_network
 
 	multiwan_nft_check_required_packages || return 1
 
-	multiwan_nft_init || return 1
-	config_foreach start_tracker interface
+	multiwan_nft_init prepare || return 1
 
 	multiwan_nft_update_iface_to_table
+	multiwan_nft_reconcile_conntrack_map || {
+		LOG error "Could not reconcile previous connection marks; startup stopped before reusing interface IDs"
+		return 1
+	}
+	# Keep the old cache and workers usable if protection or base replacement fails.
+	mask_file="$MULTIWAN_NFT_STATUS_DIR/mmx_mask"
+	if [ -e "$mask_file" ]; then
+		mask_backup="$(mktemp "$MULTIWAN_NFT_STATUS_DIR/mmx_mask.rollback.XXXXXX")" || return 1
+		cp -p "$mask_file" "$mask_backup" || { rm -f "$mask_backup"; return 1; }
+	fi
+	multiwan_nft_publish_mask || { [ -z "$mask_backup" ] || rm -f "$mask_backup"; return 1; }
 	
 	# Load base nftables ruleset atomically
 	multiwan_nft_load_base_ruleset || {
+		if [ -n "$mask_backup" ]; then
+			mv "$mask_backup" "$mask_file" || LOG error "Could not restore the previous firewall mask cache"
+		else
+			rm -f "$mask_file" || LOG error "Could not remove the unapplied firewall mask cache"
+		fi
 		LOG error "Failed to load base nftables ruleset"
 		return 1
 	}
+	[ -z "$mask_backup" ] || rm -f "$mask_backup"
+	config_foreach start_tracker interface
 	
 	# Populate sets and create interface/policy rules
 	# Small delay ensures base ruleset is fully committed before populating sets
 	sleep 1
-	multiwan_nft_set_connected_ipv4
-	[ "$NO_IPV6" -eq 0 ] && multiwan_nft_set_connected_ipv6
-	multiwan_nft_set_general_rules
+	multiwan_nft_set_custom_ipset || return 1
+	multiwan_nft_set_connected_ipv4 || return 1
+	[ "$NO_IPV6" -ne 0 ] || multiwan_nft_set_connected_ipv6 || return 1
+	multiwan_nft_set_general_rules || return 1
 	
 	# multiwan_nft_ifup serializes init-time setup because MULTIWAN_NFT_STARTUP=init
 	# bypasses the hotplug procd_lock.
-	config_foreach multiwan_nft_ifup interface "init"
+	setup_iface() { multiwan_nft_ifup "$1" init || setup_failed=1; }
+	config_foreach setup_iface interface
 	# Kept for compatibility with older library code that backgrounded init hotplug.
-	[ -n "$hotplug_pids" ] && wait $hotplug_pids
+	if [ -n "$hotplug_pids" ]; then wait $hotplug_pids || setup_failed=1; fi
+	[ "$setup_failed" -eq 0 ] || return 1
 	
 	# Create routes for each interface (hotplug skips this during init)
-	config_foreach multiwan_nft_create_iface_route interface
+	setup_route() { multiwan_nft_create_iface_route "$1" || setup_failed=1; }
+	config_foreach setup_route interface
+	[ "$setup_failed" -eq 0 ] || return 1
 
 	# Repopulate connected sets now that routes are available
-	multiwan_nft_set_connected_ipv4
-	[ "$NO_IPV6" -eq 0 ] && multiwan_nft_set_connected_ipv6
+	multiwan_nft_set_connected_ipv4 || return 1
+	[ "$NO_IPV6" -ne 0 ] || multiwan_nft_set_connected_ipv6 || return 1
 	
 	# Add policy and user rules (these use direct nft add which is safe after base is loaded)
-	multiwan_nft_set_policies_nft
-	multiwan_nft_set_user_rules_nft
+	multiwan_nft_set_policies_nft || return 1
+	multiwan_nft_set_user_rules_nft || return 1
+	multiwan_nft_commit_conntrack_map || return 1
 
 	# Only monitor address families used by enabled MultiWAN interfaces.
 	# Kernel link-local IPv6 addresses alone do not require an IPv6 monitor.
@@ -401,6 +394,13 @@ start_service() {
 			LOG warn "IPv6 MultiWAN interfaces are enabled, but kernel IPv6 support is unavailable"
 		fi
 	fi
+	MULTIWAN_NFT_START_RESULT=0
+	return 0
+}
+
+service_started() {
+	# rc.common otherwise replaces start_service's failure with procd's result.
+	return "${MULTIWAN_NFT_START_RESULT:-1}"
 }
 
 stop_service() {
@@ -412,7 +412,8 @@ stop_service() {
 service_stopped() {
 	# procd has disabled respawn and stopped registered instances before this
 	# callback. Clean up any identity-matched helpers that escaped supervision.
-	multiwan_nft_init || return 1
+	multiwan_nft_init cleanup || return 1
+	multiwan_nft_import_legacy_conntrack_map || return 1
 	
 	# Kill helper shells that procd may not know about. The process name is
 	# truncated to 15 chars, and cmdline starts with /bin/sh, so killall/pkill
@@ -420,10 +421,17 @@ service_stopped() {
 	multiwan_nft_stop_helper_processes multiwan-nft-rtmon multiwan-nft-track
 	multiwan_nft_stop_route_monitor_processes
 	
-	config_foreach multiwan_nft_interface_shutdown interface
+	if [ -d "$MULTIWAN_NFT_STATUS_DIR/owned_tables" ]; then
+		config_foreach multiwan_nft_interface_hotplug_shutdown interface
+	else
+		# Compatibility cleanup for a running pre-manifest package during upgrade.
+		config_foreach multiwan_nft_interface_shutdown interface
+	fi
+	multiwan_nft_cleanup_owned_tables || return 1
 
-	# Delete the entire nftables table (removes all chains and sets)
-	$NFT delete table $NFT_FAMILY $NFT_TABLE 2>/dev/null
+	# Keep DNS-populated external sets while removing every routing hook.
+	multiwan_nft_unload_ruleset || return 1
+	multiwan_nft_release_retired_marks || return 1
 
 	rm -rf $MULTIWAN_NFT_STATUS_DIR $MULTIWAN_NFT_TRACK_STATUS_DIR
 }

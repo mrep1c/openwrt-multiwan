@@ -28,6 +28,8 @@ return view.extend({
 	handleAction: function(ev) {
 		var iface = document.getElementById('iface');
 		var task = document.getElementById('task');
+		if (this.readonly && (task.value === 'ifup' || task.value === 'ifdown'))
+			return Promise.reject(new Error(_('Write access is required for this action.')));
 
 		switch (task.value) {
 			case 'gateway':
@@ -58,15 +60,19 @@ return view.extend({
 	},
 
 	render: function () {
+		this.readonly = !L.hasViewPermission();
 
 		var taskSel = [
 			E('option', { 'value': 'gateway' }, [ _('Ping default gateway') ]),
 			E('option', { 'value': 'tracking' }, [ _('Ping tracking IP') ]),
 			E('option', { 'value': 'rules' }, [ _('Check IP rules') ]),
-			E('option', { 'value': 'routes' }, [ _('Check routing table') ]),
-			E('option', { 'value': 'ifup' }, [ _('Hotplug ifup') ]),
-			E('option', { 'value': 'ifdown' }, [ _('Hotplug ifdown') ])
+			E('option', { 'value': 'routes' }, [ _('Check routing table') ])
 		];
+		if (!this.readonly)
+			taskSel.push(
+				E('option', { 'value': 'ifup' }, [ _('Hotplug ifup') ]),
+				E('option', { 'value': 'ifdown' }, [ _('Hotplug ifdown') ])
+			);
 
 		var ifaceSel = [E('option', { value: '' }, [_('-- Interface Selection --')])];
 

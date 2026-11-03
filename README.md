@@ -3,12 +3,14 @@
 OpenWrt MultiWAN provides one package feed for MultiWAN NFT, MultiWAN QoS,
 and their optional LuCI applications.
 
-The feed contains four separately installable packages:
+The feed contains four service/UI packages, a native socket helper, and an optional probe:
 
 - `multiwan-nft`
 - `luci-app-multiwan-nft`
 - `multiwan-qos`
 - `luci-app-multiwan-qos`
+- `multiwan-nft-sockopt` (installed automatically with `multiwan-nft`)
+- `multiwan-nft-nping` (optional Nping replacement with IPv6 fixes)
 
 Install the backend packages for router services. Install the LuCI packages
 when you want web configuration and status pages.
@@ -160,12 +162,15 @@ If you customize `multiwan-nft.globals.mmx_mask`, keep the lower byte
 
 ## Requirements
 
-- OpenWrt 25.12 or newer for the APK feed.
-- OpenWrt 24.10 or 23.05 for the OPKG feeds.
-- Firewall 4 and nftables.
+- OpenWrt 25.12.x; current builds use 25.12.6.
+- A supported APK architecture: `aarch64_generic`, `arm_cortex-a7_neon-vfpv4`, or `mipsel_24kc`.
+- Firewall 4 and `nftables-json` (installed as a dependency).
 - Working official OpenWrt package feeds for dependencies.
 - `apk` on OpenWrt 25.12 or newer.
-- `opkg` on OpenWrt 24.10 and 23.05.
+
+Older OPKG releases are frozen and do not receive the current NFT fixes.
+Other CPU variants can build the source feed with their matching OpenWrt SDK;
+an ARMv7 or MIPSel label alone does not identify a compatible package ABI.
 
 Official OpenWrt is the supported target. Forks can change kernel modules,
 package names, firewall behavior, or LuCI internals.
@@ -205,7 +210,7 @@ sh /tmp/setup-multiwan-feed.sh remove
 
 ## Manual Router Install
 
-See [INSTALL.md](INSTALL.md) for full APK and OPKG instructions.
+See [INSTALL.md](INSTALL.md) for architecture-specific APK instructions and upgrade notes.
 
 Main packages only:
 
@@ -221,8 +226,8 @@ apk update
 apk add luci-app-multiwan-nft luci-app-multiwan-qos
 ```
 
-On OPKG-based releases, use `opkg update` and `opkg install` with the same
-package names after adding the matching feed.
+The setup helper selects the native feed using `DISTRIB_ARCH` or `apk --print-arch`.
+Run it again when upgrading from the old `apk-25.12-noarch` feed.
 
 Important: LuCI's APK Configuration screen needs the router APK feed URL that
 ends in `packages.adb`. Do not paste a `.git` source-feed URL there.
@@ -239,6 +244,9 @@ make menuconfig
 ```
 
 Select the packages under Network and LuCI, then build normally.
+For a fresh SDK package build, follow the scoped selection steps in
+[the install guide](INSTALL.md#source-sdk-build) to avoid packaging unrelated
+prebuilt kernel modules.
 
 ## Raw Installer
 
@@ -383,7 +391,29 @@ sh /tmp/setup-multiwan-feed.sh remove
 
 ## Binary Notes
 
-The public router feeds are architecture-independent and do not ship
-`libwrap_mwan3_sockopt.so`. The C source remains in the tree for future
-target-specific wrapper work, but the packaged runtime uses native interface
-binding.
+Routing and LuCI scripts remain architecture-independent. The required
+`multiwan-nft-sockopt` package contains a small library compiled for the selected
+CPU and musl ABI. It binds tracking probes and `multiwan-nft use` commands to
+the requested device, source address, family, and routing mark.
+Hostname resolution also follows the selected family. For a direct `use`
+command with `nslookup`, supply a reachable upstream DNS server explicitly;
+the router's loopback resolver is not on the selected WAN device.
+
+Like upstream mwan3, preload binding applies to dynamically linked programs;
+static and secure-execution/setuid binaries are outside that mechanism. No
+unbound fallback is used when the helper is missing.
+
+Programs that construct Ethernet/ARP frames also need their own interface and
+sender-address options. The tracker supplies those options to Nping; when using
+`multiwan-nft use` directly, pass the equivalent options to such programs.
+
+Disable software/hardware flow offload when sticky timeouts must refresh on
+every packet. Offloaded traffic bypasses the normal nft hooks. Normal fw4
+reloads preserve the separate MultiWAN table; after an explicit full
+`nft flush ruleset`, restore fw4 first, then restart MultiWAN NFT. DNS-populated
+sets also need fresh DNS lookups after their definitions are restored. Follow
+the [full ruleset recovery procedure](INSTALL.md#firewall-recovery-after-a-full-ruleset-flush),
+including separately managed set definitions and dnsmasq restart where needed.
+
+See [native parity and validation](docs/NFT_PARITY.md) for test coverage and
+remaining router acceptance checks.

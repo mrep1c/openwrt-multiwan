@@ -13,31 +13,41 @@ SCRIPTNAME="multiwan_nft-hotplug"
 # Enhanced debug logging for troubleshooting
 LOG debug "multiwan_nft hotplug started: ACTION=$ACTION INTERFACE=$INTERFACE DEVICE=$DEVICE MULTIWAN_NFT_STARTUP=$MULTIWAN_NFT_STARTUP FIRSTCONNECT=$FIRSTCONNECT MULTIWAN_NFT_SHUTDOWN=$MULTIWAN_NFT_SHUTDOWN"
 
-[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || [ "$ACTION" = "connected" ] || [ "$ACTION" = "disconnected" ] || exit 1
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || [ "$ACTION" = "ifupdate" ] || [ "$ACTION" = "connected" ] || [ "$ACTION" = "disconnected" ] || exit 1
 [ -n "$INTERFACE" ] || exit 2
 [ "$FIRSTCONNECT" = "1" ] || [ "$MULTIWAN_NFT_SHUTDOWN" = "1" ] && exit 0
+if [ "$ACTION" = "ifupdate" ] && [ "${IFUPDATE_ADDRESSES:-0}" != 1 ] &&
+   [ "${IFUPDATE_ROUTES:-0}" != 1 ] && [ "${IFUPDATE_PREFIXES:-0}" != 1 ]; then
+	exit 0
+fi
 
-if { [ "$ACTION" = "ifup" ] || [ "$ACTION" = "connected" ] ; } && [ -z "$DEVICE" ]; then
+if { [ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifupdate" ] || [ "$ACTION" = "connected" ] ; } && [ -z "$DEVICE" ]; then
 	LOG notice "$ACTION called on $INTERFACE with no device set"
 	exit 3
 fi
 
 [ "$MULTIWAN_NFT_STARTUP" = "init" ] || procd_lock
 
-multiwan_nft_init
-
 /etc/init.d/multiwan-nft running || {
 	LOG notice "multiwan_nft hotplug $ACTION on $INTERFACE not called because globally disabled"
 	exit 0
 }
 
-$NFT list chain $NFT_FAMILY $NFT_TABLE multiwan_nft_hook &>/dev/null || {
+$NFT list chain $NFT_FAMILY $NFT_TABLE multiwan_nft_hook >/dev/null 2>&1 || {
 	LOG warn "hotplug called on $INTERFACE before multiwan_nft has been set up"
 	exit 0
 }
 
-if [ "$MULTIWAN_NFT_STARTUP" != "init" ] && [ "$ACTION" = "ifup" ]; then
+multiwan_nft_init || exit 1
+
+if [ "$MULTIWAN_NFT_STARTUP" != "init" ] && { [ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifupdate" ]; }; then
 	multiwan_nft_set_user_iface_rules_nft $INTERFACE $DEVICE
+fi
+
+event_interface="$INTERFACE"
+multiwan_nft_get_logical_iface INTERFACE "$INTERFACE"
+if [ "$INTERFACE" != "$event_interface" ] && { [ "$ACTION" = ifup ] || [ "$ACTION" = ifupdate ]; }; then
+	multiwan_nft_set_user_iface_rules_nft "$INTERFACE" "$DEVICE"
 fi
 
 config_get_bool enabled $INTERFACE 'enabled' '0'
@@ -59,6 +69,12 @@ LOG notice "Execute $ACTION event on interface $INTERFACE (${DEVICE:-unknown})"
 status_dir="$MULTIWAN_NFT_TRACK_STATUS_DIR/$INTERFACE"
 mkdir -p "$status_dir"
 old_state="$(multiwan_nft_get_iface_hotplug_state "$INTERFACE")"
+if [ "$ACTION" = ifupdate ] && [ "$old_state" = offline ] &&
+   [ "$(cat "$status_dir/OFFLINE_REASON" 2>/dev/null)" = ifdown ]; then
+	# Metadata changes do not reactivate an administratively stopped interface.
+	exit 0
+fi
+[ "$ACTION" != "ifupdate" ] || status="$old_state"
 previous_session_action="$(cat "$status_dir/SESSION_ACTION" 2>/dev/null)"
 case "$previous_session_action" in
 	purged|already-purged) failure_already_purged=1 ;;
@@ -139,6 +155,7 @@ case "$ACTION" in
 		[ "$ACTION" = "disconnected" ] && record_transition OFFLINE_REASON "${OFFLINE_REASON:-probe}" || record_transition OFFLINE_REASON "none"
 		;;
 	ifdown) record_transition OFFLINE_REASON "ifdown" ;;
+	ifupdate) : ;;
 	*) record_transition OFFLINE_REASON "none" ;;
 esac
 
@@ -165,37 +182,47 @@ case "$ACTION" in
 		record_transition SESSION_COUNT "0"
 		record_transition STICKY_RESULT "not-required"
 		;;
-	ifup)
-		LOG debug "Processing ifup: creating iface rules and nft chains"
+	ifup|ifupdate)
+		LOG debug "Processing ifup: preparing interface before committing eligibility and lookup rules"
 		multiwan_nft_create_iface_nft $INTERFACE $DEVICE || {
 			LOG warn "ifup event on $INTERFACE failed while rebuilding nft interface state"
 			exit 1
 		}
-		multiwan_nft_create_iface_rules $INTERFACE $DEVICE || {
-			LOG warn "ifup event on $INTERFACE failed while rebuilding ip rules"
-			exit 1
-		}
-		multiwan_nft_set_iface_hotplug_state $INTERFACE "$status"
 		if [ "$MULTIWAN_NFT_STARTUP" != "init" ]; then
 			multiwan_nft_create_iface_route $INTERFACE $DEVICE || {
 				LOG warn "ifup event on $INTERFACE skipped dependent rebuilds because route table update failed"
 				exit 1
 			}
-			multiwan_nft_set_general_rules
+			multiwan_nft_set_general_rules || exit 1
 			# Repopulate connected sets to ensure local traffic bypasses multiwan_nft
-			multiwan_nft_set_connected_ipv4
-			[ "$NO_IPV6" -eq 0 ] && multiwan_nft_set_connected_ipv6
-			if [ "$status" = "online" ]; then
-				multiwan_nft_set_policies_nft || {
-					multiwan_nft_set_iface_hotplug_state "$INTERFACE" "$old_state"
-					record_transition POLICY_RESULT "failed"
-					LOG warn "ifup event on $INTERFACE left the previous policy active"
-					exit 1
-				}
-				record_transition POLICY_RESULT "applied"
-			fi
+			multiwan_nft_set_connected_ipv4 || exit 1
+			[ "$NO_IPV6" -ne 0 ] || multiwan_nft_set_connected_ipv6 || exit 1
 		fi
-		[ "$ACTION" = ifup ] && procd_running multiwan_nft "track_$INTERFACE" && procd_send_signal multiwan_nft "track_$INTERFACE" USR2
+		multiwan_nft_set_iface_hotplug_state "$INTERFACE" "$status"
+		if [ "$MULTIWAN_NFT_STARTUP" != "init" ]; then
+			multiwan_nft_set_policies_nft || {
+				multiwan_nft_set_iface_hotplug_state "$INTERFACE" "$old_state"
+				record_transition POLICY_RESULT "failed"
+				LOG warn "ifup event on $INTERFACE left the previous policy active"
+				exit 1
+			}
+			record_transition POLICY_RESULT "applied"
+		fi
+		iface_rules=multiwan_nft_create_iface_rules
+		[ "$status" != "offline" ] || iface_rules=multiwan_nft_set_tracker_oif_rules
+		$iface_rules "$INTERFACE" "$DEVICE" || {
+			multiwan_nft_set_iface_hotplug_state "$INTERFACE" "$old_state"
+			[ "$MULTIWAN_NFT_STARTUP" = "init" ] || multiwan_nft_set_policies_nft >/dev/null 2>&1
+			iface_rules=multiwan_nft_create_iface_rules
+			[ "$old_state" != "offline" ] || iface_rules=multiwan_nft_set_tracker_oif_rules
+			$iface_rules "$INTERFACE" "$DEVICE" >/dev/null 2>&1
+			record_transition POLICY_RESULT "rolled-back-rule-failure"
+			LOG warn "ifup event on $INTERFACE rolled policy back after lookup rules failed"
+			exit 1
+		}
+		if [ "$ACTION" = ifup ] || [ "${IFUPDATE_ADDRESSES:-0}" = 1 ] || [ "${IFUPDATE_PREFIXES:-0}" = 1 ]; then
+			procd_running multiwan-nft "track_$INTERFACE" && procd_send_signal multiwan-nft "track_$INTERFACE" USR2
+		fi
 		;;
 	disconnected)
 		LOG debug "Processing disconnected: committing policy before scoped cleanup"
@@ -287,7 +314,7 @@ case "$ACTION" in
 		multiwan_nft_delete_iface_rules $INTERFACE
 		multiwan_nft_delete_iface_route $INTERFACE
 		multiwan_nft_delete_iface_nft $INTERFACE
-		procd_running multiwan_nft "track_$INTERFACE" && procd_send_signal multiwan_nft "track_$INTERFACE" USR1
+		procd_running multiwan-nft "track_$INTERFACE" && procd_send_signal multiwan-nft "track_$INTERFACE" USR1
 	;;
 esac
 

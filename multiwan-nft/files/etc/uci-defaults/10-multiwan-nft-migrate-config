@@ -12,12 +12,12 @@ migrate_file() {
 
 	[ -f "$old_path" ] || return 0
 
-	cp -p "$old_path" "${old_path}${backup_suffix}" 2>/dev/null
-	[ -f "$new_path" ] && cp -p "$new_path" "${new_path}${backup_suffix}" 2>/dev/null
+	cp -p "$old_path" "${old_path}${backup_suffix}" || return 1
+	if [ -f "$new_path" ]; then cp -p "$new_path" "${new_path}${backup_suffix}" || return 1; fi
 	mv "$old_path" "$new_path"
 }
 
-migrate_file "$old_cfg" "$new_cfg"
-migrate_file "$old_user" "$new_user"
+migrate_file "$old_cfg" "$new_cfg" || exit 1
+migrate_file "$old_user" "$new_user" || exit 1
 
 exit 0

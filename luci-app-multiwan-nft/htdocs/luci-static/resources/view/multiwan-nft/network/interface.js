@@ -75,6 +75,7 @@ return view.extend({
 		o = s.option(form.ListValue, 'track_method', _('Tracking method'));
 		o.default = 'ping';
 		o.value('ping');
+		o.value('nslookup');
 		if (stats[0].type === 'file') {
 			o.value('httping');
 		}
@@ -138,6 +139,7 @@ return view.extend({
 
 		o = s.option(form.Flag, 'check_quality', _('Check link quality'));
 		o.depends('track_method', 'ping');
+		o.depends('track_method', 'httping');
 		o.default = false;
 		o.modalonly = true;
 

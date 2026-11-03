@@ -6,9 +6,15 @@ on:
       - "multiwan-qos/**"
       - "luci-app-multiwan-qos/**"
       - "multiwan-nft/**"
+      - "multiwan-nft-nping/**"
       - "luci-app-multiwan-nft/**"
       - "scripts/install-qos.sh"
       - "scripts/install-nft.sh"
+      - "scripts/download-openwrt-sdk.py"
+      - "scripts/configure-openwrt-sdk.py"
+      - "scripts/openwrt-apk-targets.json"
+      - "setup-feed.sh"
+      - ".github/workflows/build-openwrt-apk.yml"
       - "tests/test-qos-*"
       - "tests/test-nft-*"
       - ".github/workflows/test-qos-shell.yml"
@@ -18,9 +24,15 @@ on:
       - "multiwan-qos/**"
       - "luci-app-multiwan-qos/**"
       - "multiwan-nft/**"
+      - "multiwan-nft-nping/**"
       - "luci-app-multiwan-nft/**"
       - "scripts/install-qos.sh"
       - "scripts/install-nft.sh"
+      - "scripts/download-openwrt-sdk.py"
+      - "scripts/configure-openwrt-sdk.py"
+      - "scripts/openwrt-apk-targets.json"
+      - "setup-feed.sh"
+      - ".github/workflows/build-openwrt-apk.yml"
       - "tests/test-qos-*"
       - "tests/test-nft-*"
       - ".github/workflows/test-qos-shell.yml"
@@ -38,7 +50,7 @@ jobs:
       - name: Install test runtimes
         run: |
           sudo apt-get update
-          sudo apt-get install -y busybox-static dash nodejs lua5.1
+          sudo apt-get install -y busybox-static dash nodejs lua5.1 nftables iproute2 python3 conntrack
 
       - name: Check installed script syntax
         run: |
@@ -76,6 +88,29 @@ jobs:
           busybox ash tests/test-qos-fixes.sh
           busybox ash tests/test-qos-upstream-fixes.sh
           busybox ash tests/test-nft-routes.sh
+          busybox ash tests/test-nft-default-route.sh
+          busybox ash tests/test-nft-route-snapshot.sh
+          busybox ash tests/test-nft-migration.sh
+          busybox ash tests/test-nft-common.sh
+          busybox ash tests/test-nft-cleanup.sh
+          busybox ash tests/test-nft-tracker.sh
+          busybox ash tests/test-nft-rtmon.sh
+          busybox ash tests/test-nft-rtmon-lock.sh
+          busybox ash tests/test-nft-rtmon-startup.sh
+          busybox ash tests/test-nft-policy.sh
+          busybox ash tests/test-nft-processes.sh
+          busybox ash tests/test-nft-lifecycle.sh
+          busybox ash tests/test-nft-hotplug.sh
+          busybox ash tests/test-nft-status.sh
+          busybox ash tests/test-nft-runtime.sh
+          busybox ash tests/test-nft-identity.sh
+          busybox ash tests/test-nft-ownership.sh
+          busybox ash tests/test-nft-recovery.sh
+          busybox ash tests/test-nft-rpc.sh
+          busybox ash tests/test-nft-diagnostics.sh
+          busybox ash tests/test-nft-cli.sh
+          busybox ash tests/test-nft-feed.sh
+          busybox ash tests/test-nft-sockopt.sh
 
       - name: Run QoS regression tests with dash
         run: |
@@ -87,9 +122,40 @@ jobs:
           dash tests/test-qos-fixes.sh
           dash tests/test-qos-upstream-fixes.sh
           dash tests/test-nft-routes.sh
+          dash tests/test-nft-default-route.sh
+          dash tests/test-nft-route-snapshot.sh
+          dash tests/test-nft-migration.sh
+          dash tests/test-nft-lifecycle.sh
+          dash tests/test-nft-hotplug.sh
+          dash tests/test-nft-status.sh
+          dash tests/test-nft-runtime.sh
+          dash tests/test-nft-identity.sh
+          dash tests/test-nft-ownership.sh
+          dash tests/test-nft-common.sh
+          dash tests/test-nft-cleanup.sh
+          dash tests/test-nft-rpc.sh
+          dash tests/test-nft-diagnostics.sh
+          dash tests/test-nft-cli.sh
+          dash tests/test-nft-recovery.sh
+          dash tests/test-nft-feed.sh
 
       - name: Run QoS UI regression tests
         run: node tests/test-qos-ui.js
+
+      - name: Run NFT UI regression tests
+        run: node tests/test-nft-ui.js
+
+      - name: Run isolated NFT packet regression tests
+        run: sudo python3 tests/test-nft-packets.py "$PWD"
+
+      - name: Run NFT architecture and SDK checks
+        run: python3 tests/test-nft-packaging.py
+
+      - name: Run NFT raw installer regressions
+        run: python3 tests/test-nft-installer.py
+
+      - name: Run isolated NFT routing and NAT regressions
+        run: sudo python3 tests/test-nft-routing.py "$PWD"
 
       - name: Run router agent endpoint regression tests
         run: |

@@ -15,6 +15,7 @@ RTMON_FIFO=""
 RTMON_ERROR_FILE=""
 RTMON_INIT_LOCK=""
 RTMON_CLEANED=0
+RTMON_CONFIG_READY=0
 
 multiwan_nft_rtmon_child_stop()
 {
@@ -40,8 +41,12 @@ multiwan_nft_rtmon_cleanup()
 {
 	[ "$RTMON_CLEANED" -eq 0 ] || return 0
 	RTMON_CLEANED=1
-	trap - EXIT HUP INT TERM
+	trap - EXIT
+	# Repeated stop signals must not interrupt bounded child/workspace cleanup.
+	trap '' HUP INT TERM
 	multiwan_nft_rtmon_child_stop
+	exec 1000>&-
+	exec 4<&-
 	exec 3>&- 2>/dev/null
 	exec 3<&- 2>/dev/null
 	rm -f "$RTMON_INIT_LOCK"
@@ -50,8 +55,10 @@ multiwan_nft_rtmon_cleanup()
 		[ "$MW_LOCK_OWNER_PID" = "$$" ] &&
 		[ "$MW_LOCK_OWNER_START" = "$RTMON_SELF_START" ] &&
 		[ "$MW_LOCK_OWNER_TOKEN" = "$RTMON_OWNER_TOKEN" ]; then
-		rm -f "$RTMON_FIFO" "$RTMON_ERROR_FILE" \
-			"$RTMON_WORK_DIR/owner" "$RTMON_WORK_DIR"/.owner.* 2>/dev/null
+		rm -f "$RTMON_FIFO" "$RTMON_ERROR_FILE" "$RTMON_WORK_DIR/config_map" \
+			"$RTMON_WORK_DIR"/config_map.* \
+			"$RTMON_WORK_DIR/owner" "$RTMON_WORK_DIR/child" \
+			"$RTMON_WORK_DIR"/.owner.* "$RTMON_WORK_DIR"/.child.* 2>/dev/null
 		rmdir "$RTMON_WORK_DIR" 2>/dev/null
 	fi
 }
@@ -63,45 +70,37 @@ multiwan_nft_rtmon_signal()
 
 multiwan_nft_rtmon_remove_orphans()
 {
-	local family_flag="$1" pid_dir pid ppid start cmdline count
-
-	for pid_dir in /proc/[0-9]*; do
-		[ -r "$pid_dir/cmdline" ] || continue
-		pid="${pid_dir##*/}"
-		ppid="$(sed -n 's/^PPid:[[:space:]]*//p' "$pid_dir/status" 2>/dev/null)"
-		[ "$ppid" = "1" ] || continue
-		start="$(mw_process_start_time "$pid" 2>/dev/null)"
-		cmdline="$(tr '\0' ' ' 2>/dev/null < "$pid_dir/cmdline")"
-		case "$cmdline" in
-			"ip -$family_flag monitor route"|"ip -$family_flag monitor route "|\
-			"/sbin/ip -$family_flag monitor route"|"/sbin/ip -$family_flag monitor route "|\
-			"/usr/sbin/ip -$family_flag monitor route"|"/usr/sbin/ip -$family_flag monitor route ")
-				mw_process_identity_alive "$pid" "$start" || continue
-				LOG warn "Stopping orphaned IPv$family_flag route monitor process $pid"
-				kill "$pid" 2>/dev/null
-				count=0
-				while mw_process_identity_alive "$pid" "$start" && [ "$count" -lt 2 ]; do
-					sleep 1
-					count=$((count + 1))
-				done
-				mw_process_identity_alive "$pid" "$start" && kill -KILL "$pid" 2>/dev/null
-				;;
-		esac
+	local family_flag="$1" entry pid start count
+	for entry in $(mw_rtmon_orphan_pids "ipv$family_flag"); do
+		pid=${entry%%:*}; start=${entry#*:}
+		mw_process_identity_alive "$pid" "$start" || continue
+		LOG warn "Stopping owned orphaned IPv$family_flag route monitor process $pid"
+		kill "$pid" 2>/dev/null
+		count=0
+		while mw_process_identity_alive "$pid" "$start" && [ "$count" -lt 2 ]; do
+			sleep 1
+			count=$((count + 1))
+		done
+		mw_process_identity_alive "$pid" "$start" && kill -KILL "$pid" 2>/dev/null
 	done
 }
 
 multiwan_nft_rtmon_remove_stale_workdirs()
 {
-	local family="$1" work_dir
+	local family="$1" work_dir permissions
 
 	for work_dir in /tmp/multiwan-nft-rtmon-"$family".*; do
-		[ -d "$work_dir" ] && [ ! -L "$work_dir" ] || continue
+		[ -d "$work_dir" ] && [ ! -L "$work_dir" ] && [ -O "$work_dir" ] || continue
+		permissions=$(LC_ALL=C ls -ld "$work_dir") || continue
+		[ "${permissions%% *}" = drwx------ ] || continue
 		mw_lock_read_owner "$work_dir" || continue
+		case "$MW_LOCK_OWNER_TOKEN" in "rtmon:$MW_LOCK_OWNER_PID:$MW_LOCK_OWNER_START:"?*) ;; *) continue ;; esac
 		mw_process_identity_alive "$MW_LOCK_OWNER_PID" "$MW_LOCK_OWNER_START" && continue
 
 		LOG warn "Removing stale $family route monitor workspace $work_dir"
-		rm -f "$work_dir/events" "$work_dir/error" \
-			"$work_dir/owner" "$work_dir"/.owner.* 2>/dev/null
+		rm -f "$work_dir/events" "$work_dir/error" "$work_dir/child" "$work_dir/config_map" \
+			"$work_dir"/config_map.* \
+			"$work_dir/owner" "$work_dir"/.owner.* "$work_dir"/.child.* 2>/dev/null
 		rmdir "$work_dir" 2>/dev/null
 	done
 }
@@ -125,126 +124,284 @@ multiwan_nft_rtmon_create_workdir()
 
 multiwan_nft_add_all_routes()
 {
-	local tid IP route_line family active_tbls tid initial_state error
-	local ipv=$1
-
-	add_active_tbls()
-	{
-		let tid++
+	local ipv="$1" failed=0
+	case "$ipv" in ipv4) ;; ipv6) [ "$NO_IPV6" -eq 0 ] || return 0 ;; *) return 1 ;; esac
+	multiwan_nft_set_custom_ipset || return 1
+	multiwan_nft_set_connected_$ipv || return 1
+	MULTIWAN_NFT_ROUTE_HAS_NEXTHOPS=0
+	populate_iface() {
+		local family enabled
 		config_get family "$1" family ipv4
-		config_get initial_state "$1" initial_state "online"
-		[ "$family" != "$ipv" ] && return
-		if $NFT list chain $NFT_FAMILY $NFT_TABLE "multiwan_nft_iface_in_$1" &> /dev/null; then
-			active_tbls="$active_tbls${tid} "
-		fi
+		config_get_bool enabled "$1" enabled 0
+		[ "$family" = "$ipv" ] && [ "$enabled" -eq 1 ] || return 0
+		$NFT list chain "$NFT_FAMILY" "$NFT_TABLE" "multiwan_nft_iface_in_$1" >/dev/null 2>&1 || return 0
+		# Reuse stale-route cleanup for changes before the subscription existed.
+		multiwan_nft_create_iface_route "$1" || failed=1
 	}
-
-	add_route()
-	{
-		let tid++
-		[ -n "${active_tbls##* $tid *}" ] && return
-		multiwan_nft_route_replace_idempotent "$IP" "$tid" "$route_line"
-	}
-
-	multiwan_nft_update_dev_to_table
-	[ "$ipv" = "ipv6" ] && [ "$NO_IPV6" -ne 0 ] && return
-	if [ "$ipv" = "ipv4" ]; then
-		IP="$IP4"
-	elif [ "$ipv" = "ipv6" ]; then
-		IP="$IP6"
-	fi
-	tid=0
-	active_tbls=" "
-	config_foreach add_active_tbls interface
-	[ "$active_tbls" = " " ] && return
-	multiwan_nft_get_routes | while read -r route_line; do
-		multiwan_nft_route_line_dev "tid" "$route_line" "$ipv"
-		if [ -n "$tid" ] && [ -z "${active_tbls##* $tid *}" ]; then
-			multiwan_nft_route_replace_idempotent "$IP" "$tid" "$route_line"
-		elif [ -n "${route_line##default*}" ] && [ -n "${route_line##fe80::/64*}" ]; then
-			config_foreach add_route interface
-		fi
-	done
+	config_foreach populate_iface interface
+	[ "$failed" -eq 0 ] || return 1
+	RTMON_NEXTHOPS_ACTIVE=$MULTIWAN_NFT_ROUTE_HAS_NEXTHOPS
 }
 
 multiwan_nft_rtmon_route_handle()
 {
-	local action route_line family tbl device line tid
+	local action route_line route_family family IP tbl device source_routes tid=0 suffix failed=0 live_route=0
 
 	route_line=${1##"Deleted "}
 	route_family=$2
-
-	if [ "$route_line" = "$1" ]; then
-		action="replace"
-		multiwan_nft_nft_add_set_element "multiwan_nft_connected_${route_family}" "${route_line%% *}"
-	else
-		action="del"
-		multiwan_nft_set_connected_${route_family}
+	case "$route_family" in
+		ipv4) IP="$IP4"; suffix=v4 ;;
+		ipv6) [ "$NO_IPV6" -eq 0 ] || return 1; IP="$IP6"; suffix=v6 ;;
+		*) LOG warn "route update called with invalid family - $route_family"; return 1 ;;
+	esac
+	[ "$route_line" = "$1" ] && action=replace || action=del
+	route_line=$(printf '%s\n' "$route_line" | sed -ne "$MULTIWAN_NFT_ROUTE_LINE_EXP") || return 1
+	[ -n "$route_line" ] || return 0
+	case "${RTMON_NEXTHOPS_ACTIVE:-0}:$route_line" in 1:*|*" nhid "*|*"nexthop "*)
+		# Object/group changes can move routes between several WAN tables.
+		multiwan_nft_add_all_routes "$route_family"
+		return $? ;;
+	esac
+	case "$action:$route_line" in del:default|del:default\ *)
+		# A main-table withdrawal may leave a declared recovery default valid.
+		multiwan_nft_add_all_routes "$route_family"
+		return $? ;;
+	esac
+	if [ "$action" = del ]; then
+		# A failed dump cannot prove another source's live route is absent.
+		source_routes="$(multiwan_nft_get_routes)" || return 1
+		printf '%s\n' "$source_routes" | grep -qxF "$route_line" && live_route=1
 	fi
+	multiwan_nft_update_dev_to_table
+	multiwan_nft_route_line_dev "tid" "$route_line" "$route_family" || return 1
+
+	if [ "${3:-main}" != main ]; then
+		multiwan_nft_set_custom_ipset || return 1
+	elif [ "$action" = replace ]; then
+		case "${route_line%% *}" in default|broadcast|unreachable|prohibit|blackhole|throw) ;; *)
+			multiwan_nft_nft_add_set_element "multiwan_nft_connected_$suffix" "${route_line%% *}" || return 1 ;;
+		esac
+	else
+		multiwan_nft_set_connected_${route_family} || return 1
+	fi
+	[ "$live_route" -eq 0 ] || return 0
 
 	if [ -z "${route_line##*linkdown*}" ]; then
 		LOG debug "attempting to add link on down interface - $route_line"
 	fi
 
-	if [ "$route_family" = "ipv4" ]; then
-		IP="$IP4"
-	elif [ "$route_family" = "ipv6" ] && [ "$NO_IPV6" -eq 0 ]; then
-		IP="$IP6"
-	else
-		LOG warn "route update called with invalid family - $route_family"
-		return
-	fi
-	route_line=$(echo "$route_line" | sed -ne "$MULTIWAN_NFT_ROUTE_LINE_EXP")
-
 	handle_route() {
-		local error
-		local iface=$1
-		tbl=$($IP route list table $tid 2>/dev/null)$'\n'
+		local error enabled
+		local iface=${1:-}
 
-		if [ -n "$iface" ] && [ "$(multiwan_nft_get_track_status $iface)" != "active" ]; then
+		config_get_bool enabled "$iface" enabled 0
+		if [ -n "$iface" ] && [ "$enabled" -ne 1 ]; then
 			LOG debug "interface $iface is disabled - skipping '$route_line'";
-			return
+			return 0
 		fi
+		tbl="$(multiwan_nft_read_route_table "$IP" "$tid")" || { failed=1; return 1; }
 
 		# check that action needs to be performed. May not need to take action if we
 		# got a delete event, but table was already flushed
-		if [ $action = "del" ] && [ -n "${tbl##*$route_line$'\n'*}" ]; then
+		if [ "$action" = del ] && ! printf '%s\n' "$tbl" | grep -qxF "$route_line"; then
 			LOG debug "skipping already deleted route table $tid - skipping '$route_line'"
-			return
+			return 0
 		fi
 
 		network_get_device device "$iface"
 		LOG debug "adjusting route $device: '$IP route $action table $tid $route_line'"
 		if [ "$action" = "replace" ]; then
-			multiwan_nft_route_replace_idempotent "$IP" "$tid" "$route_line"
+			multiwan_nft_route_replace_idempotent "$IP" "$tid" "$route_line" || failed=1
 		else
-			error=$($IP route "$action" table $tid $route_line 2>&1)||
+			error=$(multiwan_nft_route_command "$IP" "$action" "$tid" "$route_line" 2>&1) || {
 				LOG warn "failed: '$IP route $action table $tid $route_line' - error: $error"
+				failed=1
+			}
 		fi
 	}
 	handle_route_cb(){
 		local iface=$1
 		let tid++
 		config_get family "$iface" family ipv4
-		[ "$family" != "$route_family" ] && return
+		[ "$family" = "$route_family" ] || return 0
 		handle_route "$iface"
 	}
-
-	multiwan_nft_update_dev_to_table
-	multiwan_nft_route_line_dev "tid" "$route_line" "$route_family"
 
 	if [ -n "$tid" ]; then
 		handle_route
 	elif [ -n "${route_line##default*}" ] && [ -n "${route_line##fe80::/64*}" ]; then
 		config_foreach handle_route_cb interface
 	fi
+	[ "$failed" -eq 0 ]
+}
+
+multiwan_nft_rtmon_source_table()
+{
+	local table
+	table="$(printf '%s\n' "$1" | sed -n 's/.* table \([^ ]*\).*/\1/p')"
+	case "$table" in ''|main|254) printf 'main\n'; return 0 ;; esac
+	local found=0
+	multiwan_nft_match_source_table() { [ "$1" != "$table" ] || found=1; }
+	config_list_foreach globals rt_table_lookup multiwan_nft_match_source_table
+	[ "$found" -eq 1 ] || return 1
+	printf '%s\n' "$table"
+}
+
+multiwan_nft_rtmon_refresh_config()
+{
+	# Pin the applied map inode so unapplied UCI edits cannot change live IDs.
+	if [ "$RTMON_CONFIG_READY" -eq 1 ] &&
+	   [ "$MULTIWAN_NFT_CONNTRACK_MAP" -ef /proc/$$/fd/4 ]; then
+		return 0
+	fi
+	RTMON_CONFIG_READY=0
+	multiwan_nft_init || return 1
+	multiwan_nft_update_iface_to_table
+	multiwan_nft_stage_conntrack_map "$RTMON_WORK_DIR/config_map" || return 1
+	[ "$(cat "$RTMON_WORK_DIR/config_map")" = "$(cat "$MULTIWAN_NFT_CONNTRACK_MAP")" ] || {
+		LOG warn "Route monitor configuration does not match applied interface IDs"
+		return 1
+	}
+	exec 4<"$MULTIWAN_NFT_CONNTRACK_MAP" || return 1
+	RTMON_CONFIG_READY=1
+}
+
+multiwan_nft_rtmon_with_lock()
+{
+	local result=2 error
+	command -v flock >/dev/null 2>&1 || return 1
+	# Reopen rather than borrowing rc.common's inherited lock description.
+	exec 1000>>"${IPKG_INSTROOT}/var/lock/procd_multiwan-nft.lock" || return 1
+	while ! error=$(flock -n 1000 2>&1); do
+		if [ -n "$error" ]; then
+			LOG error "Unable to lock route update: $error"
+			exec 1000>&-
+			return 1
+		fi
+		sleep 1
+	done
+	if [ -d "$MULTIWAN_NFT_STATUS_DIR" ] &&
+	   $NFT list chain "$NFT_FAMILY" "$NFT_TABLE" multiwan_nft_hook >/dev/null 2>&1 &&
+	   ! multiwan_nft_reconfiguration_pending; then
+		result=1
+		if multiwan_nft_rtmon_refresh_config; then
+			"$@"
+			result=$?
+		fi
+	fi
+	exec 1000>&-
+	return "$result"
+}
+
+multiwan_nft_rtmon_event()
+{
+	local line="$1" family="$2" source_table
+	case "$line" in id\ [0-9]*|Deleted\ id\ [0-9]*)
+		[ "${RTMON_NEXTHOPS_ACTIVE:-1}" -ne 0 ] || return 0
+		multiwan_nft_add_all_routes "$family"
+		return $? ;;
+	esac
+	source_table="$(multiwan_nft_rtmon_source_table "$line")" || return 0
+	line="$(printf '%s\n' "$line" | sed 's/ table [^ ]*//')"
+	LOG debug "handling route update $family '$line'"
+	multiwan_nft_rtmon_route_handle "$line" "$family" "$source_table"
+}
+
+multiwan_nft_rtmon_subscribed()
+{
+	local family="$1" required entry target inodes=" " sk protocol port groups rmem wmem dump locks drops inode rest
+	# Require the family route group and RTNLGRP_NEXTHOP on the same child socket.
+	case "$family" in ipv4) required=0x80000040 ;; ipv6) required=0x80000400 ;; *) return 1 ;; esac
+	for entry in /proc/"$RTMON_PID"/fd/*; do
+		target=$(readlink "$entry") || continue
+		case "$target" in socket:\[*\])
+			inode=${target#socket:\[}; inode=${inode%\]}
+			inodes="$inodes$inode " ;;
+		esac
+	done
+	while read -r sk protocol port groups rmem wmem dump locks drops inode rest; do
+		[ "$protocol" = 0 ] || continue
+		case "$inodes" in *" $inode "*) ;; *) continue ;; esac
+		case "$groups" in ''|*[!0-9a-fA-F]*) continue ;; esac
+		[ "${#groups}" -le 8 ] || continue
+		[ $((0x$groups & required)) -ne $((required)) ] || return 0
+	done 2>/dev/null < /proc/"$RTMON_PID"/net/netlink
+	return 1
+}
+
+multiwan_nft_rtmon_start_stream()
+{
+	local family="$1" family_flag="$2" error_line count=0
+
+	# Retire the writer before discarding queued events or truncating its errors.
+	touch "$RTMON_INIT_LOCK"
+	multiwan_nft_rtmon_child_stop
+	exec 3>&-
+	rm -f "$RTMON_FIFO"
+	: > "$RTMON_ERROR_FILE" || return 1
+
+	mkfifo "$RTMON_FIFO" || {
+		LOG error "Unable to create route monitor FIFO $RTMON_FIFO"
+		return 1
+	}
+
+	# Keeping one read/write descriptor open prevents FIFO EOF spin. Integer
+	# timed reads let the parent notice a dead monitor without relying on
+	# fractional timeout behavior.
+	exec 3<> "$RTMON_FIFO" || {
+		LOG error "Unable to open route monitor FIFO $RTMON_FIFO"
+		return 1
+	}
+	$IP -o monitor route nexthop 4<&- 1000>&- > "$RTMON_FIFO" 2> "$RTMON_ERROR_FILE" &
+	RTMON_PID=$!
+	RTMON_START="$(mw_process_start_time "$RTMON_PID")"
+	if [ -z "$RTMON_START" ]; then
+		sleep 1
+		RTMON_START="$(mw_process_start_time "$RTMON_PID")"
+	fi
+	[ -n "$RTMON_START" ] || {
+		LOG error "Unable to identify route monitor child $RTMON_PID"
+		return 1
+	}
+	if ! printf '%s %s %s\n' "$RTMON_PID" "$RTMON_START" "$RTMON_OWNER_TOKEN" > "$RTMON_WORK_DIR/.child.$$" ||
+	   ! mv "$RTMON_WORK_DIR/.child.$$" "$RTMON_WORK_DIR/child"; then
+		LOG error "Unable to record owned route monitor child"
+		return 1
+	fi
+
+	# Subscribe before the snapshot so concurrent changes remain queued.
+	while ! multiwan_nft_rtmon_subscribed "$family"; do
+		if ! mw_process_identity_alive "$RTMON_PID" "$RTMON_START" || [ "$count" -ge 5 ]; then
+			LOG error "IPv$family_flag route monitor did not subscribe before initial population"
+			while IFS= read -r error_line; do
+				[ -n "$error_line" ] && LOG error "ip monitor: $error_line"
+			done < "$RTMON_ERROR_FILE"
+			return 1
+		fi
+		count=$((count + 1))
+		sleep 1
+	done
+	multiwan_nft_rtmon_with_lock multiwan_nft_add_all_routes "$family" || return 1
+	rm -f "$RTMON_INIT_LOCK"
+}
+
+multiwan_nft_rtmon_drain_events()
+{
+	local queued count=0
+	while [ "$count" -lt 256 ] && IFS= read -r -t 0 queued <&3; do
+		queued=
+		if ! IFS= read -r -t 1 queued <&3; then
+			LOG warn "Incomplete queued route notification; resynchronizing"
+			return 1
+		fi
+		count=$((count+1))
+	done
+	return 0
 }
 
 main()
 {
-	local IP family family_flag line child_status error_line
-
-	multiwan_nft_init
+	local IP family family_flag line queued child_status error_line event_status full_snapshot
 
 	family=$1
 	[ -z "$family" ] && family=ipv4
@@ -266,47 +423,22 @@ main()
 
 	multiwan_nft_rtmon_remove_orphans "$family_flag"
 	multiwan_nft_rtmon_remove_stale_workdirs "$family"
-
-	# Use a lock file to synchronize route population
-	touch "$RTMON_INIT_LOCK"
-
-	# Populate initial routes
-	# Note: multiwan_nft_set_connected_* called from init script to avoid race conditions
-	multiwan_nft_add_all_routes "$family"
-
-	# Remove lock file to signal we're ready
-	rm -f "$RTMON_INIT_LOCK"
-
 	umask 077
 	multiwan_nft_rtmon_create_workdir "$family" || {
 		LOG error "Unable to create private IPv$family_flag route monitor workspace"
 		return 1
 	}
-	mkfifo "$RTMON_FIFO" || {
-		LOG error "Unable to create route monitor FIFO $RTMON_FIFO"
-		return 1
-	}
-
-	# Keeping one read/write descriptor open prevents FIFO EOF spin. Integer
-	# timed reads let the parent notice a dead monitor without relying on
-	# fractional timeout behavior.
-	exec 3<> "$RTMON_FIFO" || {
-		LOG error "Unable to open route monitor FIFO $RTMON_FIFO"
-		return 1
-	}
-	$IP monitor route > "$RTMON_FIFO" 2> "$RTMON_ERROR_FILE" &
-	RTMON_PID=$!
-	RTMON_START="$(mw_process_start_time "$RTMON_PID")"
-	if [ -z "$RTMON_START" ]; then
-		sleep 1
-		RTMON_START="$(mw_process_start_time "$RTMON_PID")"
-	fi
-	[ -n "$RTMON_START" ] || {
-		LOG error "Unable to identify route monitor child $RTMON_PID"
-		return 1
-	}
+	multiwan_nft_rtmon_start_stream "$family" "$family_flag" || return 1
 
 	while :; do
+		if [ -s "$RTMON_ERROR_FILE" ]; then
+			LOG warn "IPv$family_flag route notification stream failed; resynchronizing"
+			while IFS= read -r error_line; do
+				[ -n "$error_line" ] && LOG warn "ip monitor: $error_line"
+			done < "$RTMON_ERROR_FILE"
+			multiwan_nft_rtmon_start_stream "$family" "$family_flag" || return 1
+			continue
+		fi
 		line=""
 		if ! IFS= read -r -t 5 line <&3; then
 			if mw_process_identity_alive "$RTMON_PID" "$RTMON_START"; then
@@ -323,9 +455,38 @@ main()
 			return 1
 		fi
 		[ -n "$line" ] || continue
-		[ -z "${line##*table*}" ] && continue
-		LOG debug "handling route update $family '$line'"
-		multiwan_nft_rtmon_route_handle "$line" "$family"
+		full_snapshot=0
+		case "$line" in
+			id\ [0-9]*|Deleted\ id\ [0-9]*)
+				[ "${RTMON_NEXTHOPS_ACTIVE:-1}" -ne 0 ] && full_snapshot=1 ;;
+			*)
+				case "${RTMON_NEXTHOPS_ACTIVE:-0}:$line" in 1:*|*" nhid "*|*"nexthop "*)
+					multiwan_nft_rtmon_source_table "$line" >/dev/null && full_snapshot=1 ;;
+				esac
+				# Coalesce source bursts; unused nexthop notifications retain their fast path.
+				if [ "$full_snapshot" -eq 0 ] &&
+				   multiwan_nft_rtmon_source_table "$line" >/dev/null &&
+				   IFS= read -r -t 0 queued <&3; then
+					full_snapshot=1
+				fi ;;
+		esac
+		if [ "$full_snapshot" -eq 1 ] && ! multiwan_nft_rtmon_drain_events; then
+			multiwan_nft_rtmon_start_stream "$family" "$family_flag" || return 1
+			continue
+		fi
+		event_status=0
+		if [ "$full_snapshot" -eq 1 ]; then
+			# Drain before the fresh snapshot; later changes remain queued for the next pass.
+			multiwan_nft_rtmon_with_lock multiwan_nft_add_all_routes "$family" || event_status=$?
+		else
+			multiwan_nft_rtmon_with_lock multiwan_nft_rtmon_event "$line" "$family" || event_status=$?
+		fi
+		case "$event_status" in
+			0|2) ;; # A stopped or guarded service intentionally refuses updates.
+			*)
+				LOG warn "IPv$family_flag route update failed; resynchronizing"
+				multiwan_nft_rtmon_start_stream "$family" "$family_flag" || return 1 ;;
+		esac
 	done
 }
 [ "${MULTIWAN_NFT_RTMON_LIBRARY_ONLY:-0}" = "1" ] || main "$@"

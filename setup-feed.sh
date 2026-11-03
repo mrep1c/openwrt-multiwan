@@ -5,15 +5,12 @@ MODE="${1:-setup}"
 REPO="${REPO:-mrep1c/openwrt-multiwan}"
 RELEASE_BASE="${RELEASE_BASE:-https://github.com/${REPO}/releases/download}"
 
-APK_RELEASE_TAG="${APK_RELEASE_TAG:-apk-25.12-noarch}"
-APK_KEY_URL="${APK_KEY_URL:-${RELEASE_BASE}/${APK_RELEASE_TAG}/mrep1c-openwrt-multiwan-apk.pem}"
-APK_FEED_URL="${APK_FEED_URL:-${RELEASE_BASE}/${APK_RELEASE_TAG}/packages.adb}"
+APK_RELEASE_TAG="${APK_RELEASE_TAG:-}"
+APK_KEY_URL="${APK_KEY_URL:-}"
+APK_FEED_URL="${APK_FEED_URL:-}"
 APK_KEY_FILE="${APK_KEY_FILE:-/etc/apk/keys/mrep1c-openwrt-multiwan-apk.pem}"
 APK_FEEDS_FILE="${APK_FEEDS_FILE:-/etc/apk/repositories.d/customfeeds.list}"
 
-OPKG_KEY_URL="${OPKG_KEY_URL:-}"
-OPKG_FEED_URL="${OPKG_FEED_URL:-}"
-OPKG_KEY_TMP="${OPKG_KEY_TMP:-/tmp/mrep1c-openwrt-multiwan-opkg.pub}"
 OPKG_FEEDS_FILE="${OPKG_FEEDS_FILE:-/etc/opkg/customfeeds.conf}"
 
 MAIN_PACKAGES="multiwan-nft multiwan-qos"
@@ -32,7 +29,6 @@ Usage: sh setup-feed.sh [setup|install|main|luci|remove|help]
 
 Environment overrides:
   APK_RELEASE_TAG, APK_FEED_URL, APK_KEY_URL
-  OPKG_FEED_URL, OPKG_KEY_URL
 EOF
 }
 
@@ -75,19 +71,6 @@ openwrt_release() {
 	printf '%s\n' "$release"
 }
 
-opkg_release_tag() {
-	release="$(openwrt_release)"
-	case "$release" in
-		24.10*) echo "opkg-24.10-noarch" ;;
-		23.05*) echo "opkg-23.05-noarch" ;;
-		*)
-			echo "[ERROR] Unsupported OPKG OpenWrt release: ${release:-unknown}." >&2
-			echo "[ERROR] Supported OPKG releases are 24.10.x and 23.05.x." >&2
-			exit 1
-			;;
-	esac
-}
-
 remove_apk_feed_entries() {
 	mkdir -p "$(dirname "$APK_FEEDS_FILE")"
 	touch "$APK_FEEDS_FILE"
@@ -110,6 +93,26 @@ remove_opkg_feed_entries() {
 }
 
 apk_setup_feed() {
+	if [ -z "$APK_RELEASE_TAG" ] && [ -z "$APK_FEED_URL" ]; then
+		case "$(openwrt_release)" in 25.12*) ;; *)
+			echo '[ERROR] Current MultiWAN NFT packages require OpenWrt 25.12.x.' >&2
+			return 1 ;;
+		esac
+		architecture=""
+		if [ -r /etc/openwrt_release ]; then
+			. /etc/openwrt_release
+			architecture="${DISTRIB_ARCH:-}"
+		fi
+		[ -n "$architecture" ] || architecture="$(apk --print-arch)"
+		case "$architecture" in
+			aarch64_generic|arm_cortex-a7_neon-vfpv4|mipsel_24kc) ;;
+			*) echo "[ERROR] No native MultiWAN feed for architecture $architecture. Build the source feed with the matching SDK." >&2; return 1 ;;
+		esac
+		APK_RELEASE_TAG="apk-25.12-$architecture"
+	fi
+	APK_RELEASE_TAG="${APK_RELEASE_TAG:-apk-25.12-noarch}"
+	APK_KEY_URL="${APK_KEY_URL:-${RELEASE_BASE}/${APK_RELEASE_TAG}/mrep1c-openwrt-multiwan-apk.pem}"
+	APK_FEED_URL="${APK_FEED_URL:-${RELEASE_BASE}/${APK_RELEASE_TAG}/packages.adb}"
 	echo "[INFO] Installing APK public key"
 	mkdir -p "$(dirname "$APK_KEY_FILE")"
 	fetch_file "$APK_KEY_URL" "$APK_KEY_FILE"
@@ -125,34 +128,10 @@ apk_setup_feed() {
 	echo "[INFO] Feed: $APK_FEED_URL"
 }
 
-opkg_urls() {
-	tag="$(opkg_release_tag)"
-	OPKG_KEY_URL="${OPKG_KEY_URL:-${RELEASE_BASE}/${tag}/mrep1c-openwrt-multiwan-opkg.pub}"
-	OPKG_FEED_URL="${OPKG_FEED_URL:-${RELEASE_BASE}/${tag}}"
-}
-
 opkg_setup_feed() {
-	opkg_urls
-
-	if ! command -v opkg-key >/dev/null 2>&1; then
-		echo "[ERROR] opkg-key is required to install the MultiWAN OPKG feed key." >&2
-		exit 1
-	fi
-
-	echo "[INFO] Installing OPKG public key"
-	fetch_file "$OPKG_KEY_URL" "$OPKG_KEY_TMP"
-	opkg-key add "$OPKG_KEY_TMP"
-
-	echo "[INFO] Adding MultiWAN OPKG feed"
-	remove_opkg_feed_entries
-	printf 'src/gz multiwan %s\n' "$OPKG_FEED_URL" >> "$OPKG_FEEDS_FILE"
-
-	echo "[INFO] Running opkg update"
-	opkg update
-	echo "[OK] MultiWAN OPKG feed is configured"
-	echo "[INFO] Feed: $OPKG_FEED_URL"
+	echo '[ERROR] OPKG feeds are frozen. Current MultiWAN NFT requires OpenWrt 25.12.x and a native APK feed.' >&2
+	return 1
 }
-
 setup_feed() {
 	pm="$(package_manager)"
 	case "$pm" in

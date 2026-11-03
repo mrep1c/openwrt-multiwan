@@ -13,6 +13,7 @@
 	}
 
 	config_load 'multiwan-nft'
+	multiwan_nft_get_logical_iface INTERFACE "$INTERFACE"
 
 	config_get_bool enabled "$INTERFACE" enabled 0
 	[ "${enabled}" -eq 1 ] || {

@@ -17,10 +17,14 @@ document.querySelector('head').appendChild(E('link', {
 }));
 
 function renderMwan3Status(status) {
+	var statusview = status.reconfiguration_pending
+		? '<div class="alert-message warning">%h</div>'.format(_('Routing configuration is incomplete. Affected connections remain blocked. Check the system log if this persists.'))
+		: '';
+	if (status.running === false)
+		return statusview + '<div class="alert-message warning">%h</div>'.format(_('MultiWAN routing is stopped.'));
 	if (!status.interfaces)
-		return '<strong>%h</strong>'.format(_('No MultiWAN interfaces found'));
+		return statusview + '<strong>%h</strong>'.format(_('No MultiWAN interfaces found'));
 
-	var statusview = '';
 	for ( var iface in status.interfaces) {
 		var state = '';
 		var css = '';
@@ -44,6 +48,14 @@ function renderMwan3Status(status) {
 				state = _('Waiting for interface');
 				css = 'warning';
 				break;
+			case 'connecting':
+				state = _('Connecting');
+				css = 'warning';
+				break;
+			case 'disconnecting':
+				state = _('Disconnecting');
+				css = 'warning';
+				break;
 			case 'notracking':
 				state = _('No Tracking');
 				if ((status.interfaces[iface].uptime) > 0) {
@@ -57,11 +69,13 @@ function renderMwan3Status(status) {
 					tname = '';
 				}
 				break;
-			default:
+			case 'disabled':
 				state = _('Disabled');
 				css = 'warning';
-				time = '';
-				tname = '';
+				break;
+			default:
+				state = _('Unknown');
+				css = 'warning';
 				break;
 		}
 

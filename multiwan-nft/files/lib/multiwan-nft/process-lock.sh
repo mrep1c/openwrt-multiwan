@@ -41,6 +41,25 @@ mw_process_identity_alive() {
 	[ "$current_start" = "$expected_start" ]
 }
 
+mw_rtmon_orphan_pids() {
+	local family="$1" directory permissions pid start token extra
+	case "$family" in ipv4|ipv6) ;; *) return 1 ;; esac
+	for directory in /tmp/multiwan-nft-rtmon-"$family".*; do
+		[ -d "$directory" ] && [ ! -L "$directory" ] && [ -O "$directory" ] || continue
+		permissions=$(LC_ALL=C ls -ld "$directory") || continue
+		[ "${permissions%% *}" = drwx------ ] || continue
+		[ ! -L "$directory/owner" ] && [ ! -L "$directory/child" ] || continue
+		mw_lock_read_owner "$directory" || continue
+		case "$MW_LOCK_OWNER_TOKEN" in "rtmon:$MW_LOCK_OWNER_PID:$MW_LOCK_OWNER_START:"?*) ;; *) continue ;; esac
+		mw_process_identity_alive "$MW_LOCK_OWNER_PID" "$MW_LOCK_OWNER_START" && continue
+		[ -r "$directory/child" ] || continue
+		read -r pid start token extra < "$directory/child" || continue
+		[ -z "$extra" ] && [ "$token" = "$MW_LOCK_OWNER_TOKEN" ] || continue
+		mw_process_identity_alive "$pid" "$start" || continue
+		printf '%s:%s\n' "$pid" "$start"
+	done
+}
+
 mw_lock_read_owner() {
 	local lock_dir="$1"
 

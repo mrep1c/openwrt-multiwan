@@ -1,255 +1,309 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * Copyright (C) 2020 Aaron Goodman <aaronjg@alumni.stanford.edu>. All Rights Reserved.
- */
+/* Copyright (C) 2020 Aaron Goodman <aaronjg@alumni.stanford.edu>. */
 
-/*
- * sockopt_wrap.c provides a shared library that intercepts syscalls to various
- * networking functions to bind the sockets a source IP address and network device
- * and to set the firewall mark on otugoing packets. Parameters are set using the
- * DEVICE, SRCIP, FWMARK environment variables.
- *
- *  Additionally the FAMILY environment variable can be set to either 'ipv4' or
- *  'ipv6' to cause sockets opened with ipv6 or ipv4 to fail, respectively.
- *
- *  Each environment variable is optional, and if not set, the library will not
- *  enforce the particular parameter.
- */
-
+/* Bind dynamically linked commands to DEVICE/SRCIP/FWMARK and optional FAMILY. */
 #define _GNU_SOURCE
-#include <dlfcn.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
 #include <arpa/inet.h>
-#include <net/ethernet.h>
+#include <dlfcn.h>
+#include <errno.h>
 #include <linux/if_packet.h>
 #include <net/if.h>
+#include <netdb.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
-static int (*next_socket)(int domain, int type, int protocol);
-static int (*next_setsockopt)(int sockfd, int level, int optname,
-                              const void *optval, socklen_t optlen);
-static int (*next_bind)(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
-static int (*next_close)(int fd);
-static ssize_t (*next_send)(int sockfd, const void *buf, size_t len, int flags);
-static ssize_t (*next_sendto)(int sockfd, const void *buf, size_t len, int flags,
-                              const struct sockaddr *dest_addr, socklen_t addrlen);
-static ssize_t (*next_sendmsg)(int sockfd, const struct msghdr *msg, int flags);
-static int (*next_connect)(int sockfd, const struct sockaddr *addr,
-                           socklen_t addrlen);
-static int device=0;
-static struct sockaddr_in source4 = {0};
-#ifdef CONFIG_IPV6
-static struct sockaddr_in6 source6 = {0};
+static int (*next_socket)(int, int, int);
+static int (*next_setsockopt)(int, int, int, const void *, socklen_t);
+static int (*next_bind)(int, const struct sockaddr *, socklen_t);
+static int (*next_close)(int);
+static int (*next_getaddrinfo)(const char *, const char *, const struct addrinfo *,
+                              struct addrinfo **);
+static int (*next_connect)(int, const struct sockaddr *, socklen_t);
+static ssize_t (*next_send)(int, const void *, size_t, int);
+static ssize_t (*next_sendto)(int, const void *, size_t, int,
+                            const struct sockaddr *, socklen_t);
+static ssize_t (*next_sendmsg)(int, const struct msghdr *, int);
+/* The GNU extension uses different flag signedness in glibc and musl. */
+#ifdef __GLIBC__
+typedef int sendmmsg_flags_t;
+#else
+typedef unsigned int sendmmsg_flags_t;
 #endif
-static struct sockaddr * source = 0;
-static int sockaddr_size = 0;
-static int is_bound [1024] = {0};
+static int (*next_sendmmsg)(int, struct mmsghdr *, unsigned int, sendmmsg_flags_t);
 
-#define next_func(x)\
-void set_next_##x(){\
-	if (next_##x) return;\
-	next_##x = dlsym(RTLD_NEXT, #x);\
-	dlerror_handle();\
-	return;\
+static char device[IFNAMSIZ];
+static uint32_t mark;
+static int has_mark, family, source_family, config_error;
+static struct sockaddr_storage source;
+static socklen_t source_size;
+
+static void __attribute__((constructor)) initialize(void)
+{
+    const char *value;
+    char *end;
+    unsigned long long parsed;
+
+#define RESOLVE(name) do { \
+    const char *error; \
+    dlerror(); \
+    next_##name = dlsym(RTLD_NEXT, #name); \
+    error = dlerror(); \
+    if (error) { \
+        fprintf(stderr, "multiwan socket wrapper: %s\n", error); \
+        _exit(127); \
+    } \
+} while (0)
+    RESOLVE(socket);
+    RESOLVE(setsockopt);
+    RESOLVE(bind);
+    RESOLVE(close);
+    RESOLVE(getaddrinfo);
+    RESOLVE(connect);
+    RESOLVE(send);
+    RESOLVE(sendto);
+    RESOLVE(sendmsg);
+    RESOLVE(sendmmsg);
+#undef RESOLVE
+
+    value = getenv("DEVICE");
+    if (value && *value) {
+        if (strlen(value) >= sizeof(device))
+            config_error = ENAMETOOLONG;
+        else
+            strcpy(device, value);
+    }
+    value = getenv("FWMARK");
+    if (value && *value) {
+        errno = 0;
+        parsed = strtoull(value, &end, 0);
+        if (errno || *end || value[0] == '-' || parsed > UINT32_MAX)
+            config_error = EINVAL;
+        else {
+            has_mark = 1;
+            mark = (uint32_t)parsed;
+        }
+    }
+    value = getenv("FAMILY");
+    if (value && *value) {
+        if (!strcmp(value, "ipv4"))
+            family = AF_INET;
+        else if (!strcmp(value, "ipv6"))
+            family = AF_INET6;
+        else
+            config_error = EINVAL;
+    }
+    value = getenv("SRCIP");
+    if (value && *value) {
+        struct sockaddr_in *v4 = (struct sockaddr_in *)&source;
+        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&source;
+        if (inet_pton(AF_INET, value, &v4->sin_addr) == 1) {
+            source_family = source.ss_family = AF_INET;
+            source_size = sizeof(*v4);
+        } else if (inet_pton(AF_INET6, value, &v6->sin6_addr) == 1) {
+            source_family = source.ss_family = AF_INET6;
+            source_size = sizeof(*v6);
+        } else
+            config_error = EINVAL;
+        if (family && source_family && family != source_family)
+            config_error = EINVAL;
+    }
 }
 
-void dlerror_handle()
+int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints,
+                struct addrinfo **result)
 {
-	char *msg;
-	if ((msg = dlerror()) != NULL) {
-		fprintf(stderr, "socket: dlopen failed : %s\n", msg);
-		fflush(stderr);
-		exit(EXIT_FAILURE);
-	}
+    struct addrinfo selected = {0};
+    int domain = family ? family : source_family;
+
+    if (config_error) {
+        errno = config_error;
+        return EAI_SYSTEM;
+    }
+    if (!domain)
+        return next_getaddrinfo(node, service, hints, result);
+    /* Nping canonicalizes both families while enumerating interface addresses. */
+    if (hints && hints->ai_family != AF_UNSPEC && (hints->ai_flags & AI_NUMERICHOST))
+        return next_getaddrinfo(node, service, hints, result);
+    if (hints)
+        selected = *hints;
+    if (selected.ai_family != AF_UNSPEC && selected.ai_family != domain)
+        return EAI_FAMILY;
+    selected.ai_family = domain;
+    /* A mapped IPv4 address would bypass an IPv6-only family selection. */
+    selected.ai_flags &= ~(AI_V4MAPPED | AI_ALL);
+    return next_getaddrinfo(node, service, &selected, result);
 }
 
-next_func(bind);
-next_func(close);
-next_func(setsockopt);
-next_func(socket);
-next_func(send);
-next_func(sendto);
-next_func(sendmsg);
-next_func(connect);
-
-void dobind(int sockfd)
+static int source_matches(const struct sockaddr_storage *address)
 {
-	if (source && sockfd < 1024 && !is_bound[sockfd]) {
-		set_next_bind();
-		if (next_bind(sockfd, source, sockaddr_size)) {
-			perror("failed to bind to ip address");
-			next_close(sockfd);
-			exit(EXIT_FAILURE);
-		}
-		is_bound[sockfd] = 1;
-	}
+    if (address->ss_family == AF_INET)
+        return ((const struct sockaddr_in *)address)->sin_addr.s_addr ==
+               ((const struct sockaddr_in *)&source)->sin_addr.s_addr;
+    return !memcmp(&((const struct sockaddr_in6 *)address)->sin6_addr,
+                   &((const struct sockaddr_in6 *)&source)->sin6_addr,
+                   sizeof(struct in6_addr));
 }
 
-int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
+static int check_family(int domain)
 {
-	set_next_connect();
-	dobind(sockfd);
-	return next_connect(sockfd, addr, addrlen);
+    if ((domain == AF_INET || domain == AF_INET6) &&
+        ((family && family != domain) || (source_family && source_family != domain))) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
+    return 0;
 }
 
-ssize_t send(int sockfd, const void *buf, size_t len, int flags)
+static int bind_source(int fd)
 {
-	set_next_send();
-	dobind(sockfd);
-	return next_send(sockfd, buf, len, flags);
+    struct sockaddr_storage address;
+    struct sockaddr_storage selected = source;
+    socklen_t size = sizeof(address);
+    int saved;
+
+    if (!source_family && !family)
+        return 0;
+    if (getsockname(fd, (struct sockaddr *)&address, &size))
+        return -1;
+    if (address.ss_family != AF_INET && address.ss_family != AF_INET6)
+        return 0;
+    if (check_family(address.ss_family))
+        return -1;
+    if (!source_family)
+        return 0;
+    if (source_matches(&address))
+        return 0;
+    if (source_family == AF_INET6 && device[0])
+        ((struct sockaddr_in6 *)&selected)->sin6_scope_id = if_nametoindex(device);
+    if (!next_bind(fd, (struct sockaddr *)&selected, source_size))
+        return 0;
+    saved = errno;
+    /* Another thread can bind the same underlying socket through a dup fd. */
+    if ((saved == EINVAL || saved == EADDRINUSE) &&
+        !getsockname(fd, (struct sockaddr *)&address, &size) && source_matches(&address))
+        return 0;
+    errno = saved;
+    return -1;
 }
 
-ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
-               const struct sockaddr *dest_addr, socklen_t addrlen)
+int connect(int fd, const struct sockaddr *address, socklen_t size)
 {
-	set_next_sendto();
-	dobind(sockfd);
-	return next_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+    if (bind_source(fd))
+        return -1;
+    return next_connect(fd, address, size);
 }
 
-ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags)
+ssize_t send(int fd, const void *buffer, size_t size, int flags)
 {
-	set_next_sendmsg();
-	dobind(sockfd);
-	return next_sendmsg(sockfd, msg, flags);
+    if (bind_source(fd))
+        return -1;
+    return next_send(fd, buffer, size, flags);
 }
 
-int bind (int sockfd, const struct sockaddr *addr, socklen_t addrlen)
+ssize_t sendto(int fd, const void *buffer, size_t size, int flags,
+               const struct sockaddr *address, socklen_t length)
 {
-	set_next_bind();
-	if (device && addr->sa_family == AF_PACKET) {
-		((struct sockaddr_ll*)addr)->sll_ifindex=device;
-	}
-	else if (source && addr->sa_family == AF_INET) {
-		((struct sockaddr_in*)addr)->sin_addr = source4.sin_addr;
-	}
-#ifdef CONFIG_IPV6
-	else if (source && addr->sa_family == AF_INET6) {
-		((struct sockaddr_in6*)addr)->sin6_addr = source6.sin6_addr;
-	}
-#endif
-	if (sockfd < 1024)
-		is_bound[sockfd] = 1;
-	return next_bind(sockfd, addr, addrlen);
+    if (bind_source(fd))
+        return -1;
+    return next_sendto(fd, buffer, size, flags, address, length);
 }
 
-int close (int sockfd)
+ssize_t sendmsg(int fd, const struct msghdr *message, int flags)
 {
-	set_next_close();
-	if (sockfd < 1024)
-		is_bound[sockfd]=0;
-	return next_close(sockfd);
+    if (bind_source(fd))
+        return -1;
+    return next_sendmsg(fd, message, flags);
 }
 
-int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen)
+int sendmmsg(int fd, struct mmsghdr *messages, unsigned int count, sendmmsg_flags_t flags)
 {
-	set_next_setsockopt();
-	if (level == SOL_SOCKET && (optname == SO_MARK || optname == SO_BINDTODEVICE))
-		return 0;
-	return next_setsockopt(sockfd, level, optname, optval, optlen);
+    if (bind_source(fd))
+        return -1;
+    return next_sendmmsg(fd, messages, count, flags);
+}
+
+int bind(int fd, const struct sockaddr *address, socklen_t size)
+{
+    struct sockaddr_storage selected;
+
+    if (!address || size < sizeof(address->sa_family) || size > sizeof(selected))
+        return next_bind(fd, address, size);
+    if (check_family(address->sa_family))
+        return -1;
+    if (source_family && address->sa_family == source_family && size >= source_size) {
+        memcpy(&selected, address, source_size);
+        if (source_family == AF_INET)
+            ((struct sockaddr_in *)&selected)->sin_addr =
+                ((struct sockaddr_in *)&source)->sin_addr;
+        else {
+            ((struct sockaddr_in6 *)&selected)->sin6_addr =
+                ((struct sockaddr_in6 *)&source)->sin6_addr;
+            if (device[0])
+                ((struct sockaddr_in6 *)&selected)->sin6_scope_id = if_nametoindex(device);
+        }
+        return next_bind(fd, (struct sockaddr *)&selected, source_size);
+    }
+    if (device[0] && address->sa_family == AF_PACKET && size >= sizeof(struct sockaddr_ll)) {
+        memcpy(&selected, address, sizeof(struct sockaddr_ll));
+        ((struct sockaddr_ll *)&selected)->sll_ifindex = if_nametoindex(device);
+        if (!((struct sockaddr_ll *)&selected)->sll_ifindex) {
+            errno = ENODEV;
+            return -1;
+        }
+        return next_bind(fd, (struct sockaddr *)&selected, sizeof(struct sockaddr_ll));
+    }
+    return next_bind(fd, address, size);
+}
+
+int setsockopt(int fd, int level, int option, const void *value, socklen_t size)
+{
+    if (level == SOL_SOCKET && option == SO_MARK && has_mark)
+        return next_setsockopt(fd, level, option, &mark, sizeof(mark));
+    if (level == SOL_SOCKET && option == SO_BINDTODEVICE && device[0])
+        return next_setsockopt(fd, level, option, device, strlen(device) + 1);
+    return next_setsockopt(fd, level, option, value, size);
 }
 
 int socket(int domain, int type, int protocol)
 {
-	int handle;
+    int fd, saved;
+    struct sockaddr_ll packet = { .sll_family = AF_PACKET, .sll_protocol = protocol };
 
-	const char *socket_str = getenv("DEVICE");
-	const char *srcip_str = getenv("SRCIP");
-	const char *fwmark_str = getenv("FWMARK");
-	const char *family_str = getenv("FAMILY");
-	const int iface_len = socket_str ? strnlen(socket_str, IFNAMSIZ) : 0;
-	int has_family = family_str && *family_str != 0;
-	int has_srcip = srcip_str && *srcip_str != 0;
-	const int fwmark = fwmark_str ? (int)strtol(fwmark_str, NULL, 0) : 0;
+    if (domain != AF_INET && domain != AF_INET6 && domain != AF_PACKET)
+        return next_socket(domain, type, protocol);
+    if (config_error) {
+        errno = config_error;
+        return -1;
+    }
+    /* Interface ioctls need IPv4 datagram sockets even during IPv6 probes. */
+    if ((type & ~(SOCK_CLOEXEC | SOCK_NONBLOCK)) != SOCK_DGRAM && check_family(domain))
+        return -1;
+    fd = next_socket(domain, type, protocol);
+    if (fd < 0)
+        return fd;
+    if (device[0]) {
+        if (domain == AF_PACKET) {
+            packet.sll_ifindex = if_nametoindex(device);
+            if (!packet.sll_ifindex) {
+                errno = ENODEV;
+                goto failed;
+            }
+            if (next_bind(fd, (struct sockaddr *)&packet, sizeof(packet)))
+                goto failed;
+        } else if (next_setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, device, strlen(device) + 1))
+            goto failed;
+    }
+    if (has_mark && next_setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)))
+        goto failed;
+    return fd;
 
-	set_next_close();
-	set_next_socket();
-	set_next_send();
-	set_next_setsockopt();
-	set_next_sendmsg();
-	set_next_sendto();
-	set_next_connect();
-	if(has_family) {
-#ifdef CONFIG_IPV6
-		if(domain == AF_INET && strncmp(family_str,"ipv6",4) == 0)
-			return -1;
-#endif
-		if(domain == AF_INET6 && strncmp(family_str,"ipv4",4) == 0)
-			return -1;
-	}
-
-	if (domain != AF_INET
-#ifdef CONFIG_IPV6
-	    && domain != AF_INET6
-#endif
-		) {
-		return next_socket(domain, type, protocol);
-	}
-
-
-	if (iface_len > 0) {
-		if (iface_len == IFNAMSIZ) {
-			fprintf(stderr,"socket: Too long iface name\n");
-			fflush(stderr);
-			exit(EXIT_FAILURE);
-		}
-	}
-
-	if (has_srcip) {
-		int s;
-		void * addr_buf;
-		if (domain == AF_INET) {
-			addr_buf = &source4.sin_addr;
-			sockaddr_size=sizeof source4;
-			memset(&source4, 0, sockaddr_size);
-			source4.sin_family = domain;
-			source = (struct sockaddr*)&source4;
-		}
-#ifdef CONFIG_IPV6
-		else {
-			addr_buf = &source6.sin6_addr;
-			sockaddr_size=sizeof source6;
-			memset(&source6, 0, sockaddr_size);
-			source6.sin6_family=domain;
-			source = (struct sockaddr*)&source6;
-		}
-#endif
-		s = inet_pton(domain, srcip_str, addr_buf);
-		if (s == 0) {
-			fprintf(stderr, "socket: ip address invalid format for family %s\n",
-			        domain == AF_INET ? "AF_INET" : domain == AF_INET6 ?
-			        "AF_INET6" : "unknown");
-			return -1;
-		}
-		if (s < 0) {
-			perror("inet_pton");
-			exit(EXIT_FAILURE);
-		}
-	}
-
-	handle = next_socket(domain, type, protocol);
-	if (handle == -1 ) {
-		return handle;
-	}
-
-	if (iface_len > 0) {
-		device=if_nametoindex(socket_str);
-		if (next_setsockopt(handle, SOL_SOCKET, SO_BINDTODEVICE,
-		                    socket_str, iface_len + 1)) {
-			perror("socket: setting interface name failed with error");
-			next_close(handle);
-			exit(EXIT_FAILURE);
-		}
-	}
-
-	if (fwmark > 0) {
-		if (next_setsockopt(handle, SOL_SOCKET, SO_MARK,
-		                    &fwmark, sizeof fwmark)) {
-			perror("failed setting mark for socket");
-			next_close(handle);
-			exit(EXIT_FAILURE);
-		}
-	}
-	return handle;
+failed:
+    saved = errno;
+    next_close(fd);
+    errno = saved;
+    return -1;
 }

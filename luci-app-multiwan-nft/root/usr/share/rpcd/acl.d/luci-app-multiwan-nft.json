@@ -8,14 +8,13 @@
 				"/usr/bin/nping": [ "list" ],
 				"/usr/bin/arping": [ "list" ],
 				"/usr/sbin/multiwan-nft status": [ "exec" ],
-				"/usr/sbin/multiwan-nft ifup *": [ "exec" ],
-				"/usr/sbin/multiwan-nft ifdown *": [ "exec" ],
 				"/usr/sbin/multiwan-nft internal ipv4": [ "exec" ],
 				"/usr/sbin/multiwan-nft internal ipv6": [ "exec" ],
 				"/usr/libexec/luci-multiwan-nft diag * *": [ "exec" ],
 				"/usr/libexec/luci-multiwan-nft ipset *": [ "exec" ]
 			},
 			"ubus": {
+				"file": [ "exec" ],
 				"multiwan_nft": [ "status" ]
 			},
 			"uci": [ "multiwan-nft", "network" ]

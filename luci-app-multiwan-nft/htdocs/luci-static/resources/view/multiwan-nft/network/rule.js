@@ -103,8 +103,12 @@ return view.extend({
 		o.modalonly = true;
 		o.depends('sticky', '1');
 
-		o = s.option(form.Value, 'ipset', _('IPset'),
-			_('Name of IPset rule. Requires IPset rule in /etc/dnsmasq.conf (eg \"ipset=/youtube.com/youtube\")'));
+		o = s.option(form.Value, 'ipset', _('NFT set'),
+			_('Address set in table inet multiwan_nft. Missing sets are created from this rule family (Any defaults to IPv4). For dnsmasq-full use nftset=/youtube.com/4#inet#multiwan_nft#youtube for set youtube; use 6# and an IPv6 rule for IPv6. Sets survive service restarts.'));
+		o.validate = function(section_id, value) {
+			return !value || (/^[a-zA-Z0-9_.-]+$/.test(value) && !/^multiwan_nft_/.test(value)) ||
+				_('Use letters, digits, dots, hyphens or underscores; multiwan_nft_ names are reserved.');
+		};
 		o.value('', _('-- Please choose --'));
 		var ipsets = data[0].split(/\n/);
 		for (var i = 0; i < ipsets.length; i++) {
