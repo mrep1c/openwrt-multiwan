@@ -56,6 +56,9 @@ with tempfile.TemporaryDirectory() as temporary:
     settings = sdk / "Config-build.in"
     original_settings = ('config TARGET_BOARD\n\tstring\n\tdefault "rockchip"\n\n'
                          'config PACKAGE_kmod-unused\n\ttristate\n\tdefault m\n\n'
+                         'config PACKAGE_kmod-explicit\n\ttristate\n\tdefault m\n\n'
+                         'config PACKAGE_kmod-base\n\ttristate\n\tdefault m\n\n'
+                         'config PACKAGE_kmod-leaf\n\ttristate\n\tdefault m\n\n'
                          'config PACKAGE_kmod-required\n\tbool\n\tdefault y\n\n'
                          'config SIGNED_PACKAGES\n\tbool\n\tdefault y\n')
     settings.write_text(original_settings)
@@ -64,14 +67,26 @@ with tempfile.TemporaryDirectory() as temporary:
     config.write_text(retained + "CONFIG_ALL=y\nCONFIG_ALL_KMODS=y\n# CONFIG_ALL_NONSHARED is not set\n"
                       "CONFIG_PACKAGE_unrelated=m\n# CONFIG_PACKAGE_old is not set\n")
     configure = [sys.executable, str(repo / "scripts/configure-openwrt-sdk.py"), str(sdk)]
-    subprocess.run([*configure, "multiwan-nft", "multiwan-nft-sockopt"], check=True)
+    subprocess.run([*configure, "multiwan-nft", "multiwan-nft-sockopt", "kmod-explicit"], check=True)
     expected = retained + "# CONFIG_ALL is not set\n# CONFIG_ALL_NONSHARED is not set\n# CONFIG_ALL_KMODS is not set\n" + \
-        "CONFIG_PACKAGE_multiwan-nft=m\nCONFIG_PACKAGE_multiwan-nft-sockopt=m\n"
+        "CONFIG_PACKAGE_multiwan-nft=m\nCONFIG_PACKAGE_multiwan-nft-sockopt=m\nCONFIG_PACKAGE_kmod-explicit=m\n"
     assert config.read_text() == expected, "Package selection changed SDK target/signing settings"
-    expected_settings = original_settings.replace('\ttristate\n\tdefault m\n', '\ttristate\n\tdefault m if ALL_KMODS\n')
+    expected_settings = original_settings
+    for name in ("unused", "base", "leaf"):
+        expected_settings = expected_settings.replace(f'config PACKAGE_kmod-{name}\n\ttristate\n\tdefault m\n', f'config PACKAGE_kmod-{name}\n\ttristate\n\tdefault m if ALL_KMODS\n')
     assert settings.read_text() == expected_settings, "SDK target/signing or built-in defaults changed"
-    subprocess.run([*configure, "multiwan-nft", "multiwan-nft-sockopt"], check=True)
+    subprocess.run([*configure, "multiwan-nft", "multiwan-nft-sockopt", "kmod-explicit"], check=True)
     assert config.read_text() == expected and settings.read_text() == expected_settings, "Package selection is not idempotent"
+    (sdk / "tmp").mkdir()
+    (sdk / "tmp/.packageinfo").write_text('Package: multiwan-nft\nDepends: +IPV6:kmod-leaf\n\n'
+                                        'Package: kmod-leaf\nDepends: +kmod-base\n\n'
+                                        'Package: kmod-base\nDepends: +kmod-leaf\n')
+    expected += "CONFIG_PACKAGE_kmod-base=m\nCONFIG_PACKAGE_kmod-leaf=m\n"
+    for name in ("base", "leaf"):
+        expected_settings = expected_settings.replace(f'config PACKAGE_kmod-{name}\n\ttristate\n\tdefault m if ALL_KMODS\n', f'config PACKAGE_kmod-{name}\n\ttristate\n\tdefault m\n')
+    for _ in range(2):
+        subprocess.run([*configure, "multiwan-nft", "multiwan-nft-sockopt", "kmod-explicit"], check=True)
+        assert config.read_text() == expected and settings.read_text() == expected_settings, "Transitive module dependencies were lost or unrelated defaults changed"
     for invalid in ("../escape", "bad=name", "two packages", ""):
         result = subprocess.run([*configure, invalid], capture_output=True, text=True)
         assert result.returncode != 0 and config.read_text() == expected and settings.read_text() == expected_settings

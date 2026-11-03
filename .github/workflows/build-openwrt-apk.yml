@@ -203,6 +203,11 @@ jobs:
             multiwan-nft multiwan-nft-sockopt multiwan-nft-nping \
             luci-app-multiwan-nft multiwan-qos luci-app-multiwan-qos
           make defconfig
+          # Reconcile hidden module dependencies after the SDK generates package metadata.
+          python3 "$GITHUB_WORKSPACE/scripts/configure-openwrt-sdk.py" . \
+            multiwan-nft multiwan-nft-sockopt multiwan-nft-nping \
+            luci-app-multiwan-nft multiwan-qos luci-app-multiwan-qos
+          make defconfig
 
       - name: Cache probe source
         uses: actions/cache@v4
