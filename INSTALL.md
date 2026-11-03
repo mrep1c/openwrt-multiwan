@@ -72,6 +72,9 @@ apk add --upgrade multiwan-nft luci-app-multiwan-nft
 multiwan-nft status
 ```
 
+Follow the [router acceptance procedure](docs/NFT_ROUTER_ACCEPTANCE.md) for
+read-only reports, WAN recovery, sticky, AdGuard Home and QoS checks.
+
 `multiwan-nft` automatically requires `multiwan-nft-sockopt` for the selected
 CPU, plus `ip-full`, `nftables-json`, `kmod-nft-fib`, `jshn`, `rpcd`, and `conntrack`. Existing
 UCI configuration and `/etc/multiwan-nft.user` are conffiles. Back them up before
