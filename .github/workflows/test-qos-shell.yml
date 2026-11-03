@@ -110,7 +110,7 @@ jobs:
           busybox ash tests/test-nft-diagnostics.sh
           busybox ash tests/test-nft-cli.sh
           busybox ash tests/test-nft-feed.sh
-          busybox ash tests/test-nft-sockopt.sh
+          sudo busybox ash tests/test-nft-sockopt.sh
 
       - name: Run QoS regression tests with dash
         run: |
