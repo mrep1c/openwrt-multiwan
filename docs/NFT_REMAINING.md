@@ -25,9 +25,21 @@ changing the map. All 28 original targets, original 1.1.16 packages and stopped
 world/config/map/root rules/netifd baseline restore. Evidence is retained under
 `diagnostics/guide-roundtrip-final-1.1.17-2026-11-03/`.
 
-Remaining: physical R5S WAN/provider/DSA/load and manual LuCI acceptance;
-production signing and publication. Local unsigned APKs are ready for controlled
-LAN-connected testing. Earlier checkpoints below retain their historical limits.
+Production signing/publication now passes: compatibility CI `41716331516` and
+all three feed builds `41716378142` succeed at
+`a54fafabc693b92df80182976ede37d6d44c0ba8`. Public asset digests, production-key
+indexes and all 18 authenticated APK identities verify. NFT payloads match the
+audited SDKs. A stock 25.12.6 VM upgrades actual 1.1.16 packages to 1.1.17 with the
+production key and no `allow-untrusted`, preserving config/hooks/weights/probes
+and restoring its original baseline. QoS 1.0.60 source, runtime/LuCI contents,
+permissions, package hooks and dependencies match the previous published packages
+on all three architectures. Evidence is retained under
+`diagnostics/published-feed-1.1.17-2026-11-04/`.
+
+Remaining: physical R5S WAN/provider/DSA failover, router-side public GitHub
+transport, manual LuCI and sustained combined NFT/QoS load. Signed feeds are
+available for controlled LAN-connected testing. Earlier checkpoints below retain
+their historical limits.
 
 **Handled raw file-application rollback now passes.** The restore journal saves
 original files/links, legacy migration names/backups and provenance before writes.

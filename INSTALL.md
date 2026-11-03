@@ -5,6 +5,12 @@ and 24.10 releases are frozen; their existing release assets are not overwritten
 
 ## Supported native feeds
 
+NFT 1.1.17-r1 is published in all three signed architecture feeds. Hosted
+compatibility/build checks and a stock 25.12.6 production-key VM upgrade pass.
+QoS remains 1.0.60; its runtime/LuCI contents, permissions, package hooks and
+dependencies match the previous published packages. Physical R5S/provider/DSA,
+interactive LuCI and sustained combined load still need user validation.
+
 | CPU family | Exact OpenWrt package architecture | SDK target |
 | --- | --- | --- |
 | AArch64 | `aarch64_generic` | rockchip/armv8 |
@@ -53,6 +59,18 @@ The helper chooses the architecture feed, installs its signing key, updates
 indexes, and installs backend/UI packages. It replaces the former noarch feed
 entry, so use it again when upgrading. Modes are `setup`, `install`, `main`,
 `luci`, and `remove`.
+
+For an existing NFT installation, run this focused upgrade from LAN after saving
+a configuration backup. It switches the former noarch feed and selects the NFT
+backend, UI and required socket helper:
+
+```sh
+uclient-fetch -O /tmp/setup-multiwan-feed.sh https://raw.githubusercontent.com/mrep1c/openwrt-multiwan/main/setup-feed.sh
+sh /tmp/setup-multiwan-feed.sh setup
+apk add --upgrade multiwan-nft luci-app-multiwan-nft
+/etc/init.d/multiwan-nft restart
+multiwan-nft status
+```
 
 `multiwan-nft` automatically requires `multiwan-nft-sockopt` for the selected
 CPU, plus `ip-full`, `nftables-json`, `kmod-nft-fib`, `jshn`, `rpcd`, and `conntrack`. Existing

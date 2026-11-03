@@ -1,6 +1,45 @@
 # Release Notes
 
-## Unreleased
+## 1.1.17 — November 4, 2026
+
+The signed OpenWrt 25.12 feeds now publish NFT 1.1.17-r1 for
+`aarch64_generic`, `arm_cortex-a7_neon-vfpv4` and `mipsel_24kc`.
+The [release build](https://github.com/mrep1c/openwrt-multiwan/actions/runs/41716378142)
+and [compatibility checks](https://github.com/mrep1c/openwrt-multiwan/actions/runs/41716331516)
+pass at commit `a54fafabc693b92df80182976ede37d6d44c0ba8`.
+
+- Compared with the previous published NFT 1.0.13, repairs cover sticky refresh
+  and expiry, policy and route synchronization, tracking and socket binding,
+  interface/process ownership, CLI/RPC status and installation recovery.
+  Adds packaged native socket binding, DNS tracking and optional Nping 7.992.
+  Existing balancing, failover, sticky, rules and LuCI features remain available.
+- Current feeds support standard OpenWrt 25.12 images. Older 23.05/24.10 feeds
+  remain frozen. Existing noarch feed entries need the architecture switch in
+  [INSTALL.md](INSTALL.md). Legacy ipset producers need the documented native
+  set contract; connection cleanup is scoped to the affected WAN.
+- The SDK selector retains transitive and SDK-selected kernel dependencies while
+  avoiding unrelated module packaging. These are build changes, not firmware
+  changes. All three combined NFT/QoS feed builds pass.
+- Public asset digests, production-key index signatures and authenticated APK
+  identities verify on all three feeds. NFT payloads match the audited SDKs.
+  A stock 25.12.6 VM performs an actual production-key 1.1.16-to-1.1.17 upgrade
+  without `allow-untrusted`, preserving configuration, hooks, WAN weights and
+  bound probes, then restores its original baseline.
+- QoS stays at 1.0.60. Its source, backend/LuCI file hashes, permissions, package
+  hooks and dependencies match the previous published packages on all three
+  feeds. Rebuild metadata changes APK archive bytes; runtime contents are equal.
+
+The retained publication record is
+`diagnostics/published-feed-1.1.17-2026-11-04/` in the audit workspace.
+Physical R5S/provider/DSA failover, interactive LuCI and sustained combined
+NFT/QoS load remain unverified. Flow offload must remain disabled for packet-driven
+sticky refresh. This release is available for the requested controlled router test.
+
+## Historical audit checkpoints
+
+The following entries retain their checkpoint-time versions and limits.
+References to pending publication describe those earlier checkpoints; current
+publication and acceptance status is recorded above.
 
 - MultiWAN NFT 1.1.17 builds and verifies on AArch64, ARMv7 and MIPSel with the
   malformed CLI argument repair. All 74 package inputs match the retained SDK

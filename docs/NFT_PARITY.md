@@ -16,8 +16,22 @@ malformed ifup/ifdown return 2 without recreating stopped runtime or changing it
 map. Twelve recorded workers retire, and all 28 original targets, world/config/
 map/root rules/netifd and original stopped 1.1.16 packages restore. The record is
 `diagnostics/guide-roundtrip-final-1.1.17-2026-11-03/`. The 59-file local bundle
-includes 18 exact rollback baselines. Physical/manual/load acceptance and
-production signing/publication remain open; nothing is pushed or published.
+includes 18 exact rollback baselines. Physical/manual/load acceptance remains open.
+
+Production signing and publication now pass at commit
+`a54fafabc693b92df80182976ede37d6d44c0ba8`.
+[Compatibility CI](https://github.com/mrep1c/openwrt-multiwan/actions/runs/41716331516)
+and [all three feed builds](https://github.com/mrep1c/openwrt-multiwan/actions/runs/41716378142)
+succeed. Public asset digests, signed indexes and all 18 authenticated APK
+identities verify; NFT payloads match the audited SDKs. A stock 25.12.6 VM performs
+an actual production-key 1.1.16-to-1.1.17 upgrade without `allow-untrusted`, preserves
+configuration/hooks/weights/probes and restores its original baseline. QoS stays
+1.0.60, with source and runtime/LuCI contents, permissions, hooks and dependencies
+equal to the previous published feed on all three architectures. The retained
+record is `diagnostics/published-feed-1.1.17-2026-11-04/`. Router-side public GitHub
+transport, physical R5S/DSA/provider behavior, interactive LuCI and sustained
+combined load remain unverified. Publication limits in older checkpoints below
+describe their historical state.
 
 Routed dynamic bypass now passes focused and complete native routing checks
 (`64084a:0`). Each run covers twelve LAN/router TCP/UDP combinations, 66 successful

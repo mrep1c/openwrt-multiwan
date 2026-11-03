@@ -13,7 +13,19 @@ runtime or changing its map. Twelve workers retire; all 28 original targets,
 config/startup/map/world/root rules/netifd and original 1.1.16 packages restore.
 Independent verification passes (`cd6e66:0`); the record is
 `guide-roundtrip-final-1.1.17-2026-11-03`. This is controlled software acceptance;
-physical/manual/load validation and production publication remain open.
+physical/manual/load validation remains open.
+
+Production publication now passes at commit
+`a54fafabc693b92df80182976ede37d6d44c0ba8`:
+[compatibility CI](https://github.com/mrep1c/openwrt-multiwan/actions/runs/41716331516)
+and [all three feed builds](https://github.com/mrep1c/openwrt-multiwan/actions/runs/41716378142)
+succeed. Downloaded production-key indexes authenticate all 18 APKs, whose NFT
+payloads match the audited SDKs. A stock 25.12.6 VM genuinely upgrades 1.1.16 to
+1.1.17 with the production key and no `allow-untrusted`, then restores its original
+baseline. QoS 1.0.60 source, runtime/LuCI files, permissions, package hooks and
+dependencies match the previous published feed across all three architectures.
+Evidence is retained in `published-feed-1.1.17-2026-11-04`; physical router
+transport, interactive LuCI and sustained combined NFT/QoS load remain separate.
 
 The routed dynamic-bypass gap is now exercised in focused and complete native
 routing runs. Each passes twelve LAN/router TCP/UDP combinations and 66 successful
@@ -137,7 +149,7 @@ relative to the workspace `diagnostics/` directory.
 | 21. CLI | `test-nft-cli.sh`, `test-nft-status.sh`; CLI source record and `guide-roundtrip-final-1.1.17-2026-11-03` | All twelve commands and 34 source-trial invocations pass. Actual 1.1.17 APK rejects malformed ifup/ifdown without changing stopped runtime/map; full guide restoration passes. |
 | 22. Generic use | `test-nft-cli.sh`, `test-nft-sockopt.sh`; native optional probes and cross32 socket/resolver records | Real dynamically linked commands; family/source/device/mark, descriptor reuse/duplication and resolver behavior. Static/privileged-loader limitations follow the documented preload model. |
 | 23. RPC/LuCI | `test-nft-rpc.sh`, `test-nft-diagnostics.sh`, `test-nft-ui.js`; private HTTP ACL checks and current APK record | Actual RPC/HTTP permissions, JSON and installed status verified. Interactive browser testing remains unavailable. |
-| 24. Installation/upgrade | `test-nft-installer.py`, migration/feed/packaging tests; SDK/APK/guide, raw-staged and `raw-rollback-native-2026-11-03` records | Raw preparation, success/retry and handled rollback pass in stated profiles. Exact 1.0.13/1.1.17 install/rollback/reinstall, config and worker/probe checks pass. Production publication remains open. |
+| 24. Installation/upgrade | `test-nft-installer.py`, migration/feed/packaging tests; SDK/APK/guide, raw-staged, `raw-rollback-native-2026-11-03` and `published-feed-1.1.17-2026-11-04` records | Raw preparation, success/retry and handled rollback pass in stated profiles. Exact 1.0.13/1.1.17 install/rollback/reinstall, config and worker/probe checks pass. Production feeds and a native production-key upgrade verify. |
 | 25. Firewall coexistence | Full-ruleset-recovery and flowtable records | Native fw4 reload and explicit full-flush recovery covered. Actual software offload demonstrates why packet-driven refresh requires offload disabled. |
 | 26. Compatibility | Current three SDK records, cross32 native/lifecycle, PPPoE/bridge/VLAN/DHCPv6 and IPv6-disabled profiles | Standard 25.12 images only; primary 25.12.6/nftables 1.1.6. Current ARMv7/MIPSel APKs build; earlier native helper proofs retain identical helper payloads. R5S/DSA/load acceptance remains open. |
 
@@ -155,8 +167,9 @@ relabeled as a complete 1.1.16 hardware run.
 1. Physical R5S WAN failover/recovery, interactive LuCI and sustained hardware/load
    validation remain separate acceptance gates. Browser access is disabled and
    the user has not tested this candidate on the R5S.
-2. Production CI/signing and feed publication remain undone. Local APKs are
-   unsigned; no commit, push or publication is implied by these records.
+2. Public GitHub transport from the physical router and combined NFT/QoS load
+   remain unverified. Production CI, signing and feed publication are complete;
+   the signed-index upgrade is verified through the synthetic VM HTTP bridge.
 
 No rewrite is required by the findings to date. Repairs stay in the responsible
 shared layers, with explicit migration for native sets and scoped cleanup.
